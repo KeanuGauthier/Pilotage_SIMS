@@ -1,7 +1,6 @@
 from mesure import Mesure
 from datetime import datetime
 import numpy as np
-import cv2
 import uuid
 
 class Capteur:
@@ -11,20 +10,19 @@ class Capteur:
         self.__robot = robot
         self.__map_image = map_image
 
-    def is_obstacle(self, x, y):
-        if self.__map_image is None:
-            raise ValueError("Carte non chargée.")
-        return self.__map_image[y, x] == 0
-
     def distance_to_obstacle(self, x, y, angle, max_distance=20):
         height, width = self.__map_image.shape
+
         for d in range(1, max_distance + 1):
             check_x = int(x + d * np.cos(np.radians(angle)))
-            check_y = int(y - d * np.sin(np.radians(angle)))
+            check_y = int(y + d * np.sin(np.radians(angle)))  # Ajusté pour l'axe Y des images
+
             if check_x < 0 or check_x >= width or check_y < 0 or check_y >= height:
                 return d - 1
-            if self.is_obstacle(check_x, check_y):
+
+            if self.__map_image[check_y, check_x] == 0:
                 return d
+
         return max_distance
 
     def capte(self) -> Mesure:
