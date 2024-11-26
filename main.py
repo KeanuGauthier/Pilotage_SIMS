@@ -2,7 +2,7 @@ import keyboard
 import time
 import cv2
 from robot import Robot
-
+from database import Database
 
 def main():
     map_image_path = "map_image.png"
@@ -13,51 +13,34 @@ def main():
         return
 
     robot = Robot(x=100, y=100, angle=0, map_image=map_image)
+    db = Database()
 
     print("Utilisez les flèches directionnelles pour déplacer le robot. Appuyez sur 'esc' pour quitter.")
 
-    while True:
-        mesure = robot.capteur.capte()
-        print(mesure)
+    try:
+        while True:
+            mesure = robot.capteur.capte()
+            print(mesure)
+            db.insert_mesure(mesure)
 
-        distance_avance_possible = mesure.distance > 0
+            if keyboard.is_pressed('up'):
+                robot.avancer()
+            elif keyboard.is_pressed('down'):
+                robot.reculer()
+            elif keyboard.is_pressed('left'):
+                robot.tourner_gauche()
+            elif keyboard.is_pressed('right'):
+                robot.tourner_droite()
+            else:
+                robot.ne_rien_faire()
 
-        avancer = keyboard.is_pressed('up')
-        reculer = keyboard.is_pressed('down')
-        gauche = keyboard.is_pressed('left')
-        droite = keyboard.is_pressed('right')
+            if keyboard.is_pressed('esc'):
+                print("Programme terminé par l'utilisateur.")
+                break
 
-        if avancer and reculer:
-            robot.ne_rien_faire()
-        elif avancer and gauche:
-            robot.avancer(distance_avance_possible)
-            robot.tourner_gauche(facteur_vitesse=0.5)
-        elif avancer and droite:
-            robot.avancer(distance_avance_possible)
-            robot.tourner_droite(facteur_vitesse=0.5)
-        elif reculer and gauche:
-            robot.reculer()
-            robot.tourner_gauche(facteur_vitesse=0.5)
-        elif reculer and droite:
-            robot.reculer()
-            robot.tourner_droite(facteur_vitesse=0.5)
-        elif avancer:
-            robot.avancer(distance_avance_possible)
-        elif reculer:
-            robot.reculer()
-        elif gauche:
-            robot.tourner_gauche()
-        elif droite:
-            robot.tourner_droite()
-        else:
-            robot.ne_rien_faire()
-
-        if keyboard.is_pressed('esc'):
-            print("Programme terminé par l'utilisateur.")
-            break
-
-        time.sleep(0.1)
-
+            time.sleep(0.1)
+    finally:
+        db.close()
 
 if __name__ == "__main__":
     main()

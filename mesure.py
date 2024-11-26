@@ -5,7 +5,7 @@ class Mesure:
         self.y = y
         self.date_heure = date_heure
         self.angle = angle
-        self.distance = distance  # Assurez-vous que cet attribut existe
+        self.distance = distance
         self.vitesse_moteur_droit = vitesse_moteur_droit
         self.vitesse_moteur_gauche = vitesse_moteur_gauche
 
