@@ -1,6 +1,7 @@
 import mysql.connector
 from config import DATABASE
 
+
 class Database:
     def __init__(self):
         self.connection = mysql.connector.connect(
@@ -22,6 +23,11 @@ class Database:
             mesure.vitesse_moteur_droit, mesure.vitesse_moteur_gauche
         )
         self.cursor.execute(query, values)
+        self.connection.commit()
+
+    def clear_table(self):
+        query = "DELETE FROM mesures;"  # Supprime toutes les données de la table
+        self.cursor.execute(query)
         self.connection.commit()
 
     def close(self):
