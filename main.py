@@ -13,7 +13,7 @@ def main():
         return
 
     db = Database()
-    db.clear_table()  # Supprime toutes les données existantes avant de commencer
+    db.clear_table()
 
     robot = Robot(x=100, y=100, angle=0, map_image=map_image)
 
@@ -23,29 +23,28 @@ def main():
         while True:
             mesure = robot.capteur.capte()
             print(mesure)
-            db.insert_mesure(mesure)  # Insérer la mesure dans la base de données
+            db.insert_mesure(mesure)
 
             avancer = keyboard.is_pressed('up')
             reculer = keyboard.is_pressed('down')
             gauche = keyboard.is_pressed('left')
             droite = keyboard.is_pressed('right')
 
-            # Gestion des combinaisons de touches
             if avancer and reculer:
-                robot.ne_rien_faire()  # Si on appuie sur les deux, le robot ne bouge pas
-            elif avancer and gauche:
+                robot.ne_rien_faire()
+            elif avancer and gauche and mesure.distance > 11:
                 robot.avancer()
-                robot.tourner_gauche(facteur_vitesse=0.5)  # Tourne à gauche en avançant
-            elif avancer and droite:
+                robot.tourner_gauche(facteur_vitesse=0.5)
+            elif avancer and droite and mesure.distance > 11:
                 robot.avancer()
-                robot.tourner_droite(facteur_vitesse=0.5)  # Tourne à droite en avançant
+                robot.tourner_droite(facteur_vitesse=0.5)
             elif reculer and gauche:
                 robot.reculer()
-                robot.tourner_gauche(facteur_vitesse=0.5)  # Tourne à gauche en reculant
+                robot.tourner_gauche(facteur_vitesse=0.5)
             elif reculer and droite:
                 robot.reculer()
-                robot.tourner_droite(facteur_vitesse=0.5)  # Tourne à droite en reculant
-            elif avancer:
+                robot.tourner_droite(facteur_vitesse=0.5)
+            elif avancer and mesure.distance > 11:
                 robot.avancer()
             elif reculer:
                 robot.reculer()
@@ -60,7 +59,7 @@ def main():
                 print("Programme terminé par l'utilisateur.")
                 break
 
-            time.sleep(0.1)
+            time.sleep(0.03)
     finally:
         db.close()
 

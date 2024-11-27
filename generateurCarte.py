@@ -5,9 +5,9 @@ from PIL import Image, ImageDraw
 def generate_map_image():
     width, height = 1920, 1080
     border_thickness = 10
-    num_obstacles = 10
-    obstacle_min_size = 20
-    obstacle_max_size = 100
+    num_obstacles = 20
+    obstacle_min_size = 30
+    obstacle_max_size = 120
 
     image = Image.new("RGB", (width, height), "white")
     draw = ImageDraw.Draw(image)

@@ -71,13 +71,13 @@ class Robot:
 
     def tourner_gauche(self, facteur_vitesse=1.0):
         self.__en_deplacement = True
-        self.__angle = (self.__angle - 5) % 360
+        self.__angle = (self.__angle - 0.5) % 360
         self.__vitesse_moteur_droit = self.__vitesse_max * facteur_vitesse
         self.__vitesse_moteur_gauche = 0.0
 
     def tourner_droite(self, facteur_vitesse=1.0):
         self.__en_deplacement = True
-        self.__angle = (self.__angle + 5) % 360
+        self.__angle = (self.__angle + 0.5) % 360
         self.__vitesse_moteur_droit = 0.0
         self.__vitesse_moteur_gauche = self.__vitesse_max * facteur_vitesse
 

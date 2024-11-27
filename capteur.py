@@ -10,12 +10,12 @@ class Capteur:
         self.__robot = robot
         self.__map_image = map_image
 
-    def distance_to_obstacle(self, x, y, angle, max_distance=20):
+    def distance_to_obstacle(self, x, y, angle, max_distance=500):
         height, width = self.__map_image.shape
 
         for d in range(1, max_distance + 1):
             check_x = int(x + d * np.cos(np.radians(angle)))
-            check_y = int(y + d * np.sin(np.radians(angle)))  # Ajusté pour l'axe Y des images
+            check_y = int(y + d * np.sin(np.radians(angle)))
 
             if check_x < 0 or check_x >= width or check_y < 0 or check_y >= height:
                 return d - 1
