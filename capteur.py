@@ -22,7 +22,7 @@ class Capteur:
                 return d
         return max_distance
 
-    def distance_to_obstacle1(self, x, y, angle, max_distance=502):
+    def distance_to_obstacle1(self, x, y, angle, max_distance=500):
         height, width = self.__map_image.shape
         for d in range(1, max_distance + 1):
             check_x = int(x + d * np.cos(np.radians(angle + 5)))
@@ -33,7 +33,7 @@ class Capteur:
                 return d
         return max_distance
 
-    def distance_to_obstacle2(self, x, y, angle, max_distance=508):
+    def distance_to_obstacle2(self, x, y, angle, max_distance=500):
         height, width = self.__map_image.shape
         for d in range(1, max_distance + 1):
             check_x = int(x + d * np.cos(np.radians(angle + 10)))
@@ -44,7 +44,7 @@ class Capteur:
                 return d
         return max_distance
 
-    def distance_to_obstacle3(self, x, y, angle, max_distance=502):
+    def distance_to_obstacle3(self, x, y, angle, max_distance=500):
         height, width = self.__map_image.shape
         for d in range(1, max_distance + 1):
             check_x = int(x + d * np.cos(np.radians(angle - 5)))
@@ -55,7 +55,7 @@ class Capteur:
                 return d
         return max_distance
 
-    def distance_to_obstacle4(self, x, y, angle, max_distance=508):
+    def distance_to_obstacle4(self, x, y, angle, max_distance=500):
         height, width = self.__map_image.shape
         for d in range(1, max_distance + 1):
             check_x = int(x + d * np.cos(np.radians(angle - 10)))
