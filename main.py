@@ -32,10 +32,10 @@ def main():
 
             if avancer and reculer:
                 robot.ne_rien_faire()
-            elif avancer and gauche and mesure.distance > 11:
+            elif avancer and gauche and mesure.distance0 > 11:
                 robot.avancer()
                 robot.tourner_gauche(facteur_vitesse=0.5)
-            elif avancer and droite and mesure.distance > 11:
+            elif avancer and droite and mesure.distance0 > 11:
                 robot.avancer()
                 robot.tourner_droite(facteur_vitesse=0.5)
             elif reculer and gauche:
@@ -44,7 +44,7 @@ def main():
             elif reculer and droite:
                 robot.reculer()
                 robot.tourner_droite(facteur_vitesse=0.5)
-            elif avancer and mesure.distance > 11:
+            elif avancer and mesure.distance0 > 11:
                 robot.avancer()
             elif reculer:
                 robot.reculer()

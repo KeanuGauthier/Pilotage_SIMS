@@ -14,19 +14,29 @@ class Database:
 
     def insert_mesure(self, mesure):
         query = """
-        INSERT INTO mesures (id, x, y, date_heure, angle, distance, vitesse_moteur_droit, vitesse_moteur_gauche)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s);
+        INSERT INTO mesures (id, x, y, date_heure, angle, distance0, distance1, distance2, distance3, distance4, vitesse_moteur_droit, vitesse_moteur_gauche)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
         values = (
-            mesure.id, mesure.x, mesure.y, mesure.date_heure,
-            mesure.angle, mesure.distance,
-            mesure.vitesse_moteur_droit, mesure.vitesse_moteur_gauche
+            mesure.id,
+            mesure.x,
+            mesure.y,
+            mesure.date_heure,
+            mesure.angle,
+            mesure.distance0,
+            mesure.distance1,
+            mesure.distance2,
+            mesure.distance3,
+            mesure.distance4,
+            mesure.vitesse_moteur_droit,
+            mesure.vitesse_moteur_gauche,
         )
+        # Vérifiez que le nombre de colonnes correspond au nombre de valeurs
         self.cursor.execute(query, values)
         self.connection.commit()
 
     def clear_table(self):
-        query = "DELETE FROM mesures;"  # Supprime toutes les données de la table
+        query = "DELETE FROM mesures;"
         self.cursor.execute(query)
         self.connection.commit()
 
