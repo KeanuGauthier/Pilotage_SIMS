@@ -9,9 +9,10 @@ class Robot:
         self.__angle = angle
         self.__vitesse = 0.0
         self.__acceleration = 0.5
-        self.__vitesse_max = 1.0
+        self.__vitesse_max = 5.0
         self.__vitesse_moteur_droit = 0.0
         self.__vitesse_moteur_gauche = 0.0
+        self.__vitesse_rotation = 5.0
         self.capteur = Capteur(self, map_image)
         self.dao_mesure = DAOMesure()
         self.__en_deplacement = False
@@ -71,13 +72,13 @@ class Robot:
 
     def tourner_gauche(self, facteur_vitesse=1.0):
         self.__en_deplacement = True
-        self.__angle = (self.__angle - 0.5) % 360
+        self.__angle = (self.__angle - self.__vitesse_rotation * facteur_vitesse) % 360
         self.__vitesse_moteur_droit = self.__vitesse_max * facteur_vitesse
         self.__vitesse_moteur_gauche = 0.0
 
     def tourner_droite(self, facteur_vitesse=1.0):
         self.__en_deplacement = True
-        self.__angle = (self.__angle + 0.5) % 360
+        self.__angle = (self.__angle + self.__vitesse_rotation * facteur_vitesse) % 360
         self.__vitesse_moteur_droit = 0.0
         self.__vitesse_moteur_gauche = self.__vitesse_max * facteur_vitesse
 
