@@ -8,11 +8,13 @@ class Robot:
         self.__y = y
         self.__angle = angle
         self.__vitesse = 0.0
+        self.__vitesse_rotation = 0.0
         self.__acceleration = 0.5
-        self.__vitesse_max = 5.0
+        self.__acceleration_rotation = 0.2
+        self.__vitesse_max = 1.0
+        self.__vitesse_rotation_max = 2.0
         self.__vitesse_moteur_droit = 0.0
         self.__vitesse_moteur_gauche = 0.0
-        self.__vitesse_rotation = 5.0
         self.capteur = Capteur(self, map_image)
         self.dao_mesure = DAOMesure()
         self.__en_deplacement = False
@@ -41,6 +43,7 @@ class Robot:
         if not self.__en_deplacement:
             self.__vitesse_moteur_droit = 0.0
             self.__vitesse_moteur_gauche = 0.0
+            self.__vitesse_rotation = 0.0
 
     def avancer(self, distance_avance_possible=True):
         if not distance_avance_possible:
@@ -70,17 +73,43 @@ class Robot:
         self.__x += dx
         self.__y += dy
 
-    def tourner_gauche(self, facteur_vitesse=1.0):
+    def tourner_gauche(self, avancer=False, reculer=False):
         self.__en_deplacement = True
-        self.__angle = (self.__angle - self.__vitesse_rotation * facteur_vitesse) % 360
-        self.__vitesse_moteur_droit = self.__vitesse_max * facteur_vitesse
-        self.__vitesse_moteur_gauche = 0.0
+        if self.__vitesse_rotation < self.__vitesse_rotation_max:
+            self.__vitesse_rotation = min(self.__vitesse_rotation + self.__acceleration_rotation, self.__vitesse_rotation_max)
 
-    def tourner_droite(self, facteur_vitesse=1.0):
+        if avancer:
+            self.avancer()
+            self.__vitesse_moteur_droit = self.__vitesse
+            self.__vitesse_moteur_gauche = self.__vitesse - self.__vitesse_rotation
+        elif reculer:
+            self.reculer()
+            self.__vitesse_moteur_droit = self.__vitesse - self.__vitesse_rotation
+            self.__vitesse_moteur_gauche = self.__vitesse
+        else:
+            self.__vitesse_moteur_droit = self.__vitesse_rotation
+            self.__vitesse_moteur_gauche = -self.__vitesse_rotation
+
+        self.__angle = (self.__angle - self.__vitesse_rotation) % 360
+
+    def tourner_droite(self, avancer=False, reculer=False):
         self.__en_deplacement = True
-        self.__angle = (self.__angle + self.__vitesse_rotation * facteur_vitesse) % 360
-        self.__vitesse_moteur_droit = 0.0
-        self.__vitesse_moteur_gauche = self.__vitesse_max * facteur_vitesse
+        if self.__vitesse_rotation < self.__vitesse_rotation_max:
+            self.__vitesse_rotation = min(self.__vitesse_rotation + self.__acceleration_rotation, self.__vitesse_rotation_max)
+
+        if avancer:
+            self.avancer()
+            self.__vitesse_moteur_droit = self.__vitesse - self.__vitesse_rotation
+            self.__vitesse_moteur_gauche = self.__vitesse
+        elif reculer:
+            self.reculer()
+            self.__vitesse_moteur_droit = self.__vitesse
+            self.__vitesse_moteur_gauche = self.__vitesse - self.__vitesse_rotation
+        else:
+            self.__vitesse_moteur_droit = -self.__vitesse_rotation
+            self.__vitesse_moteur_gauche = self.__vitesse_rotation
+
+        self.__angle = (self.__angle + self.__vitesse_rotation) % 360
 
     def ne_rien_faire(self):
         self.__en_deplacement = False
