@@ -21,18 +21,15 @@ def main():
 
     try:
         while True:
-            # Capture les données du capteur
             mesure = robot.capteur.capte()
             print(mesure)
             db.insert_mesure(mesure)
 
-            # Détection des touches
             avancer = keyboard.is_pressed('up')
             reculer = keyboard.is_pressed('down')
             gauche = keyboard.is_pressed('left')
             droite = keyboard.is_pressed('right')
 
-            # Logique des mouvements du robot
             if avancer and reculer:
                 robot.ne_rien_faire()
             elif avancer and gauche and mesure.distance0 > 11:
@@ -54,7 +51,6 @@ def main():
             else:
                 robot.ne_rien_faire()
 
-            # Quitter le programme
             if keyboard.is_pressed('esc'):
                 print("Programme terminé par l'utilisateur.")
                 break
