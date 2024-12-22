@@ -27,25 +27,32 @@ def generate_map_image():
         return False
 
     obstacles = []
+    # Dessine des obstacles de manière aléatoire sur une carte et vérifie les chevauchements
     for _ in range(num_obstacles):
         while True:
+            # Détermine aléatoirement le type de l'obstacle (rectangle ou cercle)
             shape_type = random.choice(["rectangle", "circle"])
+
+            # Génère des coordonnées aléatoires pour l'obstacle
             x1 = random.randint(border_thickness, width - border_thickness - obstacle_max_size)
             y1 = random.randint(border_thickness, height - border_thickness - obstacle_max_size)
             size = random.randint(obstacle_min_size, obstacle_max_size)
             x2, y2 = x1 + size, y1 + size
 
+            # Vérifie si l'obstacle chevauche un obstacle existant
             if does_overlap((x1, y1, x2, y2), obstacles):
                 continue
 
+            # Si aucun chevauchement, ajoute l'obstacle à la liste
             obstacles.append((x1, y1, x2, y2))
 
+            # Dessine l'obstacle sur l'image
             if shape_type == "rectangle":
-                draw.rectangle([x1, y1, x2, y2], fill="black")
+                draw.rectangle([x1, y1, x2, y2], fill="black")  # Dessine un rectangle noir
             elif shape_type == "circle":
-                draw.ellipse([x1, y1, x2, y2], fill="black")
+                draw.ellipse([x1, y1, x2, y2], fill="black")  # Dessine un cercle noir
 
-            break
+            break  # Passe au prochain obstacle une fois que celui-ci est correctement placé
 
     image.save("map_image.png")
     print("Image saved as 'map_image.png'")

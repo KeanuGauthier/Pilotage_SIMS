@@ -21,36 +21,39 @@ def main():
 
     try:
         while True:
-            mesure = robot.capteur.capte()
-            print(mesure)
-            db.insert_mesure(mesure)
+            mesure = robot.capteur.capte()  # Capture une mesure des distances avec les obstacles
+            print(mesure)  # Affiche les données de mesure dans la console
+            db.insert_mesure(mesure)  # Enregistre la mesure dans la base de données MySQL
 
+            # Lecture des touches pour contrôler les mouvements du robot
             avancer = keyboard.is_pressed('up')
             reculer = keyboard.is_pressed('down')
             gauche = keyboard.is_pressed('left')
             droite = keyboard.is_pressed('right')
 
+            # Conditions pour les actions du robot en fonction des touches pressées
             if avancer and reculer:
-                robot.ne_rien_faire()
+                robot.ne_rien_faire()  # Annule le mouvement si les touches avancée et reculée sont pressées simultanément
             elif avancer and gauche and mesure.distance0 > 11:
-                robot.tourner_gauche(avancer=True)
+                robot.tourner_gauche(avancer=True)  # Tourne à gauche tout en avançant si la voie est dégagée
             elif avancer and droite and mesure.distance0 > 11:
-                robot.tourner_droite(avancer=True)
+                robot.tourner_droite(avancer=True)  # Tourne à droite tout en avançant si la voie est dégagée
             elif reculer and gauche:
-                robot.tourner_gauche(reculer=True)
+                robot.tourner_gauche(reculer=True)  # Tourne à gauche tout en reculant
             elif reculer and droite:
-                robot.tourner_droite(reculer=True)
+                robot.tourner_droite(reculer=True)  # Tourne à droite tout en reculant
             elif avancer and mesure.distance0 > 11:
-                robot.avancer()
+                robot.avancer()  # Avance si aucun obstacle n'est détecté directement devant
             elif reculer:
-                robot.reculer()
+                robot.reculer()  # Recule
             elif gauche:
-                robot.tourner_gauche()
+                robot.tourner_gauche()  # Tourne à gauche
             elif droite:
-                robot.tourner_droite()
+                robot.tourner_droite()  # Tourne à droite
             else:
-                robot.ne_rien_faire()
+                robot.ne_rien_faire()  # Reste immobile si aucune touche n'est pressée
 
+            # Quitte la boucle lorsque la touche 'esc' est pressée
             if keyboard.is_pressed('esc'):
                 print("Programme terminé par l'utilisateur.")
                 break

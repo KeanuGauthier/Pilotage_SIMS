@@ -46,17 +46,24 @@ class Robot:
             self.__vitesse_rotation = 0.0
 
     def avancer(self, distance_avance_possible=True):
+        # Vérifie si avancer est possible (en fonction des obstacles)
         if not distance_avance_possible:
             return
         self.__en_deplacement = True
+
+        # Augmente la vitesse avec une accélération jusqu'à la vitesse maximale
         if self.__vitesse < self.__vitesse_max:
             self.__vitesse = min(self.__vitesse + self.__acceleration, self.__vitesse_max)
 
+        # Assigne la vitesse actuelle aux moteurs
         self.__vitesse_moteur_droit = self.__vitesse
         self.__vitesse_moteur_gauche = self.__vitesse
 
+        # Calcule le déplacement sur les axes X et Y en fonction de l'angle
         dx = self.__vitesse * math.cos(math.radians(self.__angle))
         dy = self.__vitesse * math.sin(math.radians(self.__angle))
+
+        # Met à jour les coordonnées du robot
         self.__x += dx
         self.__y += dy
 
