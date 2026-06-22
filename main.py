@@ -6,17 +6,18 @@ Cette annexe est associée à la partie 4.5, relative aux difficultés rencontr�
 \begin{table}[H]
 \centering
 \renewcommand{\arraystretch}{1.35}
+\small
 
 \begin{tabularx}{\textwidth}{
-    >{\raggedright\arraybackslash}p{0.24\textwidth}
-    >{\raggedright\arraybackslash}p{0.23\textwidth}
-    >{\raggedright\arraybackslash}p{0.23\textwidth}
+    >{\raggedright\arraybackslash}p{0.25\textwidth}
+    >{\centering\arraybackslash}p{0.19\textwidth}
+    >{\centering\arraybackslash}p{0.22\textwidth}
     >{\raggedright\arraybackslash}X
 }
 \toprule
 \textbf{Élément concerné} 
-& \textbf{Accès à la production} 
-& \textbf{Accès à l’environnement de test} 
+& \textbf{Production} 
+& \textbf{Environnement de test} 
 & \textbf{Commentaire} \\
 \midrule
 
@@ -36,7 +37,7 @@ Jenkins hébergé côté production
 &
 \textcolor{red!70!black}{Bloqué actuellement}
 &
-Jenkins peut transmettre les résultats vers la production, notamment via API. En revanche, l’accès direct aux pages de l’environnement de test est limité par les règles réseau. \\
+Jenkins peut transmettre les résultats vers la production via API. En revanche, il ne peut pas accéder directement aux pages de l’environnement de test. \\
 
 \midrule
 
@@ -46,7 +47,7 @@ Adaptation nécessaire
 &
 \textcolor{blue!70!black}{À ouvrir de manière ciblée}
 &
-Une autorisation spécifique est nécessaire pour permettre à la machine virtuelle Jenkins d’exécuter les tests sur l’environnement de test. \\
+Une autorisation réseau spécifique est nécessaire pour permettre à Jenkins d’exécuter les tests sur l’environnement de test. \\
 
 \bottomrule
 \end{tabularx}
@@ -58,160 +59,151 @@ Une autorisation spécifique est nécessaire pour permettre à la machine virtue
 \begin{figure}[H]
 \centering
 
-\resizebox{\textwidth}{!}{%
 \begin{tikzpicture}[
-    box/.style args={#1}{
+    bloc/.style args={#1}{
         rectangle,
-        rounded corners=3mm,
+        rounded corners=2.5mm,
         draw=#1!65!black,
-        fill=#1!10,
+        fill=#1!9,
         very thick,
         align=center,
-        text width=4.1cm,
-        minimum height=1.65cm,
-        font=\small
+        text width=4.15cm,
+        minimum height=1.18cm,
+        inner sep=5pt,
+        font=\footnotesize
     },
-    smallbox/.style args={#1}{
-        rectangle,
-        rounded corners=3mm,
-        draw=#1!60!black,
-        fill=#1!8,
-        thick,
-        align=center,
-        text width=3.5cm,
-        minimum height=1.25cm,
-        font=\small
+    titre/.style={
+        font=\bfseries\small,
+        anchor=west,
+        text=black!85
     },
     lbl/.style={
-        font=\small\bfseries,
+        font=\scriptsize\bfseries,
         fill=white,
         inner sep=2pt,
         align=center
     },
     ok/.style={
-        -{Latex[length=3mm]},
+        -{Latex[length=2.7mm]},
         draw=green!45!black,
-        very thick
+        line width=1.1pt
     },
     blocked/.style={
-        -{Latex[length=3mm]},
+        -{Latex[length=2.7mm]},
         draw=red!70!black,
-        very thick,
+        line width=1.1pt,
         dashed
     },
     request/.style={
-        -{Latex[length=3mm]},
+        -{Latex[length=2.7mm]},
         draw=blue!70!black,
-        very thick,
+        line width=1.2pt,
         dotted
     },
-    note/.style={
-        rectangle,
-        rounded corners=3mm,
-        draw=black!45,
-        fill=gray!5,
-        align=left,
-        text width=14.5cm,
-        inner sep=0.35cm,
-        font=\small
+    legend/.style={
+        font=\scriptsize,
+        anchor=west
     }
 ]
 
-% =========================
-% Schéma principal : Jenkins
-% =========================
+% ==================================================
+% A. Cas d’un poste utilisateur autorisé
+% ==================================================
 
-\node[box=orange] (jenkins) at (0,0) {
-    \textbf{Jenkins}\\[0.1cm]
-    Scripts Python/Selenium\\
-    Hébergé côté production
+\node[titre] at (-0.15,1.75) {A. Accès depuis un poste utilisateur autorisé};
+
+\node[bloc=gray] (user) at (2.05,0) {
+    \textbf{Poste utilisateur}\\[0.06cm]
+    Accès via navigateur\\
+    avec droits adaptés
 };
 
-\node[box=green] (prod) at (8.2,2.25) {
-    \textbf{Production}\\[0.1cm]
-    Zephyr, rapports et API\\
-    Environnement principal
+\node[bloc=green] (prodA) at (11.25,0.95) {
+    \textbf{Production}\\[0.06cm]
+    Zephyr, rapports et API
 };
 
-\node[box=purple] (test) at (8.2,-2.25) {
-    \textbf{Environnement de test}\\[0.1cm]
-    Serveur de pré-production\\
-    Pages Jira/Confluence à vérifier
+\node[bloc=purple] (testA) at (11.25,-1.35) {
+    \textbf{Environnement de test}\\[0.06cm]
+    Pré-production et pages à vérifier
 };
 
-% Jenkins vers production : possible
 \draw[ok]
-    (jenkins.east) --
-    node[lbl, above, sloped, yshift=1mm] {API résultats\\possible}
-    (prod.west);
+    (user.east) .. controls (5.0,0.55) and (7.8,0.95) ..
+    node[lbl, above, pos=0.56] {accès possible}
+    (prodA.west);
 
-% Jenkins vers environnement de test : bloqué
+\draw[ok]
+    (user.east) .. controls (5.0,-0.55) and (7.8,-1.35) ..
+    node[lbl, below, pos=0.56] {accès possible}
+    (testA.west);
+
+% ==================================================
+% B. Cas Jenkins
+% ==================================================
+
+\begin{scope}[yshift=-4.25cm]
+
+\node[titre] at (-0.15,1.75) {B. Accès depuis Jenkins hébergé côté production};
+
+\node[bloc=orange] (jenkins) at (2.05,0) {
+    \textbf{Jenkins}\\[0.06cm]
+    Exécution des scripts Python/Selenium\\
+    hébergée côté production
+};
+
+\node[bloc=green] (prodB) at (11.25,0.95) {
+    \textbf{Production}\\[0.06cm]
+    Zephyr, rapports et API
+};
+
+\node[bloc=purple] (testB) at (11.25,-1.35) {
+    \textbf{Environnement de test}\\[0.06cm]
+    Pré-production et pages à vérifier
+};
+
+\draw[ok]
+    (jenkins.east) .. controls (5.1,0.58) and (7.8,0.95) ..
+    node[lbl, above, pos=0.55] {API résultats possible}
+    (prodB.west);
+
 \draw[blocked]
-    (jenkins.east) --
-    node[lbl, below, sloped, yshift=-1mm] {Accès direct\\actuellement bloqué}
-    (test.west);
+    (jenkins.east) .. controls (5.1,-0.42) and (7.8,-1.35) ..
+    node[lbl, above, pos=0.55] {accès direct bloqué}
+    (testB.west);
 
-\node[
-    font=\bfseries\Large,
-    text=red!70!black,
-    fill=white,
-    inner sep=1pt
-] at ($(jenkins.east)!0.55!(test.west)$) {$\times$};
-
-% Accès à ouvrir : Jenkins vers environnement de test
 \draw[request]
-    ($(jenkins.south east)+(0.05,-0.15)$)
-    .. controls (2.8,-3.85) and (5.2,-3.85) ..
-    node[lbl, below, pos=0.52] {Ouverture réseau ciblée à demander}
-    ($(test.south west)+(-0.05,-0.15)$);
+    ($(jenkins.south east)+(0,-0.15)$)
+    .. controls (5.1,-2.45) and (7.8,-2.45) ..
+    node[lbl, below, pos=0.55] {ouverture réseau ciblée à demander}
+    ($(testB.south west)+(0,-0.15)$);
 
-% =========================
-% Comparaison : poste utilisateur
-% =========================
+\end{scope}
 
-\node[smallbox=gray] (user) at (0,-5.4) {
-    \textbf{Poste utilisateur autorisé}\\
-    Accès via navigateur
-};
+% ==================================================
+% Légende visuelle
+% ==================================================
 
-\node[smallbox=green] (userprod) at (4.4,-5.4) {
-    \textbf{Production}\\
-    Accès possible
-};
+\draw[ok] (0.1,-7.65) -- (1.15,-7.65);
+\node[legend] at (1.3,-7.65) {Accès possible};
 
-\node[smallbox=purple] (usertest) at (8.2,-5.4) {
-    \textbf{Environnement de test}\\
-    Accès possible
-};
+\draw[blocked] (4.15,-7.65) -- (5.20,-7.65);
+\node[legend] at (5.35,-7.65) {Accès actuellement bloqué};
 
-\draw[ok]
-    (user.east) --
-    node[lbl, above] {possible}
-    (userprod.west);
-
-\draw[ok]
-    (userprod.east) --
-    node[lbl, above] {possible}
-    (usertest.west);
-
-% =========================
-% Note explicative
-% =========================
-
-\node[note] at (4.1,-7.55) {
-    \textbf{Lecture du schéma}\\[0.15cm]
-    Le poste utilisateur autorisé peut accéder aux environnements de production et de test. 
-    La contrainte concerne Jenkins : l’outil étant hébergé côté production, il peut transmettre les résultats vers la production via API, mais ne dispose pas actuellement d’un accès direct aux pages de l’environnement de test. 
-    Une ouverture réseau ciblée est donc nécessaire pour permettre l’exécution complète des tests automatisés.
-};
+\draw[request] (8.65,-7.65) -- (9.70,-7.65);
+\node[legend] at (9.85,-7.65) {Accès à ouvrir};
 
 \end{tikzpicture}
-}
 
 \caption{Contraintes d’accès entre Jenkins, la production et l’environnement de test.}
 \label{fig:contraintes-acces-jenkins}
 
 \end{figure}
+
+\noindent
+\textbf{Lecture du schéma.} Un poste utilisateur autorisé peut accéder aux environnements de production et de test. La contrainte concerne Jenkins : l’outil peut transmettre les résultats vers la production via API, mais l’accès direct aux pages de l’environnement de test est actuellement bloqué par les règles réseau. Une ouverture ciblée est donc nécessaire pour exécuter les tests automatisés sur l’environnement de test tout en conservant la remontée des résultats vers la production.
+
+\medskip
 
 \noindent
 Cette contrainte explique pourquoi l’intégration complète des tests automatisés nécessite une adaptation de l’architecture d’accès. L’enjeu n’est pas lié au fonctionnement des scripts eux-mêmes, mais à la capacité de Jenkins à atteindre l’environnement de test tout en conservant la transmission des résultats vers l’environnement de production.
