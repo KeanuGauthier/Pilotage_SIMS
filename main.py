@@ -1,209 +1,41 @@
-\section{Contraintes d’accès entre Jenkins, la production et l’environnement de test}
-\label{annexe:contraintes-acces-jenkins}
-
-Cette annexe est associée à la partie 4.5, relative aux difficultés rencontrées et aux choix d’adaptation. Elle présente la contrainte d’accès identifiée lors de l’intégration des tests automatisés dans Jenkins.
-
-\begin{table}[H]
-\centering
-\renewcommand{\arraystretch}{1.35}
-\small
-
-\begin{tabularx}{\textwidth}{
-    >{\raggedright\arraybackslash}p{0.25\textwidth}
-    >{\centering\arraybackslash}p{0.19\textwidth}
-    >{\centering\arraybackslash}p{0.22\textwidth}
-    >{\raggedright\arraybackslash}X
-}
-\toprule
-\textbf{Élément concerné} 
-& \textbf{Production} 
-& \textbf{Environnement de test} 
-& \textbf{Commentaire} \\
-\midrule
-
-Poste utilisateur autorisé
-&
-\textcolor{green!45!black}{Possible}
-&
-\textcolor{green!45!black}{Possible}
-&
-Un poste utilisateur disposant des droits nécessaires peut accéder aux deux environnements depuis un navigateur. \\
-
-\midrule
-
-Jenkins hébergé côté production
-&
-\textcolor{green!45!black}{Possible}
-&
-\textcolor{red!70!black}{Bloqué actuellement}
-&
-Jenkins peut transmettre les résultats vers la production via API. En revanche, il ne peut pas accéder directement aux pages de l’environnement de test. \\
-
-\midrule
-
-Adaptation nécessaire
-&
-\textcolor{green!45!black}{Conservé}
-&
-\textcolor{blue!70!black}{À ouvrir de manière ciblée}
-&
-Une autorisation réseau spécifique est nécessaire pour permettre à Jenkins d’exécuter les tests sur l’environnement de test. \\
-
-\bottomrule
-\end{tabularx}
-
-\caption{Synthèse des accès possibles et bloqués entre les environnements.}
-\label{tab:contraintes-acces-jenkins}
-\end{table}
-
+5.1 Résultats liés à la conception des tests de non-régression
+Les premiers résultats concernent la structuration des tests de non-régression de Jira et Confluence. Plus de trente plugins ont été traités pour l'instant. Les tests ont porté sur certaines fonctionnalités natives essentielles, comme la création ou la modification de tickets dans Jira, ainsi que sur plusieurs plugins ajoutés aux outils standards.
+Pour Jira, des plugins tels que SQCDP ou Zephyr ont été pris en compte. Pour Confluence, les tests ont principalement concerné des plugins liés aux macros, aux outils d’écriture, aux graphiques, aux chartes ou encore aux fonctionnalités de mise en page. Cette sélection a permis de concentrer les contrôles sur les fonctionnalités les plus sensibles pour les utilisateurs.
+Les scénarios retenus ont été formalisés dans Zephyr sous la forme de plans de test détaillés. Chaque plan est composé de plusieurs étapes, ou test steps, qui décrivent les actions à réaliser et les résultats attendus. Cette structuration permet de rendre les vérifications plus lisibles, plus reproductibles et plus faciles à transmettre.
+Ce résultat marque une évolution par rapport au fonctionnement initial. Les plans de test étaient auparavant suivis dans des tableaux intégrés à des pages Confluence. Ce format permettait de centraliser l’information, mais il restait limité pour suivre précisément les exécutions. Avec Zephyr, chaque test peut être associé à une date, une version et un résultat d’exécution. Les informations produites sont donc plus faciles à exploiter, notamment lorsqu’une anomalie doit être reliée à un ticket Jira.
+L’intérêt principal de ce travail est de fiabiliser la phase de vérification avant mise en production. Même indépendamment de l’automatisation, la formalisation des tests dans un outil dédié permet déjà de limiter les oublis, d’homogénéiser les contrôles et de disposer d’un historique plus clair.
+5.2 Résultats liés à l’automatisation et à l’intégration des tests
+Le deuxième résultat concerne l’automatisation progressive des scénarios définis dans Zephyr. Les plans de test ont été traduits en scripts Python utilisant Selenium, afin d’exécuter automatiquement les actions prévues dans les interfaces web de Jira et Confluence.
+Les scripts permettent également de mettre à jour les résultats dans Zephyr grâce aux API. Lorsqu’un test est lancé, une exécution est créée dans Zephyr, puis chaque étape est mise à jour au fur et à mesure de l’avancement du scénario. Une étape validée reçoit un statut de réussite. En cas d’échec, le statut est renseigné comme échoué et plusieurs éléments sont générés pour faciliter l’analyse : une capture d’écran, un message technique et un fichier contenant le détail de l’erreur retournée par Selenium.
+À ce stade, les scripts fonctionnent correctement depuis un poste utilisateur. La partie Selenium permet d’exécuter les scénarios, tandis que l’intégration avec Zephyr permet de créer les exécutions et de renseigner automatiquement les résultats. Ce fonctionnement valide la faisabilité technique de l’automatisation et de la remontée automatique des informations dans l’outil de test.
+La principale limite actuelle concerne l’industrialisation de cette exécution. Depuis un poste utilisateur, les scripts restent dépendants de l’environnement local : configuration du poste, navigateur, bibliothèques installées, accès réseau et disponibilité de la machine. L’intégration dans Jenkins doit permettre de dépasser cette limite en centralisant l’exécution dans un environnement serveur plus stable. Cette étape reste toutefois dépendante de la résolution des contraintes d’accès entre Jenkins, l’environnement de production et l’environnement de test.
+L’apport principal de cette automatisation est donc la traçabilité. Les résultats ne reposent plus uniquement sur une saisie manuelle. Ils sont produits de manière plus régulière, associés à une exécution précise et exploitables dans le temps. Cette évolution constitue une base solide pour rendre les futures vérifications plus fiables et plus reproductibles.
+5.3 Résultats liés à l’outil d’assistance à la gestion des utilisateurs SuperTool
+Le troisième résultat concerne l’outil d’assistance à la gestion des utilisateurs SuperTool. À partir d’un fichier CSV exporté depuis la plateforme, l’outil analyse les données utilisateurs et identifie automatiquement plusieurs anomalies liées aux comptes.
+Le principal livrable généré est un fichier texte de synthèse. Il indique les types d’anomalies détectées, le nombre d’utilisateurs concernés et la liste des comptes à vérifier. Les contrôles portent notamment sur les incohérences de rôle, les invitations manquantes ou injustifiées, les erreurs liées au nom de société, l’appartenance aux groupes ArianeGroup internes ou externes, ainsi que l’absence de groupe d’appartenance défini.
+Ce fonctionnement remplace une partie des contrôles auparavant réalisés manuellement dans Excel. La Product Owner devait exporter les données, appliquer différentes formules, repérer les anomalies, puis organiser la liste des corrections à effectuer. L’outil fournit désormais une synthèse directement exploitable, ce qui simplifie la phase d’identification et réduit le risque d’oubli.
+Le gain de temps estimé est d’environ quinze minutes par exécution pour la génération de la liste des modifications à réaliser. Au-delà de ce gain, l’intérêt réside surtout dans l’application systématique des mêmes règles de contrôle. Le traitement devient donc plus régulier et moins dépendant de manipulations manuelles.
 \begin{figure}[H]
 \centering
-
-\begin{tikzpicture}[
-    bloc/.style args={#1}{
-        rectangle,
-        rounded corners=2.5mm,
-        draw=#1!65!black,
-        fill=#1!9,
-        very thick,
-        align=center,
-        text width=4.15cm,
-        minimum height=1.18cm,
-        inner sep=5pt,
-        font=\footnotesize
-    },
-    titre/.style={
-        font=\bfseries\small,
-        anchor=west,
-        text=black!85
-    },
-    lbl/.style={
-        font=\scriptsize\bfseries,
-        fill=white,
-        inner sep=2pt,
-        align=center
-    },
-    ok/.style={
-        -{Latex[length=2.7mm]},
-        draw=green!45!black,
-        line width=1.1pt
-    },
-    blocked/.style={
-        -{Latex[length=2.7mm]},
-        draw=red!70!black,
-        line width=1.1pt,
-        dashed
-    },
-    request/.style={
-        -{Latex[length=2.7mm]},
-        draw=blue!70!black,
-        line width=1.2pt,
-        dotted
-    },
-    legend/.style={
-        font=\scriptsize,
-        anchor=west
-    }
-]
-
-% ==================================================
-% A. Cas d’un poste utilisateur autorisé
-% ==================================================
-
-\node[titre] at (-0.15,1.75) {A. Accès depuis un poste utilisateur autorisé};
-
-\node[bloc=gray] (user) at (2.05,0) {
-    \textbf{Poste utilisateur}\\[0.06cm]
-    Accès via navigateur\\
-    avec droits adaptés
-};
-
-\node[bloc=green] (prodA) at (11.25,0.95) {
-    \textbf{Production}\\[0.06cm]
-    Zephyr, rapports et API
-};
-
-\node[bloc=purple] (testA) at (11.25,-1.35) {
-    \textbf{Environnement de test}\\[0.06cm]
-    Pré-production et pages à vérifier
-};
-
-\draw[ok]
-    (user.east) .. controls (5.0,0.55) and (7.8,0.95) ..
-    node[lbl, above, pos=0.56] {accès possible}
-    (prodA.west);
-
-\draw[ok]
-    (user.east) .. controls (5.0,-0.55) and (7.8,-1.35) ..
-    node[lbl, below, pos=0.56] {accès possible}
-    (testA.west);
-
-% ==================================================
-% B. Cas Jenkins
-% ==================================================
-
-\begin{scope}[yshift=-4.25cm]
-
-\node[titre] at (-0.15,1.75) {B. Accès depuis Jenkins hébergé côté production};
-
-\node[bloc=orange] (jenkins) at (2.05,0) {
-    \textbf{Jenkins}\\[0.06cm]
-    Exécution des scripts Python/Selenium\\
-    hébergée côté production
-};
-
-\node[bloc=green] (prodB) at (11.25,0.95) {
-    \textbf{Production}\\[0.06cm]
-    Zephyr, rapports et API
-};
-
-\node[bloc=purple] (testB) at (11.25,-1.35) {
-    \textbf{Environnement de test}\\[0.06cm]
-    Pré-production et pages à vérifier
-};
-
-\draw[ok]
-    (jenkins.east) .. controls (5.1,0.58) and (7.8,0.95) ..
-    node[lbl, above, pos=0.55] {API résultats possible}
-    (prodB.west);
-
-\draw[blocked]
-    (jenkins.east) .. controls (5.1,-0.42) and (7.8,-1.35) ..
-    node[lbl, above, pos=0.55] {accès direct bloqué}
-    (testB.west);
-
-\draw[request]
-    ($(jenkins.south east)+(0,-0.15)$)
-    .. controls (5.1,-2.45) and (7.8,-2.45) ..
-    node[lbl, below, pos=0.55] {ouverture réseau ciblée à demander}
-    ($(testB.south west)+(0,-0.15)$);
-
-\end{scope}
-
-% ==================================================
-% Légende visuelle
-% ==================================================
-
-\draw[ok] (0.1,-7.65) -- (1.15,-7.65);
-\node[legend] at (1.3,-7.65) {Accès possible};
-
-\draw[blocked] (4.15,-7.65) -- (5.20,-7.65);
-\node[legend] at (5.35,-7.65) {Accès actuellement bloqué};
-
-\draw[request] (8.65,-7.65) -- (9.70,-7.65);
-\node[legend] at (9.85,-7.65) {Accès à ouvrir};
-
-\end{tikzpicture}
-
-\caption{Contraintes d’accès entre Jenkins, la production et l’environnement de test.}
-\label{fig:contraintes-acces-jenkins}
-
+% \includegraphics[width=0.9\textwidth]{chemin/vers/capture_fichier_txt.png}
+\caption{Exemple de synthèse des anomalies utilisateurs générée au format texte.}
+\label{fig:synthese-anomalies-supertool}
 \end{figure}
-
-\noindent
-\textbf{Lecture du schéma.} Un poste utilisateur autorisé peut accéder aux environnements de production et de test. La contrainte concerne Jenkins : l’outil peut transmettre les résultats vers la production via API, mais l’accès direct aux pages de l’environnement de test est actuellement bloqué par les règles réseau. Une ouverture ciblée est donc nécessaire pour exécuter les tests automatisés sur l’environnement de test tout en conservant la remontée des résultats vers la production.
-
-\medskip
-
-\noindent
-Cette contrainte explique pourquoi l’intégration complète des tests automatisés nécessite une adaptation de l’architecture d’accès. L’enjeu n’est pas lié au fonctionnement des scripts eux-mêmes, mais à la capacité de Jenkins à atteindre l’environnement de test tout en conservant la transmission des résultats vers l’environnement de production.
+L’outil est utilisé de manière quasi hebdomadaire par la Product Owner, selon les besoins de suivi et de correction des comptes. Il ne remplace pas la décision humaine, mais il facilite l’analyse préalable. La correction reste réalisée par la personne responsable de la plateforme, avec une base de travail plus claire et plus rapide à exploiter.
+5.4 Résultats liés au tableau de bord analytique
+L’exploitation des fichiers utilisateurs a également permis de produire un tableau de bord analytique. Ce livrable complète l’outil d’identification des anomalies, mais répond à un besoin différent. Il ne s’agit plus seulement de corriger des comptes, mais de disposer d’une vision globale de l’état de la plateforme.
+Le tableau de bord prend la forme d’un fichier Excel généré à partir des données utilisateurs. Il centralise plusieurs indicateurs, tels que le nombre de comptes actifs, inactifs, incomplets ou présentant une anomalie. La structure du fichier, les indicateurs retenus et les représentations graphiques utilisées sont présentés dans la figure ci-dessous.
+\begin{figure}[H]
+\centering
+% \includegraphics[width=0.95\textwidth]{chemin/vers/capture_dashboard_supertool.png}
+\caption{Exemple de tableau de bord analytique généré à partir des données utilisateurs SuperTool.}
+\label{fig:dashboard-supertool}
+\end{figure}
+La génération de ce tableau de bord représente un gain estimé à environ trente minutes par exécution. Ce gain est à la fois opérationnel et qualitatif. Les données sont croisées, organisées et présentées de façon plus lisible, ce qui facilite leur comparaison entre plusieurs périodes.
+Ce résultat permet de passer d’une logique uniquement corrective à une logique de pilotage. Les indicateurs produits peuvent aider à ajuster le nombre de licences nécessaires, à suivre l’évolution de l’utilisation de la plateforme ou à appuyer une décision de déploiement dans d’autres services. Le tableau de bord apporte ainsi des éléments chiffrés utiles pour prendre des décisions techniques ou organisationnelles.
+5.5 Interprétation globale des résultats
+Les résultats obtenus montrent une amélioration progressive de la fiabilité et du suivi des outils collaboratifs. Les travaux réalisés ne suppriment pas les interventions humaines, mais ils les rendent mieux structurées et plus faciles à exploiter.
+Pour Jira et Confluence, la valeur principale réside dans la mise en place d’un cadre de test plus rigoureux. Les scénarios sont désormais formalisés dans Zephyr, les exécutions peuvent être tracées et les résultats peuvent être associés à une version ou à une anomalie. L’automatisation renforce cette logique en réduisant la saisie manuelle et en produisant des preuves d’exécution plus complètes.
+Pour SuperTool, les résultats répondent à un enjeu différent : améliorer la qualité du suivi des utilisateurs. L’outil d’assistance accélère l’identification des anomalies, tandis que le tableau de bord permet de mieux comprendre l’état général de la plateforme. Ces deux livrables sont complémentaires : l’un aide à corriger, l’autre aide à piloter.
+La portée des résultats reste toutefois encadrée par certaines limites. L’automatisation des tests fonctionne sur poste utilisateur, mais son industrialisation complète dépend encore de l’intégration dans Jenkins et des accès réseau nécessaires. De plus, les scripts de test et les règles de contrôle devront être maintenus pour rester adaptés aux évolutions des outils, des plugins et des besoins métier.
+Ainsi, les travaux réalisés constituent une base opérationnelle solide. Ils améliorent la traçabilité, réduisent certaines tâches manuelles et renforcent la capacité de l’équipe à suivre ses outils de manière plus fiable. Leur intérêt principal réside dans le passage d’un fonctionnement ponctuel et manuel à une démarche plus reproductible, documentée et exploitable dans la durée.
