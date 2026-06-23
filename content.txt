@@ -1,31 +1,68 @@
-8. Prise de recul personnelle
+4.3
 
-8.1 Bilan des compétences
+Les scénarios définis précédemment ont été traduits en scripts Python à l’aide de Selenium WebDriver, qui permet de piloter un navigateur comme le ferait un utilisateur, localement ou à distance (Selenium, 2024).
 
-Cette année m’a d’abord permis de prendre conscience de la complexité d’un environnement professionnel réel. Au début de l’alternance, beaucoup d’éléments me paraissaient difficiles à comprendre, voire parfois inaccessibles. Il fallait intégrer à la fois le fonctionnement de l’équipe, les outils utilisés, les contraintes de sécurité, les processus internes et les attentes liées aux missions confiées. Face à cette complexité, je me suis appuyé sur les compétences que je maîtrisais déjà, notamment la programmation Python, la logique de projet et l’analyse de problème. Ces bases m’ont permis d’avancer progressivement, de mieux comprendre l’environnement et de gagner en autonomie.
+Les résultats des tests ont ensuite été transmis vers Zephyr, un plugin intégré à Jira permettant de construire des plans de test détaillés et de suivre leurs exécutions. L’utilisation des API Zephyr permet d’automatiser une partie de ces échanges avec l’outil de gestion des tests (SmartBear, s. d.-b).
 
-Avec du recul, je constate qu’au départ j’avais tendance à vouloir faire vite et bien, sans toujours prendre le temps de comprendre en profondeur l’intérêt réel de ce qui était demandé. Je cherchais parfois à répondre directement à la demande, alors qu’il aurait été pertinent de prendre davantage de recul pour questionner la solution envisagée, comprendre son usage final et proposer une approche potentiellement plus adaptée. Cette évolution représente pour moi un apprentissage important : la qualité d’un travail ne dépend pas seulement de sa rapidité d’exécution ou de son bon fonctionnement technique, mais aussi de sa pertinence par rapport au besoin réel.
+Les scripts ont ensuite été préparés pour une intégration dans Jenkins. Jenkins Pipeline permet de modéliser des chaînes d’exécution automatisées et reproductibles, notamment pour les étapes de test et de déploiement (Jenkins, s. d.).
 
-Sur le plan technique, cette année m’a permis de renforcer plusieurs compétences. J’ai progressé en Python, non seulement pour écrire des scripts fonctionnels, mais aussi pour structurer davantage mon code et anticiper les erreurs. J’ai également découvert de manière plus concrète l’automatisation avec Selenium, l’utilisation d’API, le fonctionnement d’outils comme Jira, Confluence, Zephyr ou Jenkins, ainsi que la logique d’analyse de données à travers la création de tableaux de bord. Ces compétences ont été développées dans un contexte professionnel, avec des contraintes réelles, ce qui les rend beaucoup plus concrètes que dans un simple exercice scolaire.
 
-J’ai aussi progressé sur le plan méthodologique. Cette année m’a appris à être plus rigoureux dans ma manière de travailler. J’ai compris l’importance de bien analyser un besoin avant de commencer le développement, de tester progressivement une solution et de documenter suffisamment le travail réalisé. La documentation est un point sur lequel j’ai particulièrement pris conscience de l’importance. Un projet peut être techniquement fonctionnel, mais il perd une partie de sa valeur s’il n’est pas compréhensible, transmissible ou maintenable par d’autres personnes.
+4.4
 
-Les compétences acquises à l’école m’ont beaucoup servi dans cette progression. La prépa ADIMAKER m’avait déjà donné de bonnes bases en programmation, en gestion de projet, en travail d’équipe, en communication écrite, en analyse de problème et en rigueur scientifique. Ces compétences ont constitué un socle solide pour aborder les missions en entreprise. L’alternance m’a ensuite permis de les développer dans un cadre plus exigeant, où les solutions doivent s’intégrer à un environnement existant et répondre à de vrais besoins opérationnels.
+Une première version a été développée en Python, à partir du module CSV, qui permet de lire et d’écrire des données tabulaires dans des formats compatibles avec des outils comme Excel (Python Software Foundation, s. d.).
 
-Sur le plan humain, je pense que j’avais déjà certaines facilités relationnelles. Cependant, cette année m’a permis d’observer plus précisément le fonctionnement des échanges au sein d’une équipe professionnelle. J’ai mieux compris l’importance des validations intermédiaires, des échanges avec les bons interlocuteurs et de la capacité à expliquer clairement un problème. La communication ne sert pas seulement à présenter un résultat final ; elle permet aussi d’éviter les malentendus, de faire évoluer une solution et de mieux prendre en compte les contraintes des autres.
 
-La principale difficulté rencontrée a été liée au fonctionnement d’une entreprise avec un réseau sécurisé. Les accès sont limités, les informations ne sont pas toujours disponibles aussi facilement que dans un environnement ouvert, et de nombreux protocoles doivent être respectés. Cette contrainte ajoute une complexité importante aux projets. Elle peut parfois créer des blocages qui ne dépendent pas directement du développement réalisé. Cela m’a appris à ne pas voir un projet uniquement sous l’angle technique. Une solution doit aussi être compatible avec les contraintes de sécurité, d’organisation et d’infrastructure.
+5.1
 
-Cette année m’a donc permis de mieux comprendre le rôle d’un ingénieur. Il ne s’agit pas seulement de produire une solution technique, mais de comprendre un besoin, d’analyser un contexte, de prendre en compte les contraintes, puis de proposer une solution utile, robuste et maintenable. Cette prise de conscience a confirmé mon intérêt pour les missions qui combinent analyse de problème, organisation et gestion de projet. Je me suis rendu compte que je suis particulièrement attiré par la compréhension globale d’un sujet et par la coordination des solutions, davantage que par une spécialisation uniquement technique.
+Les scénarios retenus ont été formalisés dans Zephyr sous la forme de plans de test détaillés. Ce choix est cohérent avec l’objectif de structuration documentaire des tests logiciel, qui vise à rendre les contrôles plus explicites, reproductibles et exploitables (ISO/IEC/IEEE, 2022).
 
-8.2 Objectifs pour la suite
 
-Pour la suite, mon premier objectif est de continuer à développer les compétences acquises cette année, en allant plus loin dans la qualité des livrables produits. Je souhaite être capable de réaliser des solutions plus complètes, mieux structurées et réellement déployables. L’objectif n’est pas seulement qu’un outil fonctionne sur le moment, mais qu’il puisse être utilisé, maintenu et compris facilement par d’autres personnes.
+5.2
 
-Je souhaite particulièrement progresser sur la rigueur de mes rendus. Cela concerne la qualité du code, la clarté des choix techniques, la gestion des erreurs, mais aussi la documentation. J’aimerais que mes futurs travaux soient documentés de manière plus professionnelle, en suivant davantage les normes et les bonnes pratiques du milieu. Une documentation claire permet de transmettre un projet, de faciliter sa maintenance et de renforcer sa crédibilité.
+Les plans de test ont été traduits en scripts Python utilisant Selenium WebDriver, afin d’exécuter automatiquement les actions prévues dans les interfaces web de Jira et Confluence (Selenium, 2024).
 
-Un autre objectif est de renforcer ma capacité à prendre du recul avant de commencer une mission. Cette année m’a montré qu’il est parfois nécessaire de questionner la demande initiale pour mieux comprendre le problème réel. Pour la suite, je veux donc être capable d’analyser plus rapidement les enjeux d’un sujet, d’identifier les contraintes importantes et de proposer des solutions plus pertinentes dès les premières étapes.
 
-Je souhaite également continuer à progresser sur les aspects liés à la gestion de projet. Mon intérêt pour l’analyse de problème et l’organisation s’est confirmé au cours de cette année. Je veux donc développer ma capacité à structurer une mission, à suivre son avancement, à anticiper les blocages et à coordonner les échanges entre les différents acteurs. Ces compétences me semblent essentielles pour évoluer vers un profil capable de faire le lien entre la technique, les besoins métier et les objectifs d’une équipe.
+6.3
 
-Enfin, cette année a confirmé mon projet professionnel. Elle m’a permis de mieux identifier ce qui m’intéresse le plus : comprendre des problèmes complexes, organiser une réponse adaptée et contribuer à l’amélioration des processus. Pour l’année suivante, mon objectif sera donc de gagner en autonomie sur des sujets plus complets, tout en conservant une exigence forte sur la qualité, la clarté et l’utilité des solutions produites.
+Les résultats obtenus peuvent être confrontés à l’analyse de l’existant présentée précédemment, ainsi qu’aux principes généraux du test logiciel. Les tests de non-régression visent précisément à vérifier qu’une modification n’a pas introduit de défaut dans des fonctionnalités déjà existantes (ISTQB, s. d.).
+
+La mise en place des plans de test dans Zephyr répond directement à cette limite. Elle rapproche le fonctionnement de l’équipe d’une démarche plus structurée de gestion des tests, conforme aux principes de formalisation et de suivi décrits dans les référentiels de test logiciel (ISO/IEC/IEEE, 2022).
+
+
+
+
+
+Ref :
+
+
+\section*{Références bibliographiques}
+
+Atlassian. (s. d.-a). \textit{Jira Documentation}. Atlassian Support. Consulté le 23 juin 2026, à l’adresse \url{https://confluence.atlassian.com/jira}
+
+Atlassian. (s. d.-b). \textit{Confluence Documentation Directory}. Atlassian Support. Consulté le 23 juin 2026, à l’adresse \url{https://confluence.atlassian.com/alldoc/confluence-documentation-directory-12877996.html}
+
+ISO/IEC/IEEE. (2022). \textit{ISO/IEC/IEEE 29119-1:2022 — Software and systems engineering — Software testing — Part 1: General concepts}. International Organization for Standardization. Consulté le 23 juin 2026, à l’adresse \url{https://www.iso.org/standard/81291.html}
+
+ISTQB. (s. d.). \textit{Regression testing}. ISTQB Glossary. Consulté le 23 juin 2026, à l’adresse \url{https://glossary.istqb.org/en_US/term/regression-testing}
+
+Jenkins. (s. d.). \textit{Pipeline}. Jenkins User Documentation. Consulté le 23 juin 2026, à l’adresse \url{https://www.jenkins.io/doc/book/pipeline/}
+
+Python Software Foundation. (s. d.). \textit{CSV File Reading and Writing}. Python 3 Documentation. Consulté le 23 juin 2026, à l’adresse \url{https://docs.python.org/3/library/csv.html}
+
+Selenium. (2024). \textit{WebDriver}. Selenium Documentation. Consulté le 23 juin 2026, à l’adresse \url{https://www.selenium.dev/documentation/webdriver/}
+
+SmartBear. (s. d.-a). \textit{Zephyr Test Management Products}. SmartBear. Consulté le 23 juin 2026, à l’adresse \url{https://smartbear.com/test-management/zephyr/}
+
+SmartBear. (s. d.-b). \textit{Zephyr Scale for Jira Cloud API}. SmartBear Support. Consulté le 23 juin 2026, à l’adresse \url{https://support.smartbear.com/zephyr-scale-cloud/api-docs/}
+
+
+
+
+
+
+
+préambule :
+
+\usepackage{url}
+
+
