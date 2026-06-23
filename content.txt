@@ -1,118 +1,15 @@
-3.1
+Conclusion
 
-Jira permet de suivre les tâches, les demandes et l’avancement des projets, conformément à son rôle d’outil de suivi du travail et des flux d’activité \parencite{atlassian-jira-doc}. Confluence sert quant à lui à centraliser la documentation et à faciliter le partage d’informations entre les équipes, notamment dans un contexte de documentation technique \parencite{atlassian-confluence-doc}.
+Cette mission a permis d’apporter une réponse concrète à un besoin d’amélioration des processus de gestion des outils collaboratifs chez ArianeGroup. Dans un contexte où Jira, Confluence et SuperTool sont utilisés pour soutenir le travail quotidien des équipes, la fiabilité des outils, la qualité du suivi et la réduction des tâches manuelles représentent des enjeux importants pour l’efficacité collective.
 
+La problématique du rapport portait sur l’automatisation et l’optimisation de ces processus afin d’améliorer la productivité de l’équipe et des collaborateurs. Les travaux réalisés ont permis d’avancer dans cette direction en structurant davantage les vérifications, en automatisant une partie des tests et en facilitant l’exploitation des données utilisateurs.
 
-3.2
-Lorsqu’une mise à jour ou une modification est déployée sur un serveur de pré-prod, il est nécessaire de vérifier que les principales fonctionnalités continuent de fonctionner correctement. Cette logique correspond au principe des tests de non-régression, dont l’objectif est de détecter si une modification a introduit ou révélé des défauts dans des parties déjà existantes du logiciel \parencite{istqb-regression-testing}.
+Les résultats obtenus montrent d’abord une meilleure maîtrise des tests de non-régression. Leur formalisation dans Zephyr rend les contrôles plus clairs, plus traçables et plus facilement réutilisables. L’automatisation par scripts Python et Selenium vient renforcer cette démarche, en permettant une exécution plus régulière des scénarios et une remontée automatique des résultats. Même si l’intégration complète dans Jenkins reste à finaliser, la faisabilité technique de cette automatisation a été démontrée.
 
-4.2
-La première étape a consisté à déterminer les fonctionnalités à tester en priorité. Cette démarche s’inscrit dans une logique de structuration des tests logiciels, qui repose notamment sur la définition de concepts, de processus et de documents de test clairement identifiés \parencite{iso-29119-2022}.
+Le travail mené sur SuperTool apporte également une amélioration significative. L’outil développé permet d’identifier plus rapidement les anomalies liées aux comptes utilisateurs et de produire une synthèse directement exploitable. Le tableau de bord analytique complète cette approche en donnant une vision plus globale de l’état de la plateforme. Ces livrables contribuent à réduire les manipulations manuelles, tout en améliorant la qualité des informations disponibles pour le suivi et la prise de décision.
 
+La mission ne se limite donc pas à la création d’outils techniques. Elle participe à une évolution plus large du fonctionnement de l’équipe, en passant d’un suivi principalement manuel à une démarche plus structurée, documentée et orientée données. L’intervention humaine reste indispensable, notamment pour l’analyse des anomalies et les décisions métier, mais elle peut être recentrée sur des tâches à plus forte valeur ajoutée.
 
-À partir de ces informations, des plans de test ont été construits pour chaque fonctionnalité retenue. Leur formalisation dans Zephyr permettait de s’appuyer sur un outil dédié à la gestion des tests dans Jira, adapté à la création, au suivi et à l’exécution de scénarios de test \parencite{smartbear-zephyr}.
+La perspective principale concerne désormais l’industrialisation des solutions développées. La finalisation de l’intégration Jenkins permettra de rendre les tests plus facilement exécutables par l’équipe, dans un environnement stable et partagé. Pour SuperTool, l’évolution vers une interface plus complète et l’automatisation progressive de certaines actions par API pourraient encore renforcer l’intérêt de l’outil.
 
-
-
-4.3
-
-Les scénarios définis précédemment ont été traduits en scripts Python à l’aide de Selenium WebDriver, qui permet de piloter un navigateur comme le ferait un utilisateur, localement ou à distance \parencite{selenium-webdriver}.
-
-Les résultats des tests ont ensuite été transmis vers Zephyr, un plugin intégré à Jira permettant de construire des plans de test détaillés et de suivre leurs exécutions. L’utilisation des API Zephyr permet d’automatiser une partie des échanges avec l’outil de gestion des tests \parencite{smartbear-zephyr-api}.
-
-Les scripts ont ensuite été préparés pour une intégration dans Jenkins. Jenkins Pipeline permet de modéliser des chaînes d’exécution automatisées et reproductibles, notamment pour les étapes de test et de déploiement \parencite{jenkins-pipeline}.
-
-
-4.4
-
-Une première version a été développée en Python, à partir du module CSV, qui permet de lire et d’écrire des données tabulaires dans des formats compatibles avec des outils comme Excel \parencite{python-csv}.
-
-
-5.1
-
-Les scénarios retenus ont été formalisés dans Zephyr sous la forme de plans de test détaillés. Ce choix est cohérent avec l’objectif de structuration documentaire des tests logiciels, qui vise à rendre les contrôles plus explicites, reproductibles et exploitables \parencite{iso-29119-2022}.
-
-
-5.2
-
-Les plans de test ont été traduits en scripts Python utilisant Selenium WebDriver, afin d’exécuter automatiquement les actions prévues dans les interfaces web de Jira et Confluence \parencite{selenium-webdriver}.
-
-
-6.3
-
-Les résultats obtenus peuvent être confrontés à l’analyse de l’existant présentée précédemment, ainsi qu’aux principes généraux du test logiciel. Les tests de non-régression visent précisément à vérifier qu’une modification n’a pas introduit de défaut dans des fonctionnalités déjà existantes \parencite{istqb-regression-testing}.
-
-La mise en place des plans de test dans Zephyr répond directement à cette limite. Elle rapproche le fonctionnement de l’équipe d’une démarche plus structurée de gestion des tests, conforme aux principes de formalisation et de suivi décrits dans les référentiels de test logiciel \parencite{iso-29119-2022}.
-
-
-
-
-
-Ref :
-
-
-@online{atlassian-jira-doc,
-  author  = {{Atlassian}},
-  title   = {Jira Documentation},
-  url     = {https://confluence.atlassian.com/jira},
-  urldate = {2026-06-23}
-}
-
-@online{atlassian-confluence-doc,
-  author  = {{Atlassian}},
-  title   = {Use Confluence for technical documentation},
-  url     = {https://support.atlassian.com/confluence-cloud/docs/use-confluence-for-technical-documentation/},
-  urldate = {2026-06-23}
-}
-
-@online{istqb-regression-testing,
-  author  = {{ISTQB}},
-  title   = {Regression testing},
-  url     = {https://glossary.istqb.org/en_US/term/regression-testing},
-  urldate = {2026-06-23}
-}
-
-@report{iso-29119-2022,
-  author      = {{ISO/IEC/IEEE}},
-  title       = {ISO/IEC/IEEE 29119-1:2022 -- Software and systems engineering -- Software testing -- Part 1: General concepts},
-  institution = {International Organization for Standardization},
-  year        = {2022}
-}
-
-@online{selenium-webdriver,
-  author  = {{Selenium}},
-  title   = {WebDriver},
-  url     = {https://www.selenium.dev/documentation/webdriver/},
-  urldate = {2026-06-23},
-  year    = {2024}
-}
-
-@online{jenkins-pipeline,
-  author  = {{Jenkins}},
-  title   = {Pipeline},
-  url     = {https://www.jenkins.io/doc/book/pipeline/},
-  urldate = {2026-06-23}
-}
-
-@online{smartbear-zephyr,
-  author  = {{SmartBear}},
-  title   = {Zephyr Test Management Products},
-  url     = {https://smartbear.com/test-management/zephyr/},
-  urldate = {2026-06-23}
-}
-
-@online{smartbear-zephyr-api,
-  author  = {{SmartBear}},
-  title   = {Zephyr Scale for Jira Cloud API},
-  url     = {https://support.smartbear.com/zephyr-scale-cloud/api-docs/},
-  urldate = {2026-06-23}
-}
-
-@online{python-csv,
-  author  = {{Python Software Foundation}},
-  title   = {CSV File Reading and Writing},
-  url     = {https://docs.python.org/3/library/csv.html},
-  urldate = {2026-06-23}
-}
-
-
+Ainsi, cette mission constitue une base solide pour améliorer durablement l’administration des outils collaboratifs. Elle montre que l’automatisation, lorsqu’elle est associée à une bonne compréhension des usages et des contraintes de l’entreprise, peut devenir un levier concret de fiabilité, de productivité et de pilotage.
