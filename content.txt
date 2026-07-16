@@ -1,0 +1,80 @@
+import argparse
+import json
+import os
+import ssl
+import sys
+import urllib.error
+import urllib.request
+import uuid
+from pathlib import Path
+
+
+def load_dotenv() -> None:
+    """Charge le fichier .env voisin, sans dépendance externe."""
+    path = Path(__file__).with_name(".env")
+    if not path.is_file():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--insecure", action="store_true", help="désactive la vérification TLS en préproduction")
+    args = parser.parse_args()
+    load_dotenv()
+
+    instance_url = os.getenv("WIMI_INSTANCE_URL", "https://ariane-preprod.wimi.pro/")
+    api_key = os.getenv("WIMI_API_KEY")
+    email = os.getenv("WIMI_EMAIL")
+    password = os.getenv("WIMI_PASSWORD")
+    if not all((api_key, email, password)):
+        print("ECHEC : WIMI_API_KEY, WIMI_EMAIL et WIMI_PASSWORD sont requis dans .env.")
+        sys.exit(1)
+
+    account_name = instance_url.rstrip("/").split("//", 1)[-1].split(".", 1)[0]
+    endpoint = instance_url.rstrip("/") + "/api/"
+    payload = {
+        "header": {
+            "target": "auth.user.Login",
+            "api_version": "1.2",
+            "app_token": api_key,
+            "msg_key": f"login-check-{uuid.uuid4()}",
+            "identification": {"account_name": account_name},
+            "auth": {"login": email, "password": password},
+        },
+        "body": {"data": None},
+    }
+    request = urllib.request.Request(
+        endpoint,
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers={"Accept": "application/json", "Content-Type": "application/json"},
+    )
+
+    try:
+        context = ssl._create_unverified_context() if args.insecure else None
+        with urllib.request.urlopen(request, timeout=20, context=context) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, ssl.SSLError) as error:
+        print(f"ECHEC : endpoint WAPI inaccessible ({error}).")
+        sys.exit(1)
+    except json.JSONDecodeError:
+        print("ECHEC : réponse WAPI non lisible.")
+        sys.exit(1)
+
+    error = result.get("body", {}).get("error")
+    if not error:
+        print("SUCCES : authentification WAPI réussie.")
+        return
+
+    # Le JSON complet n'est jamais affiché : il peut contenir un jeton de session.
+    print(f"ECHEC : {error.get('id', 'inconnu')} - {error.get('str', 'erreur WAPI')}.")
+    sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
