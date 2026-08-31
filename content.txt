@@ -1,1 +1,25 @@
+  Pour comparer les deux environnements, exécute ceci avec l’ancien Python :
 
+  C:\applications\MiniForge3.12\envs\Selenium\python.exe -c "import sys,os,requests,certifi; print('Python:',sys.executable);
+  print('Requests:',requests.__version__); print('CA:',certifi.where()); print('REQUESTS_CA_BUNDLE:',os.getenv('REQUESTS_CA_BUNDLE'));
+  print('CURL_CA_BUNDLE:',os.getenv('CURL_CA_BUNDLE')); print('SSL_CERT_FILE:',os.getenv('SSL_CERT_FILE'))"
+
+  Puis dans le terminal Playwright :
+
+  python -c "import sys,os,requests,certifi; print('Python:',sys.executable); print('Requests:',requests.__version__);
+  print('CA:',certifi.where()); print('REQUESTS_CA_BUNDLE:',os.getenv('REQUESTS_CA_BUNDLE'));
+  print('CURL_CA_BUNDLE:',os.getenv('CURL_CA_BUNDLE')); print('SSL_CERT_FILE:',os.getenv('SSL_CERT_FILE'))"
+
+  Vérifie aussi les paquets installés :
+
+  python -m pip show certifi python-certifi-win32 pip-system-certs truststore
+
+  Et, pour l’ancien environnement Conda :
+
+  conda config --show ssl_verify
+
+  La différence apparaîtra probablement dans le chemin Python, le fichier CA utilisé, une variable d’environnement ou un paquet d’intégration
+  Windows. La bonne correction sera ensuite de faire utiliser au nouvel environnement Playwright le même certificat interne, idéalement avec :
+
+  VERIFY_TLS=true
+  REQUESTS_CA_BUNDLE=C:/Certificates/intranet-ca-chain.pem
