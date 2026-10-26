@@ -1,17 +1,16 @@
-var o = AJS.dialog2;
-AJS.dialog2 = function (el) {
-  var r = o.apply(this, arguments);
-  ['show', 'hide'].forEach(function (m) {
-    var f = r[m];
-    if (typeof f !== 'function') return;
-    r[m] = function () { console.trace('dialog2.' + m, el); return f.apply(this, arguments); };
-  });
-  return r;
-};
-Object.keys(o).forEach(function (k) { AJS.dialog2[k] = o[k]; });
-
-
-
-
-
-new MutationObserver(function (ms) { ms.forEach(function (m) { console.log('ATTR', m.attributeName, '=', m.target.getAttribute(m.attributeName), m.target.id); }); }).observe(document.body, { attributes: true, subtree: true, attributeFilter: ['open', 'aria-hidden'] });
+(function () {
+  var opened = {}, retried = {};
+  new MutationObserver(function (ms) {
+    ms.forEach(function (m) {
+      var d = m.target;
+      if (!d.matches('section.aui-dialog2')) return;
+      if (d.hasAttribute('open')) { opened[d.id] = Date.now(); return; }
+      var t = opened[d.id], now = Date.now();
+      delete opened[d.id];
+      if (!t || now - t > 500) return;
+      if (retried[d.id] && now - retried[d.id] < 2000) return;
+      retried[d.id] = now;
+      setTimeout(function () { AJS.dialog2(d).show(); }, 50);
+    });
+  }).observe(document.body, { attributes: true, subtree: true, attributeFilter: ['open'] });
+})();
