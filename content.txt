@@ -14,3 +14,57 @@
     });
   }).observe(document.body, { attributes: true, subtree: true, attributeFilter: ['open'] });
 })();
+
+
+
+
+
+
+Here is a ticket-style summary you can adapt:
+
+**Title:** Linchpin Events dialogs close immediately after opening on Microsoft Edge 150+
+
+**Summary**
+Since upgrading from Edge 148 to Edge 150 (currently 152), modal dialogs in the Linchpin Events plugin do not stay open. This affects edit and delete confirmation dialogs, for example "Are you sure you want to delete this event?". Other browsers are not affected.
+
+**Current findings**
+- The dialog element (`section.aui-dialog2`, managed by AUI) is correctly found and the plugin calls `AJS.dialog2(...)` when the button is clicked.
+- The `open` attribute is added to the dialog and then removed within a fraction of a second, so the dialog appears to open and close instantly.
+- No `dialog2.hide` call is made by the plugin, so the closing comes from another mechanism, likely inside AUI or the event handling of the click.
+- Calling `AJS.dialog2(element).show()` manually in the console opens the dialog and keeps it open.
+- Reloading the page only shows the dialog when the URL changes, so the problem is in the click handling, not the initial rendering.
+- Edge reports a `Blocked aria-hidden` accessibility warning on the dialog. It is a warning only and does not explain the closing.
+- Edge's Enhanced Security Mode is set to balanced (policy `EnhanceSecurityMode = 1`), which is a possible difference from other browsers but is not confirmed as the cause.
+
+**Workaround (temporary, client-side)**
+A script reopens any dialog that closes less than 500 ms after opening, using `AJS.dialog2(...).show()`. It is applied per browser and does not fix the root cause.
+
+**Next steps**
+- Identify which code removes the `open` attribute by setting a DOM breakpoint on the dialog (attribute modifications) and reading the call stack.
+- Compare with a working browser to see whether the same call sequence occurs.
+- Once the source is found, decide between a targeted fix in the plugin or an adjustment of the browser configuration.
+
+I've left out the console-specific steps and the internal reasoning from the summary, since a ticket should only record what is known. Let me know if you want it shorter, or with the DOM breakpoint results added once you have them.
+
+
+
+
+
+
+
+
+
+
+
+
+
+var ra = Element.prototype.removeAttribute;
+Element.prototype.removeAttribute = function (n) {
+  if (n === 'open' && this.matches && this.matches('section.aui-dialog2')) console.trace('RETRAIT open', this.id);
+  return ra.apply(this, arguments);
+};
+var ta = Element.prototype.toggleAttribute;
+Element.prototype.toggleAttribute = function (n) {
+  if (n === 'open' && this.matches && this.matches('section.aui-dialog2')) console.trace('TOGGLE open', this.id);
+  return ta.apply(this, arguments);
+};
