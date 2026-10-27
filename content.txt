@@ -18,3 +18,13 @@
   };
   console.info('[fix] correctif actif');
 })();
+
+
+
+The first workaround reopened any dialog that closed within 500 ms of opening. It handled the simple cases, but it only reacted after the fact. By the time it reopened the dialog, AUI had already run its whole close sequence: removing the dialog from its layer stack, dropping the blanket and restoring the rest of the page. Reopening on top of that left some dialogs in an inconsistent state. That is why “Share to Microblog” reopened but could not be closed afterwards. It also missed any close that happened later than 500 ms, such as the edit dialog disappearing when clicking the image upload button.
+
+Further tracing showed what actually closes the dialogs. AUI dropdown menus react to mouseover on their items by asking the AUI layer manager (popUntil) to close every layer above the menu, which is meant to collapse submenus. Since the dialog is opened after the menu, AUI treats it as a layer above the menu and closes it as well. This happens with the “…” event menu right after choosing an action, and with the upload dropdown inside the edit dialog. The link with the Edge update is likely that recent Chromium versions fire mouseover in situations where they didn’t before, but that part is not confirmed.
+
+The current workaround intercepts AJS.LayerManager.global.popUntil and ignores calls triggered by mouse hover events while an AUI dialog is open. The close is prevented rather than undone, so AUI’s internal state stays consistent. Normal closes are unaffected: Cancel, the close button, Escape and automatic closes after saving all still work. The only known side effect is that submenus inside an open dialog no longer collapse on hover, only on click.
+
+This remains a client-side script that has to be run on each page load. A proper fix should come from the plugin vendor or a server-side change.
