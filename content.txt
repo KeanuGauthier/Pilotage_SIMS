@@ -1,28 +1,24 @@
 (function () {
-  var opened = {}, retried = {};
-  new MutationObserver(function (ms) {
-    ms.forEach(function (m) {
-      var d = m.target;
-      if (!d.matches('section.aui-dialog2')) return;
-      if (d.hasAttribute('open')) { opened[d.id] = Date.now(); return; }
-      var t = opened[d.id], now = Date.now();
-      delete opened[d.id];
-      if (!t || now - t > 500) return;
-      if (retried[d.id] && now - retried[d.id] < 2000) return;
-      retried[d.id] = now;
-      setTimeout(function () { AJS.dialog2(d).show(); }, 50);
-    });
-  }).observe(document.body, { attributes: true, subtree: true, attributeFilter: ['open'] });
+  var LM = window.AJS && AJS.LayerManager && AJS.LayerManager.global;
+  if (!LM || typeof LM.popUntil !== 'function') {
+    console.warn('[fix] LayerManager AUI introuvable, correctif non applique');
+    return;
+  }
+  if (LM.__fixFocus) { console.info('[fix] deja actif'); return; }
+  LM.__fixFocus = true;
+
+  var FOCUS = { focusin: 1, focusout: 1, focus: 1, blur: 1 };
+  var orig = LM.popUntil;
+
+  LM.popUntil = function () {
+    var ev = window.event;
+    var dialogOuvert = document.querySelector('section.aui-dialog2[open]');
+    if (ev && FOCUS[ev.type] && dialogOuvert) {
+      console.info('[fix] fermeture bloquee (' + ev.type + ') sur', dialogOuvert.id);
+      return;
+    }
+    return orig.apply(this, arguments);
+  };
+
+  console.info('[fix] correctif actif');
 })();
-
-
-
-
-
-
-['pointerdown','mousedown','pointerup','mouseup','click','focusin','focusout','keydown'].forEach(function (t) {
-  document.addEventListener(t, function (e) {
-    var el = e.target;
-    console.log('EVT', t, el && (el.id || el.className || el.tagName), Math.round(performance.now()));
-  }, true);
-});
