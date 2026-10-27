@@ -1,33 +1,18 @@
-var ra = Element.prototype.removeAttribute;
-Element.prototype.removeAttribute = function (n) {
-  if (n === 'open' && this.matches && this.matches('section.aui-dialog2')) {
-    var ev = window.event, t = ev && ev.target, r = ev && ev.relatedTarget;
-    console.log('FERMETURE', this.id, ev ? ev.type : 'aucun evt', t && (t.id || t.className || t.tagName), r ? 'vers=' + (r.id || r.className || r.tagName) : '');
-  }
-  return ra.apply(this, arguments);
-};
-
-
-
-
-
-
-
-
 (function () {
   var LM = window.AJS && AJS.LayerManager && AJS.LayerManager.global;
   if (!LM || typeof LM.popUntil !== 'function') { console.warn('[fix] LayerManager introuvable'); return; }
   if (LM.__fix) { console.info('[fix] deja actif'); return; }
   LM.__fix = true;
-  var FOCUS = { focusin: 1, focusout: 1, focus: 1, blur: 1 };
+  var SURVOL = /^(mouse|pointer)(over|out|enter|leave|move)$/;
   var orig = LM.popUntil;
-  LM.popUntil = function () {
+  LM.popUntil = function (calque) {
     var ev = window.event;
-    var ouverts = Array.prototype.slice.call(document.querySelectorAll('section.aui-dialog2[open]'));
-    var cible = ev && ev.target;
-    var dedans = cible && cible.nodeType === 1 && ouverts.some(function (d) { return d.contains(cible); });
-    var bloquer = ouverts.length > 0 && ev && ev.type.indexOf('key') !== 0 && (FOCUS[ev.type] || !dedans);
-    console.info('[fix] popUntil', ev ? ev.type : 'aucun evt', cible && (cible.id || cible.className || cible.tagName), bloquer ? 'BLOQUE' : 'ok');
+    var ouvert = document.querySelector('section.aui-dialog2[open]');
+    var el = calque && calque.jquery ? calque[0] : calque;
+    var bloquer = !!(ouvert && ev && SURVOL.test(ev.type));
+    console.info('[fix] popUntil', ev ? ev.type : 'aucun evt',
+      'calque=' + (el && el.id ? el.id : '?') + (el && el.hasAttribute && el.hasAttribute('open') ? ' (ouvert)' : ' (ferme)'),
+      bloquer ? 'BLOQUE' : 'ok');
     if (bloquer) return;
     return orig.apply(this, arguments);
   };
