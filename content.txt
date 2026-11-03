@@ -37,14 +37,14 @@
 \def\dy{-4.6}  % écart vertical entre les deux lignes
 
 % --- Ligne 1 : CI/CD GitLab ---
-\node[gitlab] (git)   at (0,0)     {\textbf{1. GitLab Repo}\\[2pt]Modification de version\\(\texttt{Dockerfile} + configs)};
-\node[gitlab] (build) at (\dx,0)   {\textbf{2. GitLab CI (Build)}\\[2pt]Création de l'image\\XWiki personnalisée};
-\node[gitlab] (test)  at (2*\dx,0) {\textbf{3. GitLab CI (Test)}\\[2pt]Migration + test API\\sur clone de la prod};
-\node[gitlab] (reg)   at (3*\dx,0) {\textbf{4. GitLab Registry}\\[2pt]Image XWiki validée,\\prête pour la prod};
+\node[gitlab] (git)   at (0,0)     {\textbf{1. GitLab Repo}\\[2pt]Modification de version\\(\texttt{Helm} / configs)};
+\node[gitlab] (build) at (\dx,0)   {\textbf{2. GitLab CI (Build)}\\[2pt]Préparation de l'image\\OpenProject interne};
+\node[gitlab] (test)  at (2*\dx,0) {\textbf{3. GitLab CI (Test)}\\[2pt]Migration \texttt{db:migrate}\\+ \texttt{/health\_checks/all}};
+\node[gitlab] (reg)   at (3*\dx,0) {\textbf{4. GitLab Registry}\\[2pt]Image OpenProject\\validée pour la prod};
 
 % --- Ligne 2 : Production ---
-\node[db]    (storage) at (\dx,\dy)   {\textbf{Stockage Prod}\\[2pt]Base PostgreSQL\\+ dossier \texttt{data}};
-\node[k8s]   (k8s)     at (2*\dx,\dy) {\textbf{6. Kubernetes (Prod)}\\[2pt]Pods XWiki\\(auto-scaling RAM/CPU\\\& self-healing)};
+\node[db]    (storage) at (\dx,\dy)   {\textbf{Stockage Prod}\\[2pt]Base PostgreSQL\\+ dossier \texttt{assets}};
+\node[k8s]   (k8s)     at (2*\dx,\dy) {\textbf{6. Kubernetes (Prod)}\\[2pt]Pods \texttt{Web} \& \texttt{Worker}\\(auto-scaling séparé)};
 \node[human] (deploy)  at (3*\dx,\dy) {\textbf{5. Action humaine}\\[2pt]Une seule commande :\\\texttt{./deploy.sh <version>}};
 
 % ===== Flux principal =====
@@ -52,7 +52,7 @@
 \draw[arrow] (build) -- (test);
 \draw[arrow] (test) -- (reg);
 \draw[arrow] (reg) -- node[lbl, right=3pt] {Pull de\\l'image} (deploy);
-\draw[arrow] (deploy) -- node[lbl, above=2pt] {Mise à jour} (k8s);
+\draw[arrow] (deploy) -- node[lbl, above=2pt] {Rolling\\update} (k8s);
 \draw[dualarrow] (k8s) -- node[lbl, above=2pt] {Lecture /\\Écriture} (storage);
 
 % ===== Flux de sauvegarde =====
