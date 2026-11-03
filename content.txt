@@ -1,30 +1,55 @@
-(function () {
-  var LM = window.AJS && AJS.LayerManager && AJS.LayerManager.global;
-  if (!LM || typeof LM.popUntil !== 'function') { console.warn('[fix] LayerManager introuvable'); return; }
-  if (LM.__fix) { console.info('[fix] deja actif'); return; }
-  LM.__fix = true;
-  var SURVOL = /^(mouse|pointer)(over|out|enter|leave|move)$/;
-  var orig = LM.popUntil;
-  LM.popUntil = function (calque) {
-    var ev = window.event;
-    var ouvert = document.querySelector('section.aui-dialog2[open]');
-    var el = calque && calque.jquery ? calque[0] : calque;
-    var bloquer = !!(ouvert && ev && SURVOL.test(ev.type));
-    console.info('[fix] popUntil', ev ? ev.type : 'aucun evt',
-      'calque=' + (el && el.id ? el.id : '?') + (el && el.hasAttribute && el.hasAttribute('open') ? ' (ouvert)' : ' (ferme)'),
-      bloquer ? 'BLOQUE' : 'ok');
-    if (bloquer) return;
-    return orig.apply(this, arguments);
-  };
-  console.info('[fix] correctif actif');
-})();
+« Salut, j'ai structuré un plan complet pour fiabiliser nos mises à jour d'**OpenProject** et gérer sa montée en charge avec **Kubernetes**. L'idée est double : garantir zéro régression grâce à **GitLab CI** avant de toucher à la prod, et laisser Kubernetes allouer dynamiquement les ressources en fonction de l'activité des utilisateurs, tout en gardant un déploiement final déclenché par nous en une seule commande.
 
+Et la bonne nouvelle, c'est qu'OpenProject s'intègre beaucoup plus naturellement dans Kubernetes que XWiki, car son architecture sépare déjà nativement le serveur web et les tâches de fond.
 
+---
 
-The first workaround reopened any dialog that closed within 500 ms of opening. It handled the simple cases, but it only reacted after the fact. By the time it reopened the dialog, AUI had already run its whole close sequence: removing the dialog from its layer stack, dropping the blanket and restoring the rest of the page. Reopening on top of that left some dialogs in an inconsistent state. That is why “Share to Microblog” reopened but could not be closed afterwards. It also missed any close that happened later than 500 ms, such as the edit dialog disappearing when clicking the image upload button.
+### Le fonctionnement en 5 étapes
 
-Further tracing showed what actually closes the dialogs. AUI dropdown menus react to mouseover on their items by asking the AUI layer manager (popUntil) to close every layer above the menu, which is meant to collapse submenus. Since the dialog is opened after the menu, AUI treats it as a layer above the menu and closes it as well. This happens with the “…” event menu right after choosing an action, and with the upload dropdown inside the edit dialog. The link with the Edge update is likely that recent Chromium versions fire mouseover in situations where they didn’t before, but that part is not confirmed.
+**1. Le déclencheur (Sur GitLab)**
+On crée un dépôt Git qui contient notre configuration de déploiement Kubernetes (le *Helm Chart* officiel d'OpenProject ou nos manifestes YAML, nos variables LDAP/SMTP et nos scripts). Quand une nouvelle version d'OpenProject sort (ex: passage en `15.x`), on change simplement le numéro de version dans le dépôt et on *push*.
 
-The current workaround intercepts AJS.LayerManager.global.popUntil and ignores calls triggered by mouse hover events while an AUI dialog is open. The close is prevented rather than undone, so AUI’s internal state stays consistent. Normal closes are unaffected: Cancel, the close button, Escape and automatic closes after saving all still work. The only known side effect is that submenus inside an open dialog no longer collapse on hover, only on click.
+**2. La préparation de l'image (Étape `Build` automatique)**
+GitLab CI détecte le changement, récupère la nouvelle image officielle d'OpenProject, y intègre nos éventuels certificats d'entreprise et prépare l'image dans notre registre interne.
 
-This remains a client-side script that has to be run on each page load. A proper fix should come from the plugin vendor or a server-side change.
+**3. Le crash-test sur nos vraies données (Étape `Test` automatique)**
+Avant d'autoriser cette version à aller sur le cluster Kubernetes de prod, GitLab CI monte un environnement temporaire isolé branché sur **une copie de notre sauvegarde de prod de la veille** (base PostgreSQL + dossier `assets` des pièces jointes).
+
+* Le conteneur de test lance automatiquement la migration de la base de données (`db:migrate`).
+* Notre script vérifie l'absence d'erreurs SQL dans les logs et interroge la sonde officielle d'OpenProject (`/health_checks/all`) jusqu'à obtenir un `HTTP 200 OK`.
+* Dès que c'est validé, l'environnement de test est détruit et l'image reçoit le tag "Prête pour la prod" dans le GitLab Container Registry.
+
+**4. Le déploiement en 1 commande (Par nous, vers Kubernetes)**
+Rien ne part en production tout seul. Le jour choisi, l'un de nous lance une seule commande : `./deploy.sh <nouvelle_version>`.
+Ce script orchestre la mise à jour avec Kubernetes (`helm upgrade` ou `kubectl`) :
+
+1. Il déclenche une sauvegarde immédiate de sécurité (Dump PostgreSQL + snapshot des pièces jointes).
+2. Il lance un *Job* Kubernetes de pré-déploiement qui met à jour le schéma de la base de données.
+3. Il met à jour les conteneurs OpenProject progressivement (*Rolling Update*) sans couper brutalement les utilisateurs connectés.
+
+**5. Gestion de la charge et haute disponibilité avec Kubernetes (Scalabilité)**
+C'est là qu'OpenProject brille sur Kubernetes, car il sépare son fonctionnement en deux types de conteneurs (*Pods*) qu'on peut faire évoluer indépendamment selon le besoin réel des utilisateurs :
+
+* **Les Pods `Web` (Interface utilisateur et API) :** Si beaucoup d'utilisateurs se connectent en même temps le matin, Kubernetes augmente automatiquement la RAM/CPU allouée ou démarre un deuxième conteneur `Web` en parallèle pour répartir le trafic instantanément.
+* **Les Pods `Worker` (Tâches de fond) :** Quand des utilisateurs lancent de gros exports (PDF, Excel), des copies de projets entiers ou que des centaines de notifications mails partent, ce sont les *Workers* qui travaillent. Kubernetes peut allouer plus de ressources aux *Workers* pendant ces pics sans jamais ralentir l'interface web des autres utilisateurs.
+* **Auto-guérison (Self-Healing) :** Kubernetes interroge en permanence la sonde `/health_checks` d'OpenProject. Si un conteneur fige ou sature en mémoire, Kubernetes le redémarre automatiquement en coulisses.
+
+---
+
+### Le choix d'architecture pour notre base PostgreSQL et les fichiers
+
+Pour que plusieurs conteneurs OpenProject tournent sur Kubernetes, il faut juste trancher sur l'emplacement des données :
+
+**Option 1 : PostgreSQL en dehors de Kubernetes (le choix de la simplicité et de la sécurité).** Kubernetes ne gère que les conteneurs `Web`, `Worker` et le cache `Memcached` d'OpenProject, tandis que la base PostgreSQL reste sur un serveur Linux dédié à côté (avec un dossier partagé NFS pour les pièces jointes). C'est l'approche la plus rassurante : on garde nos sauvegardes `pg_dump` habituelles très simples à restaurer, et on évite la complexité de gérer une base de données dans un cluster. En contrepartie, les ressources de la base de données restent fixes.
+
+**Option 2 : Tout à l'intérieur de Kubernetes (le choix du "tout-automatisé", mais plus complexe).** La base PostgreSQL et le stockage des pièces jointes tournent eux aussi dans le cluster Kubernetes. Kubernetes peut alors ajuster dynamiquement leurs ressources et redémarrer la base sur un autre serveur physique en cas de panne matérielle. En revanche, cela exige d'avoir une brique de stockage distribuée très solide sur nos serveurs (type Longhorn, Ceph ou NFS en mode `ReadWriteMany` pour que tous les conteneurs accèdent aux mêmes pièces jointes) et un *Operator* PostgreSQL pour gérer les sauvegardes sans risque de corruption.
+
+---
+
+### Ce qu'on y gagne au quotidien
+
+* **Zéro surprise lors des mises à jour :** Les migrations de base de données sont testées automatiquement sur nos vraies données dans GitLab CI avant d'arriver sur le cluster.
+* **Une application toujours fluide :** Plus de ralentissements quand quelqu'un lance un gros export de projet, Kubernetes isole et adapte les ressources entre l'affichage web et les tâches de fond.
+* **Déploiement et Rollback en 2 minutes :** Une seule commande pour déployer après sauvegarde, et un retour en arrière immédiat (`helm rollback` + restauration du dump) si jamais on détecte une anomalie.
+
+Qu'est-ce que tu en penses ? On peut commencer par valider si on préfère garder PostgreSQL en dehors ou à l'intérieur du cluster, et je monte un prototype sur GitLab. »
