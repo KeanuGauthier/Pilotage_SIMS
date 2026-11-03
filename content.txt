@@ -1,1 +1,54 @@
+\documentclass[tikz,border=10pt]{standalone}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{tikz}
+\usetikzlibrary{shapes.geometric, arrows.meta, positioning, fit, backgrounds}
 
+\begin{document}
+
+\begin{tikzpicture}[
+    node distance=1.2cm and 1.6cm,
+    box/.style={
+        rectangle, rounded corners=4pt, draw=black!75, thick,
+        text width=3.2cm, minimum height=1.3cm, align=center,
+        font=\sffamily\footnotesize, fill=white
+    },
+    gitlab/.style={box, fill=orange!12, draw=orange!80!black},
+    human/.style={box, fill=yellow!15, draw=yellow!80!black},
+    k8s/.style={box, fill=blue!10, draw=blue!75!black},
+    db/.style={
+        cylinder, shape border rotate=90, aspect=0.25,
+        draw=teal!80!black, thick, fill=teal!10,
+        text width=2.8cm, minimum height=1.3cm, align=center,
+        font=\sffamily\footnotesize
+    },
+    arrow/.style={-Stealth, thick, draw=black!75},
+    dashedarrow/.style={-Stealth, thick, dashed, draw=teal!80!black}
+]
+
+% --- 1. Ligne CI/CD (GitLab) ---
+\node[gitlab] (git) {\textbf{1. GitLab Repo}\\Modification version\\(\texttt{Dockerfile} + configs)};
+\node[gitlab, right=of git] (build) {\textbf{2. GitLab CI (Build)}\\Création de l'image\\XWiki personnalisée};
+\node[gitlab, right=of build] (test) {\textbf{3. GitLab CI (Test)}\\Migration + test API\\sur clone de Prod};
+\node[gitlab, right=of test] (reg) {\textbf{4. GitLab Registry}\\Image XWiki validée\\prête pour la prod};
+
+% --- 2. Ligne Production (Humain + Kubernetes + Données) ---
+\node[human, below=1.8cm of reg] (deploy) {\textbf{5. Action Humaine}\\1 seule commande :\\\texttt{./deploy.sh <version>}};
+\node[k8s, left=of deploy] (k8s) {\textbf{6. Kubernetes (Prod)}\\Pods XWiki (Auto-scaling\\RAM/CPU \& Self-Healing)};
+\node[db, left=of k8s] (storage) {\textbf{Stockage Prod}\\Base PostgreSQL\\+ Dossier \texttt{data}};
+
+% --- Flèches du flux principal ---
+\draw[arrow] (git) -- (build);
+\draw[arrow] (build) -- (test);
+\draw[arrow] (test) -- (reg);
+\draw[arrow] (reg) -- node[right, font=\sffamily\scriptsize] {Pull image} (deploy);
+\draw[arrow] (deploy) -- node[above, font=\sffamily\scriptsize] {Mise à jour} (k8s);
+\draw[arrow, <->] (k8s) -- node[above, font=\sffamily\scriptsize] {Lecture/Écriture} (storage);
+
+% --- Flèches des sauvegardes (Backups) ---
+\draw[dashedarrow] (storage.north) -- ++(0,0.85) -| node[pos=0.25, above, font=\sffamily\scriptsize, text=teal!80!black] {Copie nocturne (Vraies données pour le crash-test)} (test.south);
+\draw[dashedarrow] (deploy.south) -- ++(0,-0.6) -| node[pos=0.25, below, font=\sffamily\scriptsize, text=teal!80!black] {1. Backup de sécurité immédiat avant déploiement} (storage.south);
+
+\end{tikzpicture}
+
+\end{document}
