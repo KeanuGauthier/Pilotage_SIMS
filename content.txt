@@ -1,148 +1,113 @@
-"""Small, dependency-free helpers (file names, hashing, atomic writes, formatting)."""
+"""Install automatic-jira-archiving (run it once, and again after each ``git pull``).
+
+Usage (in a terminal opened in the project folder):
+
+    py install.py              # recommended: private Python environment in the .venv folder
+    py install.py --no-venv    # if the .venv Python is blocked on your PC (see README.md)
+
+What it does:
+
+1. checks the Python version;
+2. creates a private Python environment in the ``.venv`` folder (unless ``--no-venv``);
+3. installs the libraries listed in ``requirements.txt`` with pip;
+4. creates the configuration file ``.env`` from ``.env.example`` (an existing ``.env`` is kept).
+
+This script uses the Python standard library only.
+"""
 
 from __future__ import annotations
 
-import hashlib
-import json
-import os
-import re
-import unicodedata
-from collections.abc import Iterator
-from datetime import datetime, timezone
+import argparse
+import shutil
+import subprocess
+import sys
 from pathlib import Path
-from typing import Any, TypeVar
 
-T = TypeVar("T")
+from jira_archiver.bootstrap import pause_if_double_clicked, started_by_double_click, venv_python
 
-# Names Windows refuses to use as file names, whatever the extension.
-_WINDOWS_RESERVED = {
-    "CON", "PRN", "AUX", "NUL",
-    *(f"COM{i}" for i in range(1, 10)),
-    *(f"LPT{i}" for i in range(1, 10)),
-}
-_FORBIDDEN_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
-
-#: Jira project keys: a letter followed by letters, digits or underscores.
-PROJECT_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,254}$")
+PROJECT_ROOT = Path(__file__).resolve().parent
+MIN_PYTHON = (3, 10)
 
 
-def safe_filename(name: str, max_length: int = 100) -> str:
-    """Return a file name that is safe on Windows, macOS and Linux.
-
-    Removes path separators (prevents writing outside the target folder),
-    forbidden characters, reserved Windows names, and limits the length while
-    keeping the extension.
-    """
-    name = unicodedata.normalize("NFC", name or "")
-    name = _FORBIDDEN_CHARS.sub("_", name).strip().strip(".")
-    if not name:
-        name = "file"
-    stem, dot, ext = name.rpartition(".")
-    if not dot:
-        stem, ext = name, ""
-    if stem.upper() in _WINDOWS_RESERVED:
-        stem = f"_{stem}"
-    ext = ext[:15]
-    room = max_length - (len(ext) + 1 if ext else 0)
-    stem = stem[: max(room, 1)].rstrip(" .") or "file"
-    return f"{stem}.{ext}" if ext else stem
+def step(message: str) -> None:
+    print(f"\n--- {message}")
 
 
-def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
-    """Compute the SHA-256 fingerprint of a file without loading it in memory."""
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(chunk_size), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+def run(command: list[str]) -> bool:
+    """Run *command* (a fixed list of arguments, no shell). Return True on success."""
+    sys.stdout.flush()  # keep our messages in order with the output of the command
+    try:
+        return subprocess.run(command, cwd=PROJECT_ROOT, check=False).returncode == 0  # noqa: S603
+    except OSError as exc:
+        print(f"[ERROR] Could not start {command[0]}: {exc}")
+        return False
 
 
-def atomic_write_bytes(path: Path, data: bytes) -> None:
-    """Write a file atomically: a crash never leaves a half-written file behind."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".part")
-    tmp.write_bytes(data)
-    os.replace(tmp, path)
+def install(use_venv: bool) -> bool:
+    print("=== automatic-jira-archiving installation ===")
 
+    step("Checking Python")
+    print(f"Python {sys.version.split()[0]} ({sys.executable})")
+    if sys.version_info < MIN_PYTHON:
+        print(f"[ERROR] Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]} or newer is required. Install Python 3.12.")
+        return False
 
-def atomic_write_json(path: Path, data: Any) -> None:
-    """Write *data* as pretty UTF-8 JSON, atomically."""
-    atomic_write_bytes(path, json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"))
-
-
-def read_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8"))
-
-
-def utc_now() -> datetime:
-    return datetime.now(timezone.utc).replace(microsecond=0)
-
-
-def human_size(num_bytes: int | float | None) -> str:
-    """Format a byte count, e.g. ``1536`` -> ``"1.5 KB"``."""
-    if num_bytes is None:
-        return ""
-    size = float(num_bytes)
-    for unit in ("B", "KB", "MB", "GB"):
-        if size < 1024 or unit == "GB":
-            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
-        size /= 1024
-    return f"{size:.1f} GB"
-
-
-def chunks(items: list[T], size: int) -> Iterator[list[T]]:
-    for start in range(0, len(items), size):
-        yield items[start:start + size]
-
-
-def issue_sort_key(key: str) -> tuple[str, int]:
-    """Sort ``PROJ-2`` before ``PROJ-10``."""
-    prefix, _, number = key.rpartition("-")
-    return (prefix, int(number)) if number.isdigit() else (key, 0)
-
-
-def is_empty(value: Any) -> bool:
-    """True for values Jira uses to say "nothing here"."""
-    if value is None:
-        return True
-    if isinstance(value, (str, list, dict, tuple)) and len(value) == 0:
-        return True
-    if isinstance(value, str) and not value.strip():
-        return True
-    return False
-
-
-class SingleInstanceLock:
-    """Prevents two archive runs from working at the same time on the same machine/output folder.
-
-    Uses an operating-system file lock: it is released automatically if the
-    process stops, even after a crash, so it can never stay "stuck".
-    """
-
-    def __init__(self, path: Path) -> None:
-        self._path = path
-        self._handle: Any = None
-
-    def acquire(self) -> bool:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        handle = self._path.open("a+")
-        try:
-            if os.name == "nt":
-                import msvcrt
-
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            handle.close()
+    if use_venv:
+        python = venv_python(PROJECT_ROOT)
+        if python.is_file():
+            step("The private Python environment (.venv folder) already exists")
+        else:
+            step("Creating the private Python environment in the .venv folder")
+            if not run([sys.executable, "-m", "venv", str(PROJECT_ROOT / ".venv")]):
+                print("[ERROR] The .venv folder could not be created.")
+                print("        Try: py install.py --no-venv   (see README.md)")
+                return False
+        if not run([str(python), "-c", "pass"]):
+            print("[ERROR] The Python of the .venv folder cannot start (maybe blocked by a company policy).")
+            print("        Delete the .venv folder, then run: py install.py --no-venv")
             return False
-        self._handle = handle
-        return True
+        pip_command = [str(python), "-m", "pip", "install", "-r", "requirements.txt"]
+    else:
+        step("Installing without .venv: the libraries go to your user profile")
+        if (PROJECT_ROOT / ".venv").exists():
+            print("[ERROR] A .venv folder exists: the scripts would keep trying to use it.")
+            print("        Delete the .venv folder, then run this command again.")
+            return False
+        pip_command = [sys.executable, "-m", "pip", "install", "--user", "-r", "requirements.txt"]
 
-    def release(self) -> None:
-        if self._handle is not None:
-            self._handle.close()  # closing the file releases the lock
-            self._handle = None
+    step("Installing the libraries listed in requirements.txt (this can take a minute)")
+    if not run(pip_command):
+        print("[ERROR] pip could not install the libraries. Read the messages above.")
+        print('        See "Troubleshooting" in README.md (internal package mirror).')
+        return False
+
+    env_file = PROJECT_ROOT / ".env"
+    if env_file.exists():
+        step("Configuration file .env already exists: kept as it is")
+    else:
+        shutil.copyfile(PROJECT_ROOT / ".env.example", env_file)
+        step("Configuration file .env created")
+
+    print("\n=== Installation finished ===")
+    print("Next steps:")
+    print('  1. Open the ".env" file with Notepad and fill in JIRA_BASE_URL and JIRA_PAT.')
+    print("  2. Test the connection:  py check_connection.py")
+    return True
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(description="Install automatic-jira-archiving and its libraries.")
+    parser.add_argument("--no-venv", action="store_true",
+                        help="Install the libraries in your user profile instead of a private .venv folder.")
+    args = parser.parse_args(argv)
+    if install(use_venv=not args.no_venv):
+        return 0
+    print("\n=== Installation FAILED: read the messages above, and \"Troubleshooting\" in README.md ===")
+    return 1
+
+
+if __name__ == "__main__":
+    _double_clicked = started_by_double_click()
+    _exit_code = main(sys.argv[1:])
+    pause_if_double_clicked(_double_clicked)
+    sys.exit(_exit_code)
