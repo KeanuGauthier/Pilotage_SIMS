@@ -1,207 +1,429 @@
-"""Assemble the final archive: ``project.json``, ``manifest.json``, ``README.txt`` and the ZIP file.
+"""Render one archived issue as a clean, detailed PDF document.
 
-Final ZIP layout::
+Layout (A4, portrait):
 
-    <KEY>_jira_archive_<YYYYMMDD>.zip
-    └── <KEY>_jira_archive_<YYYYMMDD>/
-        ├── README.txt          plain-language description of the archive
-        ├── project.json        all project + issue data (see docs/ARCHIVE_FORMAT.md)
-        ├── manifest.json       inventory of every file with its SHA-256 fingerprint
-        ├── pdf/<KEY>-<n>.pdf   one PDF per issue
-        └── attachments/<KEY>-<n>/<id>_<file name>
+1. Header: issue key, summary, project.
+2. Details / People / Dates side by side, then time tracking.
+3. Description and Environment (rich text, with images).
+4. Every other non-empty field ("Other fields"), rich-text fields shown in full.
+5. Issue links, parent and sub-tasks, remote links.
+6. Attachments (list + image previews).
+7. Comments, work log, full change history.
 
-A ``<zip name>.sha256`` file is written next to the ZIP to check it was not
-corrupted (e.g. after copying it to the archive storage).
+Every page has a footer with the issue key, archive date and "Page X of Y".
+
+If a document cannot be laid out (e.g. a gigantic table cell), it is rebuilt in
+"safe mode" (tables flattened), and as a last resort as a minimal PDF pointing to
+the JSON file. A single problematic issue therefore never stops an archive run.
 """
 
 from __future__ import annotations
 
-import json
-import os
-import textwrap
-import zipfile
-from collections.abc import Iterator
+import io
+from functools import partial
 from pathlib import Path
 from typing import Any
+from xml.sax.saxutils import escape
 
-from . import ARCHIVE_FORMAT_VERSION, __version__
-from .exporter import ExportResult
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import mm
+from reportlab.pdfgen import canvas
+from reportlab.platypus import (
+    CondPageBreak,
+    Flowable,
+    KeepTogether,
+    Paragraph,
+    SimpleDocTemplate,
+    Spacer,
+    Table,
+    TableStyle,
+)
+from reportlab.platypus.flowables import HRFlowable
+
+from . import __version__
+from .formatting import format_datetime, format_seconds, format_value
+from .html_to_pdf import HtmlToFlowables, ImageResolver
 from .logging_setup import get_logger
-from .utils import atomic_write_json, issue_sort_key, read_json, sha256_file, utc_now
+from .pdf_styles import BORDER, HEADER_BG, MUTED, PRIMARY, PdfStyles, make_image, make_styles
+from .utils import atomic_write_bytes, human_size, is_empty
 
-log = get_logger("package")
+log = get_logger("pdf")
 
+PAGE_WIDTH, PAGE_HEIGHT = A4
+MARGIN = 15 * mm
+CONTENT_WIDTH = PAGE_WIDTH - 2 * MARGIN
+MAX_CELL_CHARS = 1500  # long values in tables are cut (the full value is always in the JSON)
 
-def _dump(value: Any, indent_level: int) -> str:
-    """JSON-encode *value* and indent it so it can be embedded at *indent_level*."""
-    text = json.dumps(value, ensure_ascii=False, indent=2)
-    return text.replace("\n", "\n" + "  " * indent_level)
+DETAIL_FIELDS = [
+    ("issuetype", "Type"), ("status", "Status"), ("priority", "Priority"),
+    ("resolution", "Resolution"), ("versions", "Affects Version/s"),
+    ("fixVersions", "Fix Version/s"), ("components", "Component/s"),
+    ("labels", "Labels"), ("security", "Security Level"),
+]
+PEOPLE_FIELDS = [("assignee", "Assignee"), ("reporter", "Reporter"), ("creator", "Creator"),
+                 ("votes", "Votes"), ("watches", "Watchers")]
+DATE_FIELDS = [("created", "Created"), ("updated", "Updated"), ("resolutiondate", "Resolved"),
+               ("duedate", "Due Date")]
+RICH_FIELDS = [("description", "Description"), ("environment", "Environment")]
 
-
-def _issue_files(result: ExportResult) -> Iterator[Path]:
-    keys = sorted((item["key"] for item in result.inventory), key=issue_sort_key)
-    for key in keys:
-        yield result.paths.issues / f"{key}.json"
-
-
-def write_project_json(result: ExportResult, jira_info: dict[str, Any], generated_at: str) -> Path:
-    """Write ``project.json`` by streaming the issues one by one (works for very large projects)."""
-    metadata = result.metadata
-    used_fields: set[str] = set()
-    for path in _issue_files(result):
-        used_fields.update(read_json(path)["fields"].keys())
-    for issue_type in metadata["issue_types"]:
-        used_fields.update(f.get("fieldId") for f in issue_type.get("create_screen_fields") or [])
-
-    header = {
-        "archive": {
-            "format_version": ARCHIVE_FORMAT_VERSION,
-            "generated_at": generated_at,
-            "export_started_at": metadata["export_started_at"],
-            "tool": f"jira-archiver {__version__}",
-            "jira": jira_info,
-            "issue_count": len(result.inventory),
-            "warnings": metadata.get("warnings", []),
-        },
-        "project": metadata["project"],
-        "components": metadata["components"],
-        "versions": metadata["versions"],
-        "roles": metadata["roles"],
-        "schemes": {
-            "permission": metadata["permission_scheme"],
-            "notification": metadata["notification_scheme"],
-            "issue_security": metadata["issue_security_scheme"],
-        },
-        "statuses_by_issue_type": metadata["statuses_by_issue_type"],
-        "issue_types": metadata["issue_types"],
-        "fields": {fid: info for fid, info in sorted(metadata["field_catalog"].items()) if fid in used_fields},
-    }
-
-    target = result.paths.archive / "project.json"
-    tmp = target.with_name(target.name + ".part")
-    with tmp.open("w", encoding="utf-8", newline="\n") as handle:
-        handle.write("{\n")
-        for name, value in header.items():
-            handle.write(f"  {json.dumps(name)}: {_dump(value, 1)},\n")
-        handle.write('  "issues": [')
-        first = True
-        for path in _issue_files(result):
-            handle.write("\n    " if first else ",\n    ")
-            handle.write(_dump(read_json(path), 2))
-            first = False
-        handle.write("\n  ]\n}\n")
-    os.replace(tmp, target)
-    return target
+#: Fields shown in dedicated sections, or pure noise in a printed document.
+HANDLED_FIELDS = (
+    {f for f, _ in DETAIL_FIELDS + PEOPLE_FIELDS + DATE_FIELDS + RICH_FIELDS}
+    | {"summary", "project", "issuelinks", "subtasks", "parent", "timetracking", "timeoriginalestimate",
+       "timeestimate", "timespent", "aggregatetimeoriginalestimate", "aggregatetimeestimate",
+       "aggregatetimespent", "progress", "aggregateprogress", "workratio", "lastViewed", "thumbnail"}
+)
+HIDDEN_CUSTOM_TYPES = ("gh-lexo-rank",)  # Jira Software "Rank": internal ordering string
 
 
-def write_readme(result: ExportResult, generated_at: str, base_url: str) -> Path:
-    project = result.metadata["project"]
-    text = textwrap.dedent(f"""\
-        JIRA PROJECT ARCHIVE
-        ====================
+class _NumberedCanvas(canvas.Canvas):
+    """Canvas that writes "Page X of Y" once the total page count is known."""
 
-        Project      : {project.get('name')} ({project.get('key')})
-        Source       : {base_url}
-        Archived on  : {generated_at} (UTC)
-        Issues       : {len(result.inventory)}
-        Created with : jira-archiver {__version__}
+    def __init__(self, *args: Any, footer_text: str = "", font: str = "Helvetica", **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._pages: list[dict[str, Any]] = []
+        self._footer_text = footer_text
+        self._footer_font = font
 
-        CONTENTS
-        --------
-        project.json   All the data of the project and of every issue (fields,
-                       comments, work logs, history, links, attachments list...).
-                       Text format, readable with any text editor or JSON viewer.
-        pdf/           One PDF per issue, ready to read or print.
-        attachments/   The files attached to the issues, one folder per issue.
-        manifest.json  The list of every file of this archive with its SHA-256
-                       fingerprint, to prove nothing was changed or corrupted.
+    def showPage(self) -> None:  # noqa: N802 (ReportLab API name)
+        self._pages.append(dict(self.__dict__))
+        self._startPage()
 
-        HOW TO CHECK THE ARCHIVE IS INTACT
-        ----------------------------------
-        Each file has a "sha256" value in manifest.json. On Windows, run in PowerShell:
-            Get-FileHash .\\pdf\\{project.get('key')}-1.pdf -Algorithm SHA256
-        The value displayed must be identical to the one in manifest.json
-        (upper case / lower case does not matter).
-        """)
-    target = result.paths.archive / "README.txt"
-    target.write_text(text.replace("\n", "\r\n"), encoding="utf-8")
-    return target
+    def save(self) -> None:
+        total = len(self._pages)
+        for state in self._pages:
+            self.__dict__.update(state)
+            self._draw_footer(total)
+            super().showPage()
+        super().save()
 
-
-def write_manifest(result: ExportResult, jira_info: dict[str, Any], generated_at: str) -> Path:
-    archive_dir = result.paths.archive
-    files = []
-    attachment_count = 0
-    attachment_bytes = 0
-    for path in sorted(p for p in archive_dir.rglob("*") if p.is_file() and p.name != "manifest.json"):
-        relative = path.relative_to(archive_dir).as_posix()
-        size = path.stat().st_size
-        files.append({"path": relative, "size": size, "sha256": sha256_file(path)})
-        if relative.startswith("attachments/"):
-            attachment_count += 1
-            attachment_bytes += size
-
-    notes = {}
-    for issue_path in _issue_files(result):
-        record = read_json(issue_path)
-        if record.get("archive_notes"):
-            notes[record["key"]] = record["archive_notes"]
-
-    manifest = {
-        "format_version": ARCHIVE_FORMAT_VERSION,
-        "generated_at": generated_at,
-        "tool": f"jira-archiver {__version__}",
-        "jira": jira_info,
-        "project": {"id": result.metadata["project"].get("id"), "key": result.project_key,
-                    "name": result.metadata["project"].get("name")},
-        "counts": {
-            "issues": len(result.inventory),
-            "pdf_files": sum(1 for f in files if f["path"].startswith("pdf/")),
-            "attachments": attachment_count,
-            "attachment_bytes": attachment_bytes,
-        },
-        "warnings": result.metadata.get("warnings", []),
-        "issue_notes": notes,
-        "files": files,
-    }
-    target = archive_dir / "manifest.json"
-    atomic_write_json(target, manifest)
-    return target
+    def _draw_footer(self, total: int) -> None:
+        self.saveState()
+        self.setStrokeColor(BORDER)
+        self.setLineWidth(0.4)
+        self.line(MARGIN, 11 * mm, PAGE_WIDTH - MARGIN, 11 * mm)
+        self.setFont(self._footer_font, 7)
+        self.setFillColor(MUTED)
+        self.drawString(MARGIN, 7 * mm, self._footer_text[:150])
+        self.drawRightString(PAGE_WIDTH - MARGIN, 7 * mm, f"Page {self._pageNumber} of {total}")
+        self.restoreState()
 
 
-def build_zip(result: ExportResult, output_dir: Path, date_tag: str) -> Path:
-    """Zip the archive folder, verify the ZIP, and write its SHA-256 next to it."""
-    name = f"{result.project_key}_jira_archive_{date_tag}"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    zip_path = output_dir / f"{name}.zip"
-    tmp = zip_path.with_name(zip_path.name + ".part")
+class IssuePdfRenderer:
+    """Builds the PDF of one issue. One instance can render many issues."""
 
-    archive_dir = result.paths.archive
-    with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as zf:
-        for path in sorted(archive_dir.rglob("*")):
-            if path.is_file() and not path.is_symlink() and not path.name.endswith(".part"):
-                zf.write(path, f"{name}/{path.relative_to(archive_dir).as_posix()}")
+    def __init__(self, field_catalog: dict[str, dict[str, Any]], base_url: str, archive_date: str) -> None:
+        self.styles: PdfStyles = make_styles()
+        self.catalog = field_catalog
+        self.base_url = base_url
+        self.archive_date = archive_date
 
-    log.info("[%s] Verifying the ZIP file...", result.project_key)
-    with zipfile.ZipFile(tmp) as zf:
-        broken = zf.testzip()
-        if broken:
-            raise RuntimeError(f"ZIP verification failed on {broken}")
-    os.replace(tmp, zip_path)
+    # ------------------------------------------------------------------ public
+    def render(self, issue: dict[str, Any], project: dict[str, Any], out_path: Path,
+               archive_root: Path, resolve_image: ImageResolver | None) -> list[str]:
+        """Render *issue* to *out_path*. Returns notes about degraded rendering (if any)."""
+        key = issue["key"]
+        summary = self._value(issue, "summary") or ""
+        footer = f"{key} - archived from {self.base_url} on {self.archive_date[:16].replace('T', ' ')} UTC"
+        last_error: Exception | None = None
 
-    digest = sha256_file(zip_path)
-    (output_dir / f"{zip_path.name}.sha256").write_text(f"{digest}  {zip_path.name}\n", encoding="utf-8")
-    return zip_path
+        for safe_mode in (False, True):
+            try:
+                story = self._story(issue, project, archive_root, resolve_image, safe_mode)
+                atomic_write_bytes(out_path, self._build(story, f"{key} {summary}", footer))
+                return ["PDF rendered in simplified mode (complex layout)."] if safe_mode else []
+            except Exception as exc:  # layout errors, broken images...
+                last_error = exc
+                log.debug("PDF for %s failed (safe_mode=%s): %r", key, safe_mode, exc)
+
+        log.warning("PDF for %s could not be rendered normally (%s); writing a minimal PDF.", key, last_error)
+        story = [
+            Paragraph(escape(key), self.styles.issue_key),
+            Paragraph(escape(str(summary)), self.styles.title),
+            Paragraph("This issue could not be rendered as a full PDF. All of its data is "
+                      "available in <b>project.json</b> inside this archive.", self.styles.body),
+            Paragraph(escape(f"Technical reason: {last_error!r}"[:500]), self.styles.muted),
+        ]
+        atomic_write_bytes(out_path, self._build(story, f"{key} {summary}", footer))
+        return [f"Minimal PDF only (rendering error: {last_error!r})"[:300]]
+
+    # --------------------------------------------------------------- building
+    def _build(self, story: list[Flowable], title: str, footer: str) -> bytes:
+        buffer = io.BytesIO()
+        doc = SimpleDocTemplate(
+            buffer, pagesize=A4, leftMargin=MARGIN, rightMargin=MARGIN, topMargin=MARGIN,
+            bottomMargin=16 * mm, title=title[:200], author="Jira Archiver",
+            subject="Jira issue archive", creator=f"jira-archiver {__version__}",
+        )
+        doc.build(story, canvasmaker=partial(_NumberedCanvas, footer_text=footer, font=self.styles.sans))
+        return buffer.getvalue()
+
+    def _story(self, issue: dict[str, Any], project: dict[str, Any], archive_root: Path,
+               resolve_image: ImageResolver | None, safe_mode: bool) -> list[Flowable]:
+        html = HtmlToFlowables(self.styles, resolve_image, safe_mode=safe_mode)
+        s = self.styles
+        story: list[Flowable] = []
+
+        # Header
+        project_text = f"{project.get('name', '')} ({project.get('key', '')})"
+        story.append(Paragraph(escape(f"{project_text}  /  {issue['key']}"), s.issue_key))
+        story.append(Paragraph(escape(str(self._value(issue, "summary") or "(no summary)")), s.title))
+        story.append(HRFlowable(width="100%", thickness=1.2, color=PRIMARY, spaceBefore=2, spaceAfter=8))
+
+        # Details / People / Dates
+        details = self._kv_rows(issue, DETAIL_FIELDS)
+        parent = self._value(issue, "parent")
+        if parent:
+            details.append(("Parent", format_value(parent)))
+        right = self._kv_rows(issue, PEOPLE_FIELDS) + [("", "")] + self._kv_rows(issue, DATE_FIELDS)
+        if safe_mode:
+            story.append(self._kv_table(details + right, CONTENT_WIDTH))
+        else:
+            half = (CONTENT_WIDTH - 6 * mm) / 2
+            outer = Table([[self._kv_table(details, half), self._kv_table(right, half)]],
+                          colWidths=[half + 6 * mm, half], hAlign="LEFT")
+            outer.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"),
+                                       ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                                       ("RIGHTPADDING", (0, 0), (-1, -1), 0)]))
+            story.append(outer)
+
+        time_rows = self._time_tracking(issue)
+        if time_rows:
+            story += self._section("Time Tracking")
+            story.append(self._kv_table(time_rows, CONTENT_WIDTH))
+
+        # Rich text fields
+        for field_id, label in RICH_FIELDS:
+            entry = issue["fields"].get(field_id) or {}
+            if is_empty(entry.get("value")):
+                continue
+            story += self._section(label)
+            story += self._rich(html, entry)
+
+        # Other fields
+        simple_rows, rich_entries = self._other_fields(issue)
+        if simple_rows:
+            story += self._section("Other Fields")
+            story.append(self._kv_table(simple_rows, CONTENT_WIDTH, label_width=55 * mm))
+        for label, entry in rich_entries:
+            story += self._section(label)
+            story += self._rich(html, entry)
+
+        story += self._links(issue)
+        story += self._attachments(issue, archive_root)
+        story += self._comments(issue, html)
+        story += self._worklogs(issue, html)
+        story += self._history(issue)
+
+        notes = issue.get("archive_notes") or []
+        if notes:
+            story += self._section("Archive Notes")
+            for note in notes:
+                story.append(Paragraph(escape(note), s.muted))
+        return story
+
+    # ---------------------------------------------------------------- helpers
+    @staticmethod
+    def _value(issue: dict[str, Any], field_id: str) -> Any:
+        return (issue["fields"].get(field_id) or {}).get("value")
+
+    def _section(self, title: str) -> list[Flowable]:
+        return [CondPageBreak(30 * mm), Paragraph(escape(title), self.styles.section),
+                HRFlowable(width="100%", thickness=0.4, color=BORDER, spaceBefore=0, spaceAfter=4)]
+
+    def _kv_rows(self, issue: dict[str, Any], fields: list[tuple[str, str]]) -> list[tuple[str, str]]:
+        rows = []
+        for field_id, label in fields:
+            text = format_value(self._value(issue, field_id))
+            if field_id == "resolution" and not text:
+                text = "Unresolved"
+            elif field_id == "assignee" and not text:
+                text = "Unassigned"
+            if field_id in {"created", "updated", "resolutiondate", "duedate"}:
+                text = format_datetime(self._value(issue, field_id)) or text
+            rows.append((label, text or "-"))
+        return rows
+
+    def _kv_table(self, rows: list[tuple[str, str]], width: float, label_width: float = 30 * mm) -> Table:
+        s = self.styles
+        data = [[Paragraph(escape(label), s.label),
+                 Paragraph(escape(_cut(value)).replace("\n", "<br/>"), s.cell)] for label, value in rows]
+        table = Table(data or [["", ""]], colWidths=[label_width, width - label_width], hAlign="LEFT")
+        table.setStyle(TableStyle([
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 0), ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+            ("TOPPADDING", (0, 0), (-1, -1), 1.5), ("BOTTOMPADDING", (0, 0), (-1, -1), 1.5),
+        ]))
+        return table
+
+    def _grid(self, header: list[str], rows: list[list[str]], widths: list[float],
+              max_chars: int = MAX_CELL_CHARS) -> Table:
+        s = self.styles
+        data: list[list[Any]] = [[Paragraph(escape(h), s.cell_header) for h in header]]
+        for row in rows:
+            data.append([Paragraph(escape(_cut(v, max_chars)).replace("\n", "<br/>"), s.cell) for v in row])
+        total = sum(widths)
+        table = Table(data, colWidths=[w * CONTENT_WIDTH / total for w in widths], repeatRows=1, hAlign="LEFT")
+        table.setStyle(TableStyle([
+            ("GRID", (0, 0), (-1, -1), 0.4, BORDER),
+            ("BACKGROUND", (0, 0), (-1, 0), HEADER_BG),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 3), ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+            ("TOPPADDING", (0, 0), (-1, -1), 2), ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+        ]))
+        return table
+
+    def _rich(self, html: HtmlToFlowables, entry: dict[str, Any], width: float = CONTENT_WIDTH) -> list[Flowable]:
+        rendered = entry.get("rendered_html")
+        if rendered:
+            flowables = html.convert(rendered, width)
+            if flowables:
+                return flowables
+        text = format_value(entry.get("value"))
+        return [html.paragraph(escape(text).replace("\n", "<br/>"), self.styles.body)] if text else []
+
+    def _time_tracking(self, issue: dict[str, Any]) -> list[tuple[str, str]]:
+        tracking = self._value(issue, "timetracking") or {}
+        rows = [(label, tracking.get(key)) for key, label in
+                (("originalEstimate", "Original Estimate"), ("remainingEstimate", "Remaining Estimate"),
+                 ("timeSpent", "Time Spent"))]
+        return [(label, str(value)) for label, value in rows if value]
+
+    def _other_fields(self, issue: dict[str, Any]) -> tuple[list[tuple[str, str]], list[tuple[str, dict]]]:
+        simple: list[tuple[str, str]] = []
+        rich: list[tuple[str, dict]] = []
+        for field_id, entry in issue["fields"].items():
+            if field_id in HANDLED_FIELDS or is_empty(entry.get("value")):
+                continue
+            schema = (self.catalog.get(field_id) or {}).get("schema") or {}
+            if any(t in str(schema.get("custom", "")) for t in HIDDEN_CUSTOM_TYPES):
+                continue
+            label = entry.get("name") or field_id
+            if entry.get("rendered_html") and "<" in entry["rendered_html"]:
+                rich.append((label, entry))
+            else:
+                simple.append((label, format_value(entry.get("value"))))
+        simple.sort(key=lambda row: row[0].lower())
+        rich.sort(key=lambda row: row[0].lower())
+        return simple, rich
+
+    def _links(self, issue: dict[str, Any]) -> list[Flowable]:
+        story: list[Flowable] = []
+        rows = []
+        for link in self._value(issue, "issuelinks") or []:
+            link_type = link.get("type") or {}
+            if "outwardIssue" in link:
+                relation, other = link_type.get("outward", ""), link["outwardIssue"]
+            else:
+                relation, other = link_type.get("inward", ""), link.get("inwardIssue") or {}
+            fields = other.get("fields") or {}
+            rows.append([relation, other.get("key", ""), fields.get("summary", ""),
+                         format_value(fields.get("status"))])
+        if rows:
+            story += self._section("Issue Links")
+            story.append(self._grid(["Relation", "Issue", "Summary", "Status"], rows, [3, 2, 7, 2]))
+
+        subtasks = self._value(issue, "subtasks") or []
+        if subtasks:
+            story += self._section("Sub-Tasks")
+            story.append(self._grid(
+                ["Issue", "Summary", "Type", "Status"],
+                [[t.get("key", ""), (t.get("fields") or {}).get("summary", ""),
+                  format_value((t.get("fields") or {}).get("issuetype")),
+                  format_value((t.get("fields") or {}).get("status"))] for t in subtasks],
+                [2, 8, 2, 2]))
+
+        remote = issue.get("remote_links") or []
+        if remote:
+            story += self._section("Web Links")
+            story.append(self._grid(
+                ["Title", "URL", "Relationship"],
+                [[(r.get("object") or {}).get("title", ""), (r.get("object") or {}).get("url", ""),
+                  r.get("relationship", "")] for r in remote],
+                [4, 7, 2]))
+        return story
+
+    def _attachments(self, issue: dict[str, Any], archive_root: Path) -> list[Flowable]:
+        attachments = issue.get("attachments") or []
+        if not attachments:
+            return []
+        story = self._section("Attachments")
+        rows = []
+        for att in attachments:
+            archive = att.get("archive") or {}
+            location = archive.get("path") or f"NOT ARCHIVED ({archive.get('status', 'unknown')})"
+            rows.append([att.get("filename", ""), human_size(att.get("size")),
+                         format_datetime(att.get("created")), format_value(att.get("author")), location])
+        story.append(self._grid(["File", "Size", "Date", "Author", "Location in archive"], rows, [4, 1.3, 2.5, 2.5, 5]))
+
+        previews: list[Flowable] = []
+        for att in attachments:
+            archive = att.get("archive") or {}
+            if not str(att.get("mimeType", "")).startswith("image/") or not archive.get("path"):
+                continue
+            image = make_image(archive_root / archive["path"], CONTENT_WIDTH, 100 * mm)
+            if image is not None:
+                previews.append(KeepTogether([
+                    Spacer(1, 6),
+                    Paragraph(escape(att.get("filename", "")), self.styles.muted),
+                    image,
+                ]))
+        if previews:
+            story.append(Spacer(1, 4))
+            story.append(Paragraph("Image previews", self.styles.label))
+            story += previews
+        return story
+
+    def _comments(self, issue: dict[str, Any], html: HtmlToFlowables) -> list[Flowable]:
+        comments = issue.get("comments") or []
+        if not comments:
+            return []
+        story = self._section(f"Comments ({len(comments)})")
+        for comment in comments:
+            author = format_value(comment.get("author")) or "Unknown"
+            header = f"<b>{escape(author)}</b>  -  {escape(format_datetime(comment.get('created')))}"
+            if comment.get("updated") and comment.get("updated") != comment.get("created"):
+                editor = format_value(comment.get("updateAuthor"))
+                header += escape(f"  (edited {format_datetime(comment['updated'])}"
+                                 + (f" by {editor}" if editor and editor != author else "") + ")")
+            visibility = comment.get("visibility") or {}
+            if visibility:
+                header += escape(f"  [restricted to {visibility.get('type', '')}: {visibility.get('value', '')}]")
+            story.append(CondPageBreak(20 * mm))
+            story.append(Paragraph(header, self.styles.comment_header))
+            story += self._rich(html, {"value": comment.get("body"), "rendered_html": comment.get("renderedBody")})
+            story.append(HRFlowable(width="100%", thickness=0.3, color=BORDER, spaceBefore=2, spaceAfter=2))
+        return story
+
+    def _worklogs(self, issue: dict[str, Any], html: HtmlToFlowables) -> list[Flowable]:
+        worklogs = issue.get("worklogs") or []
+        if not worklogs:
+            return []
+        story = self._section(f"Work Log ({len(worklogs)})")
+        rows = [[format_datetime(w.get("started")), format_value(w.get("author")),
+                 w.get("timeSpent") or format_seconds(w.get("timeSpentSeconds")), w.get("comment") or ""]
+                for w in worklogs]
+        story.append(self._grid(["Started", "Author", "Time Spent", "Comment"], rows, [2.5, 2.5, 1.5, 7]))
+        return story
+
+    def _history(self, issue: dict[str, Any]) -> list[Flowable]:
+        histories = issue.get("changelog") or []
+        rows = []
+        for history in histories:
+            when = format_datetime(history.get("created"))
+            who = format_value(history.get("author")) or "Unknown"
+            for item in history.get("items") or []:
+                rows.append([when, who, item.get("field", ""),
+                             item.get("fromString") or item.get("from") or "",
+                             item.get("toString") or item.get("to") or ""])
+        if not rows:
+            return []
+        story = self._section(f"History ({len(rows)} changes)")
+        story.append(self._grid(["Date", "Author", "Field", "Old Value", "New Value"], rows, [2.4, 2.4, 2, 4, 4],
+                                max_chars=500))
+        return story
 
 
-def package(result: ExportResult, jira_info: dict[str, Any], output_dir: Path, base_url: str) -> Path:
-    """Create every archive file and the final ZIP. Returns the ZIP path."""
-    now = utc_now()
-    generated_at = now.isoformat()
-    log.info("[%s] Writing project.json...", result.project_key)
-    write_project_json(result, jira_info, generated_at)
-    write_readme(result, generated_at, base_url)
-    log.info("[%s] Writing manifest.json (computing fingerprints)...", result.project_key)
-    write_manifest(result, jira_info, generated_at)
-    log.info("[%s] Creating the ZIP file...", result.project_key)
-    return build_zip(result, output_dir, now.strftime("%Y%m%d"))
+def _cut(value: Any, limit: int = MAX_CELL_CHARS) -> str:
+    text = "" if value is None else str(value)
+    return text if len(text) <= limit else text[:limit] + " [...] (truncated, full value in project.json)"
