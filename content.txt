@@ -1,113 +1,101 @@
-"""Install automatic-jira-archiving (run it once, and again after each ``git pull``).
+"""Start-up helpers shared by the command-line scripts.
 
-Usage (in a terminal opened in the project folder):
+This module uses the Python standard library only: it runs *before* the
+third-party libraries are imported, possibly with a Python that does not have them.
 
-    py install.py              # recommended: private Python environment in the .venv folder
-    py install.py --no-venv    # if the .venv Python is blocked on your PC (see README.md)
-
-What it does:
-
-1. checks the Python version;
-2. creates a private Python environment in the ``.venv`` folder (unless ``--no-venv``);
-3. installs the libraries listed in ``requirements.txt`` with pip;
-4. creates the configuration file ``.env`` from ``.env.example`` (an existing ``.env`` is kept).
-
-This script uses the Python standard library only.
+Why it exists: on the company workstations ``.bat`` files are blocked, so the
+scripts are started directly with ``py <script>.py``. That command uses the
+system-wide Python. :func:`use_project_venv` makes the script re-start itself
+with the private Python environment (``.venv``) created by ``install.py``, so
+that users never have to "activate" anything.
 """
 
 from __future__ import annotations
 
-import argparse
-import shutil
+import os
 import subprocess
 import sys
 from pathlib import Path
 
-from jira_archiver.bootstrap import pause_if_double_clicked, started_by_double_click, venv_python
-
-PROJECT_ROOT = Path(__file__).resolve().parent
-MIN_PYTHON = (3, 10)
+# Set for the re-started process, so it never tries to re-start itself again.
+_SWITCHED_ENV = "JIRA_ARCHIVER_IN_VENV"
 
 
-def step(message: str) -> None:
-    print(f"\n--- {message}")
+def venv_python(project_root: Path) -> Path:
+    """Path of the Python program inside the project's ``.venv`` folder."""
+    if os.name == "nt":
+        return project_root / ".venv" / "Scripts" / "python.exe"
+    return project_root / ".venv" / "bin" / "python"
 
 
-def run(command: list[str]) -> bool:
-    """Run *command* (a fixed list of arguments, no shell). Return True on success."""
-    sys.stdout.flush()  # keep our messages in order with the output of the command
+def _running_in(venv_dir: Path) -> bool:
     try:
-        return subprocess.run(command, cwd=PROJECT_ROOT, check=False).returncode == 0  # noqa: S603
+        return Path(sys.prefix).resolve() == venv_dir.resolve()
+    except OSError:
+        return False
+
+
+def started_by_double_click() -> bool:
+    """Best-effort detection of a script opened by double-click in Windows Explorer.
+
+    In that case Windows opens a new console window that closes as soon as the
+    script ends, so the messages could not be read. A console opened by
+    double-click only holds the Python processes (at most 2: the ``py`` launcher
+    and Python), whereas a terminal also holds ``cmd.exe`` or ``powershell.exe``.
+    """
+    if os.name != "nt" or os.environ.get(_SWITCHED_ENV) or not sys.stdin or not sys.stdin.isatty():
+        return False
+    try:
+        import ctypes
+
+        process_list = (ctypes.c_uint * 16)()
+        count = ctypes.windll.kernel32.GetConsoleProcessList(process_list, 16)
+    except Exception:  # noqa: BLE001 - detection is optional, never fail because of it
+        return False
+    return 0 < count <= 2
+
+
+def pause_if_double_clicked(double_clicked: bool) -> None:
+    """Keep the console window open so the user can read the result."""
+    if double_clicked:
+        try:
+            input("\nPress Enter to close this window...")
+        except (EOFError, KeyboardInterrupt):
+            pass
+
+
+def use_project_venv(project_root: Path) -> None:
+    """Re-run the current script with ``.venv`` Python if it exists and is not the one running.
+
+    Returns normally (and the script continues with the current Python) when there
+    is no ``.venv`` folder, when it is already the running Python, or when the
+    ``.venv`` Python cannot be started (e.g. blocked by a company policy). Otherwise
+    it never returns: it exits with the exit code of the re-started script.
+    """
+    venv_dir = project_root / ".venv"
+    python = venv_python(project_root)
+    if os.environ.get(_SWITCHED_ENV) or not python.is_file() or _running_in(venv_dir):
+        return
+
+    double_clicked = started_by_double_click()
+    script = str(Path(sys.argv[0]).resolve())
+    env = dict(os.environ, **{_SWITCHED_ENV: "1"})
+    sys.stdout.flush()
+    try:
+        # Fixed program (our own .venv Python) and our own script: no shell, no user-built command.
+        process = subprocess.Popen([str(python), script, *sys.argv[1:]], env=env)  # noqa: S603
     except OSError as exc:
-        print(f"[ERROR] Could not start {command[0]}: {exc}")
-        return False
+        print(f"[WARN] Could not start the Python of the .venv folder ({exc}).")
+        print("       Continuing with the current Python. If this keeps happening, see")
+        print('       "Installation without .venv" in README.md.')
+        return
 
-
-def install(use_venv: bool) -> bool:
-    print("=== automatic-jira-archiving installation ===")
-
-    step("Checking Python")
-    print(f"Python {sys.version.split()[0]} ({sys.executable})")
-    if sys.version_info < MIN_PYTHON:
-        print(f"[ERROR] Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]} or newer is required. Install Python 3.12.")
-        return False
-
-    if use_venv:
-        python = venv_python(PROJECT_ROOT)
-        if python.is_file():
-            step("The private Python environment (.venv folder) already exists")
-        else:
-            step("Creating the private Python environment in the .venv folder")
-            if not run([sys.executable, "-m", "venv", str(PROJECT_ROOT / ".venv")]):
-                print("[ERROR] The .venv folder could not be created.")
-                print("        Try: py install.py --no-venv   (see README.md)")
-                return False
-        if not run([str(python), "-c", "pass"]):
-            print("[ERROR] The Python of the .venv folder cannot start (maybe blocked by a company policy).")
-            print("        Delete the .venv folder, then run: py install.py --no-venv")
-            return False
-        pip_command = [str(python), "-m", "pip", "install", "-r", "requirements.txt"]
-    else:
-        step("Installing without .venv: the libraries go to your user profile")
-        if (PROJECT_ROOT / ".venv").exists():
-            print("[ERROR] A .venv folder exists: the scripts would keep trying to use it.")
-            print("        Delete the .venv folder, then run this command again.")
-            return False
-        pip_command = [sys.executable, "-m", "pip", "install", "--user", "-r", "requirements.txt"]
-
-    step("Installing the libraries listed in requirements.txt (this can take a minute)")
-    if not run(pip_command):
-        print("[ERROR] pip could not install the libraries. Read the messages above.")
-        print('        See "Troubleshooting" in README.md (internal package mirror).')
-        return False
-
-    env_file = PROJECT_ROOT / ".env"
-    if env_file.exists():
-        step("Configuration file .env already exists: kept as it is")
-    else:
-        shutil.copyfile(PROJECT_ROOT / ".env.example", env_file)
-        step("Configuration file .env created")
-
-    print("\n=== Installation finished ===")
-    print("Next steps:")
-    print('  1. Open the ".env" file with Notepad and fill in JIRA_BASE_URL and JIRA_PAT.')
-    print("  2. Test the connection:  py check_connection.py")
-    return True
-
-
-def main(argv: list[str]) -> int:
-    parser = argparse.ArgumentParser(description="Install automatic-jira-archiving and its libraries.")
-    parser.add_argument("--no-venv", action="store_true",
-                        help="Install the libraries in your user profile instead of a private .venv folder.")
-    args = parser.parse_args(argv)
-    if install(use_venv=not args.no_venv):
-        return 0
-    print("\n=== Installation FAILED: read the messages above, and \"Troubleshooting\" in README.md ===")
-    return 1
-
-
-if __name__ == "__main__":
-    _double_clicked = started_by_double_click()
-    _exit_code = main(sys.argv[1:])
-    pause_if_double_clicked(_double_clicked)
-    sys.exit(_exit_code)
+    while True:
+        try:
+            exit_code = process.wait()
+            break
+        except KeyboardInterrupt:
+            # Ctrl+C also reaches the re-started script, which stops cleanly by itself.
+            continue
+    pause_if_double_clicked(double_clicked)
+    sys.exit(exit_code)
