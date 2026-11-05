@@ -1,372 +1,317 @@
-"""Convert the HTML that Jira renders (from its wiki markup) into ReportLab flowables.
+"""Minimal, read-only client for the Jira Data Center REST API (v2).
 
-Jira gives us, for every rich-text field and comment, an HTML version
-("renderedFields"). This module turns that HTML into PDF building blocks:
-paragraphs, headings, lists, tables, code blocks, quotes and images.
+Security notes
+--------------
+* Authentication uses a Personal Access Token sent as a ``Bearer`` header.
+* The token is only ever sent to the configured Jira host: any absolute URL
+  pointing elsewhere is refused (prevents leaking the token to third parties).
+* TLS certificates are always verified (Windows certificate store through
+  ``pip_system_certs``, or a custom CA bundle via ``JIRA_CA_BUNDLE``).
+* The client only reads data. The single POST request used (``/search``) is a
+  read-only search endpoint; nothing is ever created, changed or deleted in Jira.
 
-It is deliberately tolerant: unknown tags are treated as plain text containers,
-and any piece that ReportLab cannot handle falls back to plain text instead of
-failing the whole document.
+Protecting the Jira server (throttling)
+---------------------------------------
+Every request goes through :meth:`JiraClient._slot`, which enforces:
+
+1. **One request at a time**: never two requests in flight simultaneously.
+2. **A minimum pause between two requests** (``JIRA_REQUEST_DELAY``, default
+   0.5 s, i.e. at most 2 requests per second; it cannot be set below 0.2 s).
+3. **Adaptive pause**: after a request that took N seconds (including the
+   download of the answer), the client waits at least N seconds before the next
+   one (capped at 30 s). The tool therefore occupies at most about half of the
+   time of a single Jira worker thread, and automatically slows down when Jira
+   is loaded and answers slowly.
+4. **Back-off when Jira asks for it**: answers 429 (too many requests) and 503
+   (unavailable) are retried later (honoring ``Retry-After``), and the minimum
+   pause is doubled (up to 5 s). After 200 requests in a row without such an
+   answer, the pause is halved again, step by step, back to the configured value.
 """
 
 from __future__ import annotations
 
-import re
-from collections.abc import Callable
-from html.parser import HTMLParser
+import os
+import threading
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
-from xml.sax.saxutils import escape
+from typing import Any
+from urllib.parse import urljoin, urlparse
 
-from reportlab.lib import colors
-from reportlab.lib.styles import ParagraphStyle
-from reportlab.platypus import Flowable, Paragraph, Spacer, Table, TableStyle, XPreformatted
-from reportlab.platypus.flowables import HRFlowable
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-from .pdf_styles import BORDER, HEADER_BG, LINK, PdfStyles, make_image
+from . import __version__
+from .config import Settings
+from .logging_setup import get_logger
 
-#: Given an ``<img src=...>`` value, returns the image (bytes or local file) or ``None``.
-ImageResolver = Callable[[str], bytes | Path | None]
+log = get_logger("client")
 
-_VOID = {"br", "img", "hr", "input", "meta", "link", "col", "wbr", "area", "base", "source", "param"}
-_SKIP = {"script", "style", "head", "title", "noscript", "button", "form", "select",
-         "textarea", "svg", "iframe", "object", "embed", "video", "audio", "canvas"}
-_AUTO_CLOSE = {"p": {"p"}, "li": {"li"}, "tr": {"tr", "td", "th"}, "td": {"td", "th"},
-               "th": {"td", "th"}, "dt": {"dt", "dd"}, "dd": {"dt", "dd"}}
-_SIMPLE_INLINE = {
-    "b": ("<b>", "</b>"), "strong": ("<b>", "</b>"),
-    "i": ("<i>", "</i>"), "em": ("<i>", "</i>"), "cite": ("<i>", "</i>"), "dfn": ("<i>", "</i>"),
-    "var": ("<i>", "</i>"),
-    "u": ("<u>", "</u>"), "ins": ("<u>", "</u>"),
-    "s": ("<strike>", "</strike>"), "del": ("<strike>", "</strike>"), "strike": ("<strike>", "</strike>"),
-    "sup": ("<super>", "</super>"), "sub": ("<sub>", "</sub>"),
-}
-_CODE_INLINE = {"code", "tt", "kbd", "samp"}
-_CONTAINERS = {"p", "div", "section", "article", "header", "footer", "main", "center",
-               "figure", "figcaption", "dl", "dt", "dd", "body", "html", "nav", "aside", "details", "summary"}
-_HEADINGS = {"h1": 1, "h2": 2, "h3": 3, "h4": 4, "h5": 5, "h6": 6}
-_WHITESPACE = re.compile(r"\s+")
-_TAG = re.compile(r"<[^>]+>")
-_COLOR_STYLE = re.compile(r"color\s*:\s*([#a-zA-Z0-9]+)")
-_HEX_COLOR = re.compile(r"^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
-_NAMED_COLORS = {name.lower() for name in colors.getAllNamedColors()}
+#: Lowest pause allowed between two requests, whatever the configuration says.
+MIN_REQUEST_DELAY = 0.2
+#: Upper bound of the pause after a slow answer (adaptive throttling).
+MAX_ADAPTIVE_PAUSE = 30.0
+#: Upper bound of the minimum pause after Jira asked us to slow down (429/503).
+MAX_BACKOFF_DELAY = 5.0
+#: Successful requests in a row needed before speeding up again after a slow-down.
+RECOVERY_STREAK = 200
+_SLOW_DOWN_STATUSES = {429, 503}
 
 
-# ------------------------------------------------------------------ HTML tree
-class Node:
-    __slots__ = ("tag", "attrs", "children")
+class JiraError(Exception):
+    """An error returned by Jira (or a network problem talking to it)."""
 
-    def __init__(self, tag: str, attrs: dict[str, str]) -> None:
-        self.tag = tag
-        self.attrs = attrs
-        self.children: list[Node | str] = []
+    def __init__(self, message: str, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
-class _TreeBuilder(HTMLParser):
-    """Builds a forgiving DOM-like tree (Jira's HTML is not always well formed)."""
+class JiraClient:
+    """Thin wrapper around :class:`requests.Session` with retries and safety checks."""
 
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.root = Node("root", {})
-        self._stack = [self.root]
+    API = "/rest/api/2"
 
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        closes = _AUTO_CLOSE.get(tag)
-        if closes and self._stack[-1].tag in closes:
-            self._stack.pop()
-        node = Node(tag, {key: value or "" for key, value in attrs})
-        self._stack[-1].children.append(node)
-        if tag not in _VOID:
-            self._stack.append(node)
+    def __init__(self, settings: Settings) -> None:
+        self.base_url = settings.base_url.rstrip("/")
+        parsed = urlparse(self.base_url)
+        self._origin = (parsed.scheme.lower(), parsed.netloc.lower())
+        self._timeout = settings.timeout
+        self._base_interval = max(settings.request_delay, MIN_REQUEST_DELAY)
+        self._min_interval = self._base_interval
+        self._calm_streak = 0  # requests in a row without "slow down" answers
+        self._lock = threading.Lock()
+        self._next_allowed = 0.0
+        self.request_count = 0
+        self.busy_seconds = 0.0  # time spent waiting for Jira answers
 
-    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        self.handle_starttag(tag, attrs)
-        if tag not in _VOID and self._stack[-1].tag == tag:
-            self._stack.pop()
+        retry = Retry(
+            total=5,
+            connect=5,
+            read=3,
+            backoff_factor=2,  # waits 0s, 4s, 8s, 16s, 32s between attempts
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset({"GET", "POST"}),
+            respect_retry_after_header=True,
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=1, pool_maxsize=1)
 
-    def handle_endtag(self, tag: str) -> None:
-        if any(node.tag == tag for node in self._stack[1:]):
-            while self._stack[-1].tag != tag:
-                self._stack.pop()
-            self._stack.pop()
+        self._session = requests.Session()
+        self._session.mount("https://", adapter)
+        self._session.mount("http://", adapter)
+        self._session.verify = settings.ca_bundle or True
+        self._session.headers.update(
+            {
+                "Authorization": f"Bearer {settings.token}",
+                "Accept": "application/json",
+                "User-Agent": f"jira-archiver/{__version__}",
+            }
+        )
 
-    def handle_data(self, data: str) -> None:
-        self._stack[-1].children.append(data)
-
-
-def parse_html(html: str) -> Node:
-    builder = _TreeBuilder()
-    builder.feed(html or "")
-    builder.close()
-    return builder.root
-
-
-def text_content(node: Node | str) -> str:
-    """Raw text of a node (``<br>`` becomes a new line)."""
-    if isinstance(node, str):
-        return node
-    if node.tag == "br":
-        return "\n"
-    if node.tag in _SKIP:
-        return ""
-    return "".join(text_content(child) for child in node.children)
-
-
-def strip_tags(markup: str) -> str:
-    return _TAG.sub("", markup)
-
-
-# ------------------------------------------------------------- the converter
-class _Context:
-    """State of one container being rendered (a cell, a list item, the root...)."""
-
-    def __init__(self, style: ParagraphStyle, width: float) -> None:
-        self.style = style
-        self.width = width
-        self.out: list[Flowable] = []
-        self.buffer: list[str] = []          # inline markup waiting to become a Paragraph
-        self.open_tags: list[tuple[str, str]] = []  # inline tags currently open
-
-
-class HtmlToFlowables:
-    """Converts Jira HTML into a list of ReportLab flowables.
-
-    :param styles: shared PDF styles.
-    :param resolve_image: callback returning image data for an ``<img src>``.
-    :param safe_mode: simpler output (tables flattened to text). Used as a
-        fallback when a document cannot be laid out normally.
-    """
-
-    def __init__(self, styles: PdfStyles, resolve_image: ImageResolver | None = None,
-                 safe_mode: bool = False) -> None:
-        self.styles = styles
-        self.resolve_image = resolve_image
-        self.safe_mode = safe_mode
-        self._pending_bullet: str | None = None
-
-    # -------------------------------------------------------------- public
-    def convert(self, html: str, width: float, style: ParagraphStyle | None = None) -> list[Flowable]:
-        root = parse_html(html)
-        return self._render(root.children, style or self.styles.body, width)
-
-    def paragraph(self, markup: str, style: ParagraphStyle) -> Paragraph:
-        """Create a Paragraph; if the markup is rejected, fall back to escaped plain text."""
-        bullet = self._pending_bullet
-        self._pending_bullet = None
-        try:
-            return Paragraph(markup, style, bulletText=bullet)
-        except Exception:
-            return Paragraph(escape(strip_tags(markup)), style, bulletText=bullet)
-
-    # ------------------------------------------------------------ internals
-    def _render(self, nodes: list[Node | str], style: ParagraphStyle, width: float) -> list[Flowable]:
-        ctx = _Context(style, width)
-        for node in nodes:
-            self._visit(node, ctx)
-        self._flush(ctx)
-        return ctx.out
-
-    def _flush(self, ctx: _Context) -> None:
-        closing = "".join(close for _, close in reversed(ctx.open_tags))
-        markup = "".join(ctx.buffer) + closing
-        ctx.buffer = [opening for opening, _ in ctx.open_tags]
-        markup = re.sub(r"^(\s|<br/>)+", "", markup)
-        markup = re.sub(r"(\s|<br/>)+$", "", markup)
-        if strip_tags(markup).strip():
-            ctx.out.append(self.paragraph(markup, ctx.style))
-
-    def _visit(self, node: Node | str, ctx: _Context) -> None:
-        if isinstance(node, str):
-            text = _WHITESPACE.sub(" ", node)
-            if text:
-                ctx.buffer.append(escape(text))
-            return
-
-        tag = node.tag
-        if tag in _SKIP:
-            return
-        if tag == "br":
-            ctx.buffer.append("<br/>")
-            return
-        if tag == "img":
-            self._visit_image(node, ctx)
-            return
-        if tag in _HEADINGS:
-            self._flush(ctx)
-            ctx.out.extend(self._render(node.children, self.styles.heading(_HEADINGS[tag]), ctx.width))
-            return
-        if tag in ("ul", "ol"):
-            self._flush(ctx)
-            ctx.out.extend(self._list(node, ctx))
-            return
-        if tag == "table":
-            self._flush(ctx)
-            ctx.out.extend(self._table(node, ctx))
-            return
-        if tag == "pre":
-            self._flush(ctx)
-            ctx.out.extend(self._preformatted(node, ctx))
-            return
-        if tag == "blockquote":
-            self._flush(ctx)
-            quote_style = self.styles.indented(ctx.style, 12, quote=True)
-            ctx.out.extend(self._render(node.children, quote_style, ctx.width - 12))
-            return
-        if tag == "hr":
-            self._flush(ctx)
-            ctx.out.append(HRFlowable(width="100%", thickness=0.5, color=BORDER, spaceBefore=3, spaceAfter=3))
-            return
-        if tag in _CONTAINERS or tag == "li":
-            self._flush(ctx)
-            css_class = node.attrs.get("class", "")
-            style = self.styles.panel_header if "panelHeader" in css_class else ctx.style
-            if tag == "dd":
-                style = self.styles.indented(ctx.style, 12)
-            ctx.out.extend(self._render(node.children, style, ctx.width))
-            return
-
-        opening, closing = self._inline_tags(node)
-        if opening:
-            ctx.buffer.append(opening)
-            ctx.open_tags.append((opening, closing))
-        for child in node.children:
-            self._visit(child, ctx)
-        if opening:
-            ctx.open_tags.pop()
-            ctx.buffer.append(closing)
-
-    def _inline_tags(self, node: Node) -> tuple[str, str]:
-        tag = node.tag
-        if tag in _SIMPLE_INLINE:
-            return _SIMPLE_INLINE[tag]
-        if tag in _CODE_INLINE:
-            return f'<font face="{self.styles.mono}">', "</font>"
-        if tag == "a":
-            href = node.attrs.get("href", "").strip()
-            if href.lower().startswith(("http://", "https://", "mailto:")):
-                safe_href = escape(href, {'"': "&quot;"})
-                return f'<a href="{safe_href}" color="{LINK.hexval()}">', "</a>"
-            return "", ""
-        if tag in ("span", "font"):
-            color = node.attrs.get("color", "")
-            match = _COLOR_STYLE.search(node.attrs.get("style", ""))
-            if match:
-                color = match.group(1)
-            color = color.strip().lower()
-            if _HEX_COLOR.match(color) or color in _NAMED_COLORS:
-                return f'<font color="{color}">', "</font>"
-        return "", ""
-
-    def _visit_image(self, node: Node, ctx: _Context) -> None:
-        src = node.attrs.get("src", "")
-        css_class = node.attrs.get("class", "")
-        if "emoticon" in css_class or "/images/icons/" in src:
-            # Small Jira icons (smileys, status icons): rendered as text, e.g. "(smile)".
-            name = node.attrs.get("alt") or Path(src.split("?")[0]).stem
-            if name:
-                ctx.buffer.append(escape(f"({name.strip('()')})"))
-            return
-        self._flush(ctx)
-        name = node.attrs.get("alt") or Path(src.split("?")[0]).name or "image"
-        data = self.resolve_image(src) if self.resolve_image else None
-        image = make_image(data, ctx.width) if data is not None else None
-        if image is None:
-            ctx.out.append(self.paragraph(f"<i>[Image not available: {escape(name)}]</i>", self.styles.muted))
+    # ------------------------------------------------------------------ helpers
+    def resolve_url(self, path_or_url: str) -> str:
+        """Turn an API path or a URL returned by Jira into an absolute URL on the Jira host."""
+        if path_or_url.startswith(("http://", "https://")):
+            url = path_or_url
+        elif path_or_url.startswith("/rest/") or path_or_url.startswith("/secure/"):
+            url = self.base_url + path_or_url
         else:
-            ctx.out.append(image)
-            ctx.out.append(Spacer(1, 3))
+            url = urljoin(self.base_url + "/", path_or_url)
+        return url
 
-    def _list(self, node: Node, ctx: _Context) -> list[Flowable]:
-        ordered = node.tag == "ol"
+    def is_same_origin(self, url: str) -> bool:
+        parsed = urlparse(url)
+        return (parsed.scheme.lower(), parsed.netloc.lower()) == self._origin
+
+    def _checked_url(self, path_or_url: str) -> str:
+        url = self.resolve_url(path_or_url)
+        if not self.is_same_origin(url):
+            raise JiraError(f"Refusing to send credentials to a foreign host: {urlparse(url).netloc}")
+        return url
+
+    @contextmanager
+    def _slot(self) -> Iterator[None]:
+        """Throttling: see the module docstring. Wraps the whole request, body download included."""
+        with self._lock:
+            wait = self._next_allowed - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+            start = time.monotonic()
+            try:
+                yield
+            finally:
+                elapsed = time.monotonic() - start
+                self.request_count += 1
+                self.busy_seconds += elapsed
+                pause = max(self._min_interval, min(elapsed, MAX_ADAPTIVE_PAUSE))
+                self._next_allowed = time.monotonic() + pause
+
+    def _slow_down(self, status: int) -> None:
+        self._calm_streak = 0
+        new_interval = min(self._min_interval * 2, MAX_BACKOFF_DELAY)
+        if new_interval > self._min_interval:
+            self._min_interval = new_interval
+            log.warning("Jira answered HTTP %s (overloaded / rate limited): slowing down to at most "
+                        "one request every %.1f s.", status, self._min_interval)
+
+    def _recover(self) -> None:
+        self._calm_streak += 1
+        if self._min_interval > self._base_interval and self._calm_streak >= RECOVERY_STREAK:
+            self._min_interval = max(self._base_interval, self._min_interval / 2)
+            self._calm_streak = 0
+            log.info("Jira looks fine again: minimum pause back to %.1f s.", self._min_interval)
+
+    def _request(self, method: str, path_or_url: str, **kwargs: Any) -> requests.Response:
+        """Send one request (call it inside :meth:`_slot`)."""
+        url = self._checked_url(path_or_url)
+        log.debug("%s %s", method, url.split("?")[0])
         try:
-            number = int(node.attrs.get("start", "1"))
+            response = self._session.request(method, url, timeout=self._timeout, **kwargs)
+        except requests.exceptions.SSLError as exc:
+            raise JiraError(
+                "TLS/SSL certificate error. Is 'pip_system_certs' installed in the virtual "
+                f"environment, or JIRA_CA_BUNDLE set? Details: {exc}"
+            ) from exc
+        except requests.exceptions.RequestException as exc:
+            raise JiraError(f"Network error while calling Jira: {exc}") from exc
+
+        retries = getattr(response.raw, "retries", None)
+        history = getattr(retries, "history", None) or ()
+        statuses = {h.status for h in history} | {response.status_code}
+        overloaded = statuses & _SLOW_DOWN_STATUSES
+        for status in overloaded:
+            self._slow_down(status)
+        if not overloaded:
+            self._recover()
+
+        if response.status_code >= 400:
+            raise JiraError(self._describe_error(response), response.status_code)
+        return response
+
+    @staticmethod
+    def _describe_error(response: requests.Response) -> str:
+        hints = {
+            401: "authentication failed (token invalid, expired or revoked)",
+            403: "access denied (the account lacks the required permission)",
+            404: "not found (wrong project key/ID, or no permission to see it)",
+            429: "too many requests (Jira rate limiting)",
+        }
+        detail = ""
+        try:
+            body = response.json()
+            messages = list(body.get("errorMessages") or []) + [
+                f"{k}: {v}" for k, v in (body.get("errors") or {}).items()
+            ]
+            detail = "; ".join(messages)
         except ValueError:
-            number = 1
-        indent = 14
-        style = self.styles.indented(ctx.style, indent)
-        nested = ctx.style.leftIndent > 0
-        out: list[Flowable] = []
-        for child in node.children:
-            if isinstance(child, str):
-                if child.strip():
-                    out.extend(self._render([child], style, ctx.width - indent))
-                continue
-            if child.tag != "li":
-                out.extend(self._render([child], style, ctx.width - indent))
-                continue
-            self._pending_bullet = f"{number}." if ordered else ("–" if nested else "•")
-            number += 1
-            out.extend(self._render(child.children, style, ctx.width - indent))
-            self._pending_bullet = None
-        return out
+            detail = response.text[:200]
+        hint = hints.get(response.status_code, "request failed")
+        path = urlparse(response.url).path
+        return f"HTTP {response.status_code} on {path}: {hint}. {detail}".strip()
 
-    def _preformatted(self, node: Node, ctx: _Context) -> list[Flowable]:
-        text = text_content(node).expandtabs(4).strip("\n")
-        if not text.strip():
-            return []
-        style = self.styles.code
-        max_chars = max(20, int((ctx.width - 10) / (style.fontSize * 0.6)))
-        lines: list[str] = []
-        for line in text.splitlines():
-            while len(line) > max_chars:  # hard-wrap very long lines, they would overflow the page
-                lines.append(line[:max_chars])
-                line = line[max_chars:]
-            lines.append(line)
-        markup = escape("\n".join(lines))
-        try:
-            return [XPreformatted(markup, style)]
-        except Exception:
-            return [self.paragraph(markup.replace("\n", "<br/>"), style)]
+    # --------------------------------------------------------------- public API
+    def get_json(self, path_or_url: str, params: dict[str, Any] | None = None) -> Any:
+        with self._slot():
+            return self._request("GET", path_or_url, params=params).json()
 
-    def _table(self, node: Node, ctx: _Context) -> list[Flowable]:
-        rows: list[list[Node]] = []
+    def post_json(self, path: str, payload: dict[str, Any]) -> Any:
+        with self._slot():
+            return self._request("POST", path, json=payload).json()
 
-        def collect(parent: Node) -> None:
-            for child in parent.children:
-                if isinstance(child, str):
-                    continue
-                if child.tag == "tr":
-                    cells = [c for c in child.children if isinstance(c, Node) and c.tag in ("td", "th")]
-                    if cells:
-                        rows.append(cells)
-                elif child.tag in ("thead", "tbody", "tfoot"):
-                    collect(child)
+    def get_bytes(self, path_or_url: str, max_bytes: int) -> bytes:
+        """Download a small resource (e.g. an inline image) fully into memory."""
+        with self._slot():
+            response = self._request("GET", path_or_url, stream=True, headers={"Accept": "*/*"})
+            data = bytearray()
+            try:
+                for chunk in response.iter_content(64 * 1024):
+                    data.extend(chunk)
+                    if len(data) > max_bytes:
+                        raise JiraError(f"Resource larger than {max_bytes} bytes, skipped.")
+            except requests.exceptions.RequestException as exc:
+                raise JiraError(f"Download interrupted: {exc}") from exc
+            finally:
+                response.close()
+            return bytes(data)
 
-        collect(node)
-        if not rows:
-            return []
+    def download(self, path_or_url: str, destination: Path) -> int:
+        """Stream a file (e.g. an attachment) to *destination*. Returns the number of bytes."""
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        tmp = destination.with_name(destination.name + ".part")
+        written = 0
+        with self._slot():
+            response = self._request("GET", path_or_url, stream=True, headers={"Accept": "*/*"})
+            try:
+                with tmp.open("wb") as handle:
+                    for chunk in response.iter_content(1024 * 1024):
+                        handle.write(chunk)
+                        written += len(chunk)
+            except requests.exceptions.RequestException as exc:
+                tmp.unlink(missing_ok=True)
+                raise JiraError(f"Download interrupted: {exc}") from exc
+            finally:
+                response.close()
+        os.replace(tmp, destination)
+        return written
 
-        if self.safe_mode:  # flattened: one paragraph per row, cells separated by "|"
-            out = []
-            for cells in rows:
-                texts = [escape(_WHITESPACE.sub(" ", text_content(c)).strip()) for c in cells]
-                out.append(self.paragraph(" | ".join(texts), self.styles.small))
-            return out
+    def stats(self) -> str:
+        """Short summary of the load put on Jira so far."""
+        return (f"{self.request_count} API request(s), {self.busy_seconds:.0f} s spent waiting for Jira, "
+                f"current minimum pause {self._min_interval:.1f} s")
 
-        column_count = max(len(cells) for cells in rows)
-        column_width = ctx.width / column_count
-        padding = 3
-        data: list[list[object]] = []
-        commands: list[tuple] = [
-            ("GRID", (0, 0), (-1, -1), 0.4, BORDER),
-            ("VALIGN", (0, 0), (-1, -1), "TOP"),
-            ("LEFTPADDING", (0, 0), (-1, -1), padding),
-            ("RIGHTPADDING", (0, 0), (-1, -1), padding),
-            ("TOPPADDING", (0, 0), (-1, -1), 2),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
-        ]
-        for row_index, cells in enumerate(rows):
-            row: list[object] = []
-            for col_index, cell in enumerate(cells):
-                header = cell.tag == "th"
-                style = self.styles.cell_header if header else self.styles.cell
-                content = self._render(cell.children, style, column_width - 2 * padding)
-                row.append(content or "")
-                if header:
-                    commands.append(("BACKGROUND", (col_index, row_index), (col_index, row_index), HEADER_BG))
-            row.extend([""] * (column_count - len(row)))
-            data.append(row)
+    # ---------------------------------------------------------- Jira shortcuts
+    def server_info(self) -> dict[str, Any]:
+        return self.get_json(f"{self.API}/serverInfo")
 
-        header_rows = 1 if all(c.tag == "th" for c in rows[0]) and len(rows) > 1 else 0
-        table = Table(data, colWidths=[column_width] * column_count, repeatRows=header_rows, hAlign="LEFT")
-        table.setStyle(TableStyle(commands))
-        return [table, Spacer(1, 5)]
+    def myself(self) -> dict[str, Any]:
+        return self.get_json(f"{self.API}/myself")
+
+    def search(
+        self,
+        jql: str,
+        start_at: int,
+        max_results: int,
+        fields: list[str],
+        expand: list[str] | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "jql": jql,
+            "startAt": start_at,
+            "maxResults": max_results,
+            "fields": fields,
+            "validateQuery": "strict",
+        }
+        if expand:
+            payload["expand"] = expand
+        return self.post_json(f"{self.API}/search", payload)
+
+    def iter_search(self, jql: str, fields: list[str], page_size: int) -> Iterator[dict[str, Any]]:
+        """Yield every issue matching *jql*, following pagination."""
+        start = 0
+        while True:
+            page = self.search(jql, start, page_size, fields)
+            issues = page.get("issues") or []
+            yield from issues
+            start += len(issues)
+            if not issues or start >= int(page.get("total", 0)):
+                return
+
+    def paged_values(self, path: str, page_size: int = 100, params: dict[str, Any] | None = None) -> list[Any]:
+        """Collect all ``values`` of a Jira "paged" endpoint (``isLast`` / ``startAt`` style)."""
+        results: list[Any] = []
+        start = 0
+        while True:
+            query = dict(params or {}, startAt=start, maxResults=page_size)
+            page = self.get_json(path, query)
+            values = page.get("values") or []
+            results.extend(values)
+            start += len(values)
+            total = page.get("total")
+            if not values or page.get("isLast") is True:
+                return results
+            if total is not None and start >= int(total):
+                return results
+            if total is None and "isLast" not in page and len(values) < page_size:
+                return results
