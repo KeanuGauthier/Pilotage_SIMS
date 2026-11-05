@@ -1,58 +1,126 @@
-@echo off
-REM ==========================================================================
-REM  jira-archiver - one-time installation (run it again after a "git pull")
-REM  Creates a private Python environment (.venv) and installs the libraries.
-REM ==========================================================================
-setlocal
-cd /d "%~dp0"
-echo.
-echo === jira-archiver setup ===
-echo.
+# Archive format (version 1.0)
 
-REM Find Python: the "py" launcher first, then "python"
-set "PY="
-where py >nul 2>nul && set "PY=py -3"
-if not defined PY (
-    where python >nul 2>nul && set "PY=python"
-)
-if not defined PY (
-    echo [ERROR] Python was not found. Install Python 3.12 and try again.
-    goto :fail
-)
+This document describes the content of an archive produced by jira-archiver. Its goal is that anyone can understand and reuse an archive in the future, even without Jira and without this tool.
 
-%PY% -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)"
-if errorlevel 1 (
-    echo [ERROR] Python 3.10 or newer is required.
-    goto :fail
-)
+## Files
 
-if not exist ".venv\Scripts\python.exe" (
-    echo Creating the Python environment in the .venv folder...
-    %PY% -m venv .venv
-    if errorlevel 1 goto :fail
-)
+| Path in the ZIP | Content |
+|---|---|
+| `README.txt` | Short plain-text description of the archive. |
+| `project.json` | All data: project configuration and every issue. UTF-8 JSON. |
+| `manifest.json` | Every file of the archive with its size and SHA-256 fingerprint, plus counters and warnings. |
+| `pdf/<KEY>-<n>.pdf` | One PDF per issue (human-readable version of the data). |
+| `attachments/<KEY>-<n>/<attachment id>_<file name>` | Attachment files. The id prefix keeps two files with the same name apart. |
 
-echo Installing the libraries listed in requirements.txt...
-".venv\Scripts\python.exe" -m pip install -r requirements.txt
-if errorlevel 1 goto :fail
+Next to the ZIP file, `<zip name>.sha256` contains the SHA-256 fingerprint of the ZIP itself, in the standard `sha256sum` format.
 
-if not exist ".env" (
-    copy ".env.example" ".env" >nul
-    echo.
-    echo A configuration file ".env" was created.
-)
+## General rules
 
-echo.
-echo === Setup finished ===
-echo Next steps:
-echo   1. Open the ".env" file with Notepad and fill in JIRA_BASE_URL and JIRA_PAT.
-echo   2. Double-click check_connection.bat to test the connection.
-echo.
-pause
-exit /b 0
+- **Raw Jira data.** Jira objects (users, statuses, versions, comments, history…) are kept **as returned by the Jira REST API v2**. Only these keys are removed everywhere: `self`, `avatarUrls` and `iconUrl`. They are links to the Jira server and become useless once Jira is gone.
+- **Dates.** They are kept exactly as Jira gives them, e.g. `2024-03-01T10:15:30.000+0100`, which is local time plus the offset from UTC. Archive timestamps (`generated_at`…) are in UTC.
+- **Empty values.** An empty field is written as `null` (or `[]`). This shows that the field existed for the issue and was empty, rather than forgotten by the export.
 
-:fail
-echo.
-echo === Setup FAILED - read the messages above, and the "Troubleshooting" part of README.md ===
-pause
-exit /b 1
+## `project.json`
+
+```jsonc
+{
+  "archive": {
+    "format_version": "1.0",
+    "generated_at": "2026-11-05T13:13:59+00:00",   // when the archive was finished (UTC)
+    "export_started_at": "...",                     // when the export started (UTC)
+    "tool": "jira-archiver 1.0.0",
+    "jira": { "base_url": "...", "version": "11.3.7", "build_number": 0, "deployment_type": "Server" },
+    "issue_count": 25,
+    "warnings": []                                  // project-level problems (e.g. a scheme not readable)
+  },
+  "project":   { ... },        // GET /project/{key}: name, description, lead, issue types...
+  "components": [ ... ],
+  "versions":   [ ... ],
+  "roles":      { "Developers": { "actors": [ ... ] } },
+  "schemes": { "permission": {...}, "notification": {...}, "issue_security": null },
+  "statuses_by_issue_type": [ ... ],
+  "issue_types": [
+    {
+      "id": "1", "name": "Bug", "subtask": false, "description": "...",
+      "create_screen_fields": [          // fields configured for this issue type
+        { "fieldId": "summary", "name": "Summary", "required": true,
+          "schema": {...}, "allowedValues": [...], "hasDefaultValue": false, "operations": [...] }
+      ]
+    }
+  ],
+  "fields": {                            // catalog of every field used in this project
+    "customfield_10000": { "id": "...", "name": "Story Points", "custom": true, "schema": {...} }
+  },
+  "issues": [ <issue>, <issue>, ... ]    // sorted by key: ABC-1, ABC-2, ... ABC-10
+}
+```
+
+### An issue
+
+```jsonc
+{
+  "id": "10001",
+  "key": "ABC-1",
+  "issue_type": { "id": "1", "name": "Bug", "subtask": false },
+
+  "fields": {
+    // One entry per field: system fields first, then custom fields, sorted by name.
+    "summary":           { "name": "Summary", "value": "Login fails" },
+    "description":       { "name": "Description",
+                           "value": "Raw Jira *wiki* markup",
+                           "rendered_html": "<p>Raw Jira <b>wiki</b> markup</p>" },
+    "customfield_10000": { "name": "Story Points", "value": null }
+  },
+
+  "comments":     [ { "id", "author", "updateAuthor", "body", "renderedBody", "created", "updated", "visibility"? } ],
+  "worklogs":     [ { "id", "author", "started", "timeSpent", "timeSpentSeconds", "comment", ... } ],
+  "changelog":    [ { "id", "author", "created",
+                      "items": [ { "field", "fieldtype", "from", "fromString", "to", "toString" } ] } ],
+  "remote_links": [ { "id", "relationship", "object": { "url", "title" } } ],
+  "attachments":  [ { "id", "filename", "author", "created", "size", "mimeType",
+                      "archive": { "status": "ok", "path": "attachments/ABC-1/10200_x.png",
+                                   "size": 1234, "sha256": "..." } } ],
+  "pdf":           { "path": "pdf/ABC-1.pdf", "sha256": "..." },
+  "archive_notes": [ "Attachment x.pdf (id 10201) could not be downloaded: HTTP 404 ..." ]
+}
+```
+
+### Which fields are included for an issue
+
+The fields of an issue are the union of:
+
+1. the fields configured for its issue type (`create_screen_fields`), even when empty;
+2. the main system fields (summary, status, priority, assignee, dates, versions, links…), even when empty;
+3. every other field that has a value.
+
+Fields of the Jira instance that do not belong to the project are not included. The field `lastViewed` is also left out: it describes the account that ran the export, not the issue. Comments, work logs and attachments are moved to their own sections (`comments`, `worklogs`, `attachments`).
+
+### `rendered_html`
+
+For text fields, Jira stores *wiki markup* (e.g. `*bold*`). The archive also keeps the HTML version produced by Jira at export time. It is the most faithful view of the formatting, and it is what the PDFs show. Links to images inside it (`/secure/attachment/...`) point to the Jira server. The matching files are in `attachments/`, and the attachment id is the number in the link.
+
+### Attachment `archive.status`
+
+| Value | Meaning |
+|---|---|
+| `ok` | The file is in the archive at `archive.path`. |
+| `missing on server (HTTP 404)` | Jira lists the file but no longer has it. |
+| `skipped` | The export was run with `--no-attachments`. |
+
+## `manifest.json`
+
+```jsonc
+{
+  "format_version": "1.0",
+  "generated_at": "...",
+  "tool": "jira-archiver 1.0.0",
+  "jira": { ... },
+  "project": { "id": "10000", "key": "ABC", "name": "..." },
+  "counts": { "issues": 25, "pdf_files": 25, "attachments": 3, "attachment_bytes": 46028 },
+  "warnings": [ ... ],                          // project-level warnings
+  "issue_notes": { "ABC-4": [ "PDF rendered in simplified mode (complex layout)." ] },
+  "files": [ { "path": "pdf/ABC-1.pdf", "size": 34567, "sha256": "..." } ]
+}
+```
+
+`manifest.json` does not list itself.
