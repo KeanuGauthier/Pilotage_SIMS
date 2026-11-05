@@ -1,13 +1,58 @@
-# Python libraries needed by jira-archiver (Python 3.10 or newer, tested with 3.12).
-# Install with:  pip install -r requirements.txt   (setup.bat does it for you)
-#
-# Tested versions: requests 2.34.2, reportlab 5.1.0, pillow 13.0.0, pip-system-certs 5.3
+@echo off
+REM ==========================================================================
+REM  jira-archiver - one-time installation (run it again after a "git pull")
+REM  Creates a private Python environment (.venv) and installs the libraries.
+REM ==========================================================================
+setlocal
+cd /d "%~dp0"
+echo.
+echo === jira-archiver setup ===
+echo.
 
-# HTTP client used to call the Jira REST API
-requests>=2.31,<3
-# PDF generation (pure Python)
-reportlab>=4.0,<6
-# Image handling (resizing images before putting them in the PDFs); also required by reportlab
-pillow>=10.0
-# Makes Python trust the certificates installed in Windows (company internal certificate)
-pip-system-certs>=4.0
+REM Find Python: the "py" launcher first, then "python"
+set "PY="
+where py >nul 2>nul && set "PY=py -3"
+if not defined PY (
+    where python >nul 2>nul && set "PY=python"
+)
+if not defined PY (
+    echo [ERROR] Python was not found. Install Python 3.12 and try again.
+    goto :fail
+)
+
+%PY% -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)"
+if errorlevel 1 (
+    echo [ERROR] Python 3.10 or newer is required.
+    goto :fail
+)
+
+if not exist ".venv\Scripts\python.exe" (
+    echo Creating the Python environment in the .venv folder...
+    %PY% -m venv .venv
+    if errorlevel 1 goto :fail
+)
+
+echo Installing the libraries listed in requirements.txt...
+".venv\Scripts\python.exe" -m pip install -r requirements.txt
+if errorlevel 1 goto :fail
+
+if not exist ".env" (
+    copy ".env.example" ".env" >nul
+    echo.
+    echo A configuration file ".env" was created.
+)
+
+echo.
+echo === Setup finished ===
+echo Next steps:
+echo   1. Open the ".env" file with Notepad and fill in JIRA_BASE_URL and JIRA_PAT.
+echo   2. Double-click check_connection.bat to test the connection.
+echo.
+pause
+exit /b 0
+
+:fail
+echo.
+echo === Setup FAILED - read the messages above, and the "Troubleshooting" part of README.md ===
+pause
+exit /b 1
