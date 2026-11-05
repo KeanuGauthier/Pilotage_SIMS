@@ -1,58 +1,207 @@
-"""Logging configuration: readable console output plus a detailed log file."""
+"""Assemble the final archive: ``project.json``, ``manifest.json``, ``README.txt`` and the ZIP file.
+
+Final ZIP layout::
+
+    <KEY>_jira_archive_<YYYYMMDD>.zip
+    └── <KEY>_jira_archive_<YYYYMMDD>/
+        ├── README.txt          plain-language description of the archive
+        ├── project.json        all project + issue data (see docs/ARCHIVE_FORMAT.md)
+        ├── manifest.json       inventory of every file with its SHA-256 fingerprint
+        ├── pdf/<KEY>-<n>.pdf   one PDF per issue
+        └── attachments/<KEY>-<n>/<id>_<file name>
+
+A ``<zip name>.sha256`` file is written next to the ZIP to check it was not
+corrupted (e.g. after copying it to the archive storage).
+"""
 
 from __future__ import annotations
 
-import logging
-import sys
+import json
+import os
+import textwrap
+import zipfile
+from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
-from .utils import utc_now
+from . import ARCHIVE_FORMAT_VERSION, __version__
+from .exporter import ExportResult
+from .logging_setup import get_logger
+from .utils import atomic_write_json, issue_sort_key, read_json, sha256_file, utc_now
 
-LOGGER_NAME = "jira_archiver"
-
-
-class _RedactingFilter(logging.Filter):
-    """Defense in depth: replaces any occurrence of the secret token in log records."""
-
-    def __init__(self, secret: str) -> None:
-        super().__init__()
-        self._secret = secret
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        if self._secret and len(self._secret) >= 8:
-            message = record.getMessage()
-            if self._secret in message:
-                record.msg = message.replace(self._secret, "***REDACTED***")
-                record.args = ()
-        return True
+log = get_logger("package")
 
 
-def setup_logging(log_dir: Path | None, secret: str = "", verbose: bool = False) -> Path | None:
-    """Configure logging. Returns the path of the log file (or ``None``)."""
-    logger = logging.getLogger(LOGGER_NAME)
-    logger.setLevel(logging.DEBUG)
-    logger.handlers.clear()
-    redactor = _RedactingFilter(secret)
-
-    console = logging.StreamHandler(sys.stdout)
-    console.setLevel(logging.DEBUG if verbose else logging.INFO)
-    console.setFormatter(logging.Formatter("%(asctime)s  %(levelname)-7s %(message)s", "%H:%M:%S"))
-    console.addFilter(redactor)
-    logger.addHandler(console)
-
-    log_file = None
-    if log_dir is not None:
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_file = log_dir / f"archive_{utc_now().strftime('%Y%m%d_%H%M%S')}.log"
-        file_handler = logging.FileHandler(log_file, encoding="utf-8")
-        file_handler.setLevel(logging.DEBUG)
-        file_handler.setFormatter(
-            logging.Formatter("%(asctime)s %(levelname)-7s [%(name)s] %(message)s")
-        )
-        file_handler.addFilter(redactor)
-        logger.addHandler(file_handler)
-    return log_file
+def _dump(value: Any, indent_level: int) -> str:
+    """JSON-encode *value* and indent it so it can be embedded at *indent_level*."""
+    text = json.dumps(value, ensure_ascii=False, indent=2)
+    return text.replace("\n", "\n" + "  " * indent_level)
 
 
-def get_logger(name: str = "") -> logging.Logger:
-    return logging.getLogger(f"{LOGGER_NAME}.{name}" if name else LOGGER_NAME)
+def _issue_files(result: ExportResult) -> Iterator[Path]:
+    keys = sorted((item["key"] for item in result.inventory), key=issue_sort_key)
+    for key in keys:
+        yield result.paths.issues / f"{key}.json"
+
+
+def write_project_json(result: ExportResult, jira_info: dict[str, Any], generated_at: str) -> Path:
+    """Write ``project.json`` by streaming the issues one by one (works for very large projects)."""
+    metadata = result.metadata
+    used_fields: set[str] = set()
+    for path in _issue_files(result):
+        used_fields.update(read_json(path)["fields"].keys())
+    for issue_type in metadata["issue_types"]:
+        used_fields.update(f.get("fieldId") for f in issue_type.get("create_screen_fields") or [])
+
+    header = {
+        "archive": {
+            "format_version": ARCHIVE_FORMAT_VERSION,
+            "generated_at": generated_at,
+            "export_started_at": metadata["export_started_at"],
+            "tool": f"jira-archiver {__version__}",
+            "jira": jira_info,
+            "issue_count": len(result.inventory),
+            "warnings": metadata.get("warnings", []),
+        },
+        "project": metadata["project"],
+        "components": metadata["components"],
+        "versions": metadata["versions"],
+        "roles": metadata["roles"],
+        "schemes": {
+            "permission": metadata["permission_scheme"],
+            "notification": metadata["notification_scheme"],
+            "issue_security": metadata["issue_security_scheme"],
+        },
+        "statuses_by_issue_type": metadata["statuses_by_issue_type"],
+        "issue_types": metadata["issue_types"],
+        "fields": {fid: info for fid, info in sorted(metadata["field_catalog"].items()) if fid in used_fields},
+    }
+
+    target = result.paths.archive / "project.json"
+    tmp = target.with_name(target.name + ".part")
+    with tmp.open("w", encoding="utf-8", newline="\n") as handle:
+        handle.write("{\n")
+        for name, value in header.items():
+            handle.write(f"  {json.dumps(name)}: {_dump(value, 1)},\n")
+        handle.write('  "issues": [')
+        first = True
+        for path in _issue_files(result):
+            handle.write("\n    " if first else ",\n    ")
+            handle.write(_dump(read_json(path), 2))
+            first = False
+        handle.write("\n  ]\n}\n")
+    os.replace(tmp, target)
+    return target
+
+
+def write_readme(result: ExportResult, generated_at: str, base_url: str) -> Path:
+    project = result.metadata["project"]
+    text = textwrap.dedent(f"""\
+        JIRA PROJECT ARCHIVE
+        ====================
+
+        Project      : {project.get('name')} ({project.get('key')})
+        Source       : {base_url}
+        Archived on  : {generated_at} (UTC)
+        Issues       : {len(result.inventory)}
+        Created with : jira-archiver {__version__}
+
+        CONTENTS
+        --------
+        project.json   All the data of the project and of every issue (fields,
+                       comments, work logs, history, links, attachments list...).
+                       Text format, readable with any text editor or JSON viewer.
+        pdf/           One PDF per issue, ready to read or print.
+        attachments/   The files attached to the issues, one folder per issue.
+        manifest.json  The list of every file of this archive with its SHA-256
+                       fingerprint, to prove nothing was changed or corrupted.
+
+        HOW TO CHECK THE ARCHIVE IS INTACT
+        ----------------------------------
+        Each file has a "sha256" value in manifest.json. On Windows, run in PowerShell:
+            Get-FileHash .\\pdf\\{project.get('key')}-1.pdf -Algorithm SHA256
+        The value displayed must be identical to the one in manifest.json
+        (upper case / lower case does not matter).
+        """)
+    target = result.paths.archive / "README.txt"
+    target.write_text(text.replace("\n", "\r\n"), encoding="utf-8")
+    return target
+
+
+def write_manifest(result: ExportResult, jira_info: dict[str, Any], generated_at: str) -> Path:
+    archive_dir = result.paths.archive
+    files = []
+    attachment_count = 0
+    attachment_bytes = 0
+    for path in sorted(p for p in archive_dir.rglob("*") if p.is_file() and p.name != "manifest.json"):
+        relative = path.relative_to(archive_dir).as_posix()
+        size = path.stat().st_size
+        files.append({"path": relative, "size": size, "sha256": sha256_file(path)})
+        if relative.startswith("attachments/"):
+            attachment_count += 1
+            attachment_bytes += size
+
+    notes = {}
+    for issue_path in _issue_files(result):
+        record = read_json(issue_path)
+        if record.get("archive_notes"):
+            notes[record["key"]] = record["archive_notes"]
+
+    manifest = {
+        "format_version": ARCHIVE_FORMAT_VERSION,
+        "generated_at": generated_at,
+        "tool": f"jira-archiver {__version__}",
+        "jira": jira_info,
+        "project": {"id": result.metadata["project"].get("id"), "key": result.project_key,
+                    "name": result.metadata["project"].get("name")},
+        "counts": {
+            "issues": len(result.inventory),
+            "pdf_files": sum(1 for f in files if f["path"].startswith("pdf/")),
+            "attachments": attachment_count,
+            "attachment_bytes": attachment_bytes,
+        },
+        "warnings": result.metadata.get("warnings", []),
+        "issue_notes": notes,
+        "files": files,
+    }
+    target = archive_dir / "manifest.json"
+    atomic_write_json(target, manifest)
+    return target
+
+
+def build_zip(result: ExportResult, output_dir: Path, date_tag: str) -> Path:
+    """Zip the archive folder, verify the ZIP, and write its SHA-256 next to it."""
+    name = f"{result.project_key}_jira_archive_{date_tag}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    zip_path = output_dir / f"{name}.zip"
+    tmp = zip_path.with_name(zip_path.name + ".part")
+
+    archive_dir = result.paths.archive
+    with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as zf:
+        for path in sorted(archive_dir.rglob("*")):
+            if path.is_file() and not path.is_symlink() and not path.name.endswith(".part"):
+                zf.write(path, f"{name}/{path.relative_to(archive_dir).as_posix()}")
+
+    log.info("[%s] Verifying the ZIP file...", result.project_key)
+    with zipfile.ZipFile(tmp) as zf:
+        broken = zf.testzip()
+        if broken:
+            raise RuntimeError(f"ZIP verification failed on {broken}")
+    os.replace(tmp, zip_path)
+
+    digest = sha256_file(zip_path)
+    (output_dir / f"{zip_path.name}.sha256").write_text(f"{digest}  {zip_path.name}\n", encoding="utf-8")
+    return zip_path
+
+
+def package(result: ExportResult, jira_info: dict[str, Any], output_dir: Path, base_url: str) -> Path:
+    """Create every archive file and the final ZIP. Returns the ZIP path."""
+    now = utc_now()
+    generated_at = now.isoformat()
+    log.info("[%s] Writing project.json...", result.project_key)
+    write_project_json(result, jira_info, generated_at)
+    write_readme(result, generated_at, base_url)
+    log.info("[%s] Writing manifest.json (computing fingerprints)...", result.project_key)
+    write_manifest(result, jira_info, generated_at)
+    log.info("[%s] Creating the ZIP file...", result.project_key)
+    return build_zip(result, output_dir, now.strftime("%Y%m%d"))
