@@ -1,10 +1,115 @@
-"""Jira Data Center project archiver.
+"""Configuration loading.
 
-Exports every issue of a Jira project to a structured JSON file and one PDF per
-issue, then packs everything (including attachments) into a single ZIP archive.
+Settings come from environment variables. For convenience they can also be put
+in a ``.env`` file next to the scripts (this file must NEVER be committed to git;
+it is listed in ``.gitignore``). Real environment variables always win over the
+``.env`` file.
 """
 
-__version__ = "1.0.0"
+from __future__ import annotations
 
-#: Version of the archive layout / JSON structure. Bump it when the format changes.
-ARCHIVE_FORMAT_VERSION = "1.0"
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+from urllib.parse import urlparse
+
+
+class ConfigError(Exception):
+    """Raised when the configuration is missing or invalid."""
+
+
+def load_dotenv(path: Path) -> None:
+    """Load ``KEY=VALUE`` lines from *path* into ``os.environ``.
+
+    Existing environment variables are never overwritten. Blank lines and lines
+    starting with ``#`` are ignored. Values may be wrapped in single or double quotes.
+    """
+    if not path.is_file():
+        return
+    for raw_line in path.read_text(encoding="utf-8-sig").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if key.startswith("export "):
+            key = key[len("export "):].strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if key:
+            os.environ.setdefault(key, value)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None or value.strip() == "":
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_number(name: str, default: float, minimum: float, maximum: float) -> float:
+    value = os.environ.get(name)
+    if value is None or value.strip() == "":
+        return default
+    try:
+        number = float(value)
+    except ValueError as exc:
+        raise ConfigError(f"{name} must be a number (got {value!r}).") from exc
+    if not minimum <= number <= maximum:
+        raise ConfigError(f"{name} must be between {minimum} and {maximum} (got {number}).")
+    return number
+
+
+@dataclass(frozen=True)
+class Settings:
+    """All runtime settings. The token is excluded from ``repr`` so it never ends up in logs."""
+
+    base_url: str
+    token: str = field(repr=False)
+    ca_bundle: str | None
+    timeout: float
+    page_size: int
+    request_delay: float
+    output_dir: Path
+    allow_http: bool
+
+
+def load_settings(project_root: Path) -> Settings:
+    """Read the settings from the environment (and ``<project_root>/.env``)."""
+    load_dotenv(project_root / ".env")
+
+    base_url = os.environ.get("JIRA_BASE_URL", "").strip().rstrip("/")
+    token = os.environ.get("JIRA_PAT", "").strip()
+
+    if not base_url:
+        raise ConfigError("JIRA_BASE_URL is not set. Put it in the .env file (see .env.example).")
+    if not token:
+        raise ConfigError("JIRA_PAT is not set. Put your Personal Access Token in the .env file.")
+
+    parsed = urlparse(base_url)
+    allow_http = _env_bool("JIRA_ALLOW_HTTP", False)
+    if parsed.scheme not in {"https", "http"} or not parsed.netloc:
+        raise ConfigError(f"JIRA_BASE_URL is not a valid URL: {base_url!r} (expected https://...).")
+    if parsed.scheme == "http" and not allow_http:
+        raise ConfigError(
+            "JIRA_BASE_URL uses plain http://. The token would travel unencrypted. "
+            "Use https:// (JIRA_ALLOW_HTTP=true exists for local testing only)."
+        )
+
+    ca_bundle = os.environ.get("JIRA_CA_BUNDLE", "").strip() or None
+    if ca_bundle and not Path(ca_bundle).is_file():
+        raise ConfigError(f"JIRA_CA_BUNDLE points to a file that does not exist: {ca_bundle}")
+
+    output_dir = Path(os.environ.get("ARCHIVE_OUTPUT_DIR", "").strip() or project_root / "output")
+
+    return Settings(
+        base_url=base_url,
+        token=token,
+        ca_bundle=ca_bundle,
+        timeout=_env_number("JIRA_TIMEOUT", 60, 5, 600),
+        page_size=int(_env_number("JIRA_PAGE_SIZE", 25, 1, 100)),
+        request_delay=_env_number("JIRA_REQUEST_DELAY", 0.5, 0.2, 30),
+        output_dir=output_dir.resolve(),
+        allow_http=allow_http,
+    )
