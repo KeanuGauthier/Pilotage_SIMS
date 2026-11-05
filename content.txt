@@ -1,37 +1,167 @@
-# ---------------------------------------------------------------------------
-# jira-archiver configuration
-#
-# 1. Copy this file and name the copy ".env" (setup.bat does it for you).
-# 2. Fill in the values below in the ".env" file.
-# 3. NEVER share or commit the ".env" file: it contains your personal token.
-# ---------------------------------------------------------------------------
+"""Archive one or more Jira projects into ZIP files.
 
-# Address of Jira, exactly as in your browser, without the trailing "/".
-# Example: https://jira.mycompany.local   or   https://intranet.mycompany.local/jira
-JIRA_BASE_URL=https://jira.example.local
+Usage (from the project folder, with the virtual environment):
 
-# Your Personal Access Token.
-# Create it in Jira: click your avatar (top right) > Profile > Personal Access Tokens > Create token.
-JIRA_PAT=paste-your-token-here
+    python archive_project.py PROJKEY
+    python archive_project.py PROJ1 PROJ2 PROJ3
+    python archive_project.py --file projects.txt
+    python archive_project.py --file projects.txt --max-issues 1000
 
-# ----- Optional settings (the default values are fine in most cases) -------
+Run ``python archive_project.py --help`` for every option. See README.md.
+"""
 
-# Folder where the ZIP archives and the logs are written (default: "output" folder next to the scripts).
-# ARCHIVE_OUTPUT_DIR=D:\JiraArchives
+from __future__ import annotations
 
-# Path to a certificate file (.pem) if the company certificate is not installed in Windows.
-# Normally not needed thanks to the "pip-system-certs" library.
-# JIRA_CA_BUNDLE=C:\certs\company-root-ca.pem
+import argparse
+import contextlib
+import shutil
+import sys
+from pathlib import Path
 
-# Maximum time (seconds) to wait for an answer from Jira.
-# JIRA_TIMEOUT=60
+from jira_archiver import __version__
+from jira_archiver.config import ConfigError, Settings, load_settings
+from jira_archiver.exporter import ProjectExporter, ProjectTooLargeError
+from jira_archiver.jira_client import JiraClient, JiraError
+from jira_archiver.logging_setup import get_logger, setup_logging
+from jira_archiver.packager import package
+from jira_archiver.utils import PROJECT_KEY_RE, SingleInstanceLock
 
-# ----- Load on the Jira server (see "Load on the Jira server" in README.md) -----
-# Only change these if the Jira administrators ask for it.
+PROJECT_ROOT = Path(__file__).resolve().parent
 
-# Minimum pause (seconds) between two requests. Default 0.5 = at most 2 requests per second.
-# Cannot be lower than 0.2. Increase it (e.g. 1 or 2) to be even gentler with Jira.
-# JIRA_REQUEST_DELAY=0.5
+EXIT_OK, EXIT_SOME_FAILED, EXIT_CONFIG = 0, 1, 2
 
-# Number of issues downloaded per search request (1 to 100). Smaller = lighter requests.
-# JIRA_PAGE_SIZE=25
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Archive Jira projects (JSON + one PDF per issue + attachments) into ZIP files.",
+    )
+    parser.add_argument("projects", nargs="*", metavar="PROJECT",
+                        help="Project key (e.g. ABC) or numeric project ID. Several can be given.")
+    parser.add_argument("--file", type=Path,
+                        help="Text file with one project key per line (lines starting with # are ignored).")
+    parser.add_argument("--output", type=Path,
+                        help="Output folder (default: ARCHIVE_OUTPUT_DIR from .env, or ./output).")
+    parser.add_argument("--max-issues", type=int, metavar="N",
+                        help="Skip projects that have more than N issues (useful to process small projects first).")
+    parser.add_argument("--no-attachments", action="store_true",
+                        help="Do not download attachment files (they stay listed in the JSON and PDFs).")
+    parser.add_argument("--keep-work", action="store_true",
+                        help="Keep the temporary working folder after a successful archive.")
+    parser.add_argument("--verbose", action="store_true", help="Show detailed messages in the console.")
+    parser.add_argument("--version", action="version", version=f"jira-archiver {__version__}")
+    return parser.parse_args(argv)
+
+
+def read_project_list(args: argparse.Namespace) -> list[str]:
+    projects = list(args.projects)
+    if args.file:
+        for line in args.file.read_text(encoding="utf-8-sig").splitlines():
+            line = line.split("#", 1)[0].strip()
+            if line:
+                projects.append(line)
+    unique: list[str] = []
+    for project in projects:
+        if project not in unique:
+            unique.append(project)
+    return unique
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        settings = load_settings(PROJECT_ROOT)
+    except ConfigError as exc:
+        print(f"CONFIGURATION ERROR: {exc}")
+        return EXIT_CONFIG
+
+    output_dir = (args.output or settings.output_dir).resolve()
+    log_file = setup_logging(output_dir / "logs", secret=settings.token, verbose=args.verbose)
+    log = get_logger()
+
+    try:
+        projects = read_project_list(args)
+    except OSError as exc:
+        log.error("Cannot read the project list file: %s", exc)
+        return EXIT_CONFIG
+    invalid = [p for p in projects if not (p.isdigit() or PROJECT_KEY_RE.match(p))]
+    if invalid:
+        log.error("Invalid project key(s): %s", ", ".join(invalid))
+        return EXIT_CONFIG
+    if not projects:
+        log.error("No project given. Example: python archive_project.py ABC")
+        return EXIT_CONFIG
+
+    # Only one run at a time: several runs in parallel would multiply the load on Jira.
+    lock = SingleInstanceLock(PROJECT_ROOT / ".archiver.lock")
+    if not lock.acquire():
+        log.error("Another archive run is already in progress on this installation. "
+                  "Wait for it to finish: running several at once would overload Jira.")
+        return EXIT_CONFIG
+    try:
+        return run_projects(settings, args, projects, output_dir, log_file)
+    finally:
+        lock.release()
+
+
+def run_projects(settings: Settings, args: argparse.Namespace, projects: list[str],
+                 output_dir: Path, log_file: Path | None) -> int:
+    log = get_logger()
+    client = JiraClient(settings)
+    try:
+        server = client.server_info()
+        client.myself()
+    except JiraError as exc:
+        log.error("Cannot talk to Jira: %s", exc)
+        log.error("Run check_connection.py to diagnose the problem.")
+        return EXIT_CONFIG
+    jira_info = {"base_url": settings.base_url, "version": server.get("version"),
+                 "build_number": server.get("buildNumber"), "deployment_type": server.get("deploymentType")}
+    log.info("Connected to Jira %s at %s", server.get("version"), settings.base_url)
+    log.info("Log file: %s", log_file)
+    log.info("Server protection: one request at a time, at least %.1f s between requests "
+             "(longer when Jira answers slowly).", settings.request_delay)
+
+    summary: dict[str, str] = {}
+    for project in projects:
+        log.info("=" * 70)
+        log.info("Project %s", project)
+        exporter = ProjectExporter(client, project, output_dir / "work", page_size=settings.page_size,
+                                   max_issues=args.max_issues, include_attachments=not args.no_attachments)
+        try:
+            result = exporter.run()
+            if result.failures:
+                log.error("[%s] %d issue(s) failed. Run the same command again to retry them "
+                          "(already exported issues are skipped). Details: %s",
+                          result.project_key, len(result.failures),
+                          result.paths.state / "failures.json")
+                summary[project] = f"INCOMPLETE ({len(result.failures)} issue(s) failed, run again)"
+                continue
+            zip_path = package(result, jira_info, output_dir, settings.base_url)
+            if not args.keep_work:
+                shutil.rmtree(result.paths.root, ignore_errors=True)
+                with contextlib.suppress(OSError):
+                    (output_dir / "work").rmdir()  # only removed when empty
+            log.info("[%s] DONE -> %s", result.project_key, zip_path)
+            log.info("[%s] Load on Jira so far: %s", result.project_key, client.stats())
+            summary[project] = f"OK  {zip_path.name}"
+        except ProjectTooLargeError as exc:
+            log.warning("Skipped: %s", exc)
+            summary[project] = "SKIPPED (too many issues)"
+        except JiraError as exc:
+            log.error("[%s] Jira error: %s", project, exc)
+            summary[project] = f"FAILED ({exc})"
+        except Exception as exc:  # unexpected bug: log it fully, continue with the next project
+            log.exception("[%s] Unexpected error: %r", project, exc)
+            summary[project] = f"FAILED (unexpected error, see log: {exc!r})"
+
+    log.info("=" * 70)
+    log.info("SUMMARY")
+    for project, status in summary.items():
+        log.info("  %-15s %s", project, status)
+    log.info("Load on Jira: %s", client.stats())
+    log.info("Archives are in: %s", output_dir)
+    return EXIT_OK if all(s.startswith(("OK", "SKIPPED")) for s in summary.values()) else EXIT_SOME_FAILED
+
+
+if __name__ == "__main__":
+    sys.exit(main())
