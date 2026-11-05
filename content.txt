@@ -1,6 +1,37 @@
-# Normalize line endings in the repository
-* text=auto
+# ---------------------------------------------------------------------------
+# jira-archiver configuration
+#
+# 1. Copy this file and name the copy ".env" (setup.bat does it for you).
+# 2. Fill in the values below in the ".env" file.
+# 3. NEVER share or commit the ".env" file: it contains your personal token.
+# ---------------------------------------------------------------------------
 
-# Windows batch files MUST use CRLF line endings or cmd.exe may misbehave
-*.bat text eol=crlf
-*.cmd text eol=crlf
+# Address of Jira, exactly as in your browser, without the trailing "/".
+# Example: https://jira.mycompany.local   or   https://intranet.mycompany.local/jira
+JIRA_BASE_URL=https://jira.example.local
+
+# Your Personal Access Token.
+# Create it in Jira: click your avatar (top right) > Profile > Personal Access Tokens > Create token.
+JIRA_PAT=paste-your-token-here
+
+# ----- Optional settings (the default values are fine in most cases) -------
+
+# Folder where the ZIP archives and the logs are written (default: "output" folder next to the scripts).
+# ARCHIVE_OUTPUT_DIR=D:\JiraArchives
+
+# Path to a certificate file (.pem) if the company certificate is not installed in Windows.
+# Normally not needed thanks to the "pip-system-certs" library.
+# JIRA_CA_BUNDLE=C:\certs\company-root-ca.pem
+
+# Maximum time (seconds) to wait for an answer from Jira.
+# JIRA_TIMEOUT=60
+
+# ----- Load on the Jira server (see "Load on the Jira server" in README.md) -----
+# Only change these if the Jira administrators ask for it.
+
+# Minimum pause (seconds) between two requests. Default 0.5 = at most 2 requests per second.
+# Cannot be lower than 0.2. Increase it (e.g. 1 or 2) to be even gentler with Jira.
+# JIRA_REQUEST_DELAY=0.5
+
+# Number of issues downloaded per search request (1 to 100). Smaller = lighter requests.
+# JIRA_PAGE_SIZE=25
