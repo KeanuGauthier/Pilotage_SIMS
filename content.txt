@@ -1,85 +1,22 @@
-\documentclass[tikz,border=12pt]{standalone}
-\usepackage[utf8]{inputenc}
-\usepackage[T1]{fontenc}
-\usepackage{lmodern}
-\usepackage{tikz}
-\usetikzlibrary{shapes.geometric, arrows.meta, positioning, fit, backgrounds, calc}
+# Secrets: never commit them
+.env
+*.pem
 
-\begin{document}
+# Archives, working files and logs produced by the tool
+output/
+.archiver.lock
 
-\begin{tikzpicture}[
-    font=\sffamily,
-    box/.style={
-        rectangle, rounded corners=5pt, thick,
-        text width=3.5cm, minimum height=1.7cm, align=center,
-        font=\sffamily\footnotesize, inner sep=5pt
-    },
-    gitlab/.style={box, fill=orange!12, draw=orange!80!black},
-    human/.style={box, fill=yellow!18, draw=yellow!60!black},
-    k8s/.style={box, fill=blue!10, draw=blue!70!black},
-    db/.style={
-        cylinder, shape border rotate=90, aspect=0.22, thick,
-        draw=teal!75!black, fill=teal!10,
-        text width=3.1cm, minimum height=1.9cm, align=center,
-        font=\sffamily\footnotesize, inner sep=4pt
-    },
-    arrow/.style={-{Stealth[length=3mm]}, thick, draw=black!70},
-    dualarrow/.style={{Stealth[length=3mm]}-{Stealth[length=3mm]}, thick, draw=black!70},
-    dashedarrow/.style={-{Stealth[length=3mm]}, thick, dashed, draw=teal!75!black},
-    lbl/.style={font=\sffamily\scriptsize, align=center, text=black!80},
-    dlbl/.style={font=\sffamily\scriptsize\itshape, align=center, text=teal!65!black},
-    zone/.style={rounded corners=8pt, draw=#1!50, fill=#1!4, dashed, inner sep=12pt},
-    zonetitle/.style={font=\sffamily\small\bfseries, text=#1!70!black, anchor=south west}
-]
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.ruff_cache/
+.pytest_cache/
 
-% ===== Positions (grille régulière) =====
-\def\dx{5.4}   % écart horizontal entre colonnes
-\def\dy{-4.6}  % écart vertical entre les deux lignes
-
-% --- Ligne 1 : CI/CD GitLab ---
-\node[gitlab] (git)   at (0,0)     {\textbf{1. GitLab Repo}\\[2pt]Modification de version\\(\texttt{Helm} / configs)};
-\node[gitlab] (build) at (\dx,0)   {\textbf{2. GitLab CI (Build)}\\[2pt]Préparation de l'image\\OpenProject interne};
-\node[gitlab] (test)  at (2*\dx,0) {\textbf{3. GitLab CI (Test)}\\[2pt]Migration \texttt{db:migrate}\\+ \texttt{/health\_checks/all}};
-\node[gitlab] (reg)   at (3*\dx,0) {\textbf{4. GitLab Registry}\\[2pt]Image OpenProject\\validée pour la prod};
-
-% --- Ligne 2 : Production ---
-\node[db]    (storage) at (\dx,\dy)   {\textbf{Stockage Prod}\\[2pt]Base PostgreSQL\\+ dossier \texttt{assets}};
-\node[k8s]   (k8s)     at (2*\dx,\dy) {\textbf{6. Kubernetes (Prod)}\\[2pt]Pods \texttt{Web} \& \texttt{Worker}\\(auto-scaling séparé)};
-\node[human] (deploy)  at (3*\dx,\dy) {\textbf{5. Action humaine}\\[2pt]Une seule commande :\\\texttt{./deploy.sh <version>}};
-
-% ===== Flux principal =====
-\draw[arrow] (git) -- (build);
-\draw[arrow] (build) -- (test);
-\draw[arrow] (test) -- (reg);
-\draw[arrow] (reg) -- node[lbl, right=3pt] {Pull de\\l'image} (deploy);
-\draw[arrow] (deploy) -- node[lbl, above=2pt] {Rolling\\update} (k8s);
-\draw[dualarrow] (k8s) -- node[lbl, above=2pt] {Lecture /\\Écriture} (storage);
-
-% ===== Flux de sauvegarde =====
-% Copie nocturne : Stockage -> environnement de test
-\coordinate (midY) at ($(build.south)!0.5!(storage.north)$);
-\draw[dashedarrow] (storage.north) -- (storage.north |- midY)
-    -- node[dlbl, above=1pt, pos=0.5] {Copie nocturne\\(vraies données pour le crash-test)}
-       ($(test.south |- midY) + (-0.6,0)$)
-    -- ($(test.south) + (-0.6,0)$);
-
-% Backup avant déploiement : Action humaine -> Stockage
-\coordinate (lowY) at ($(storage.south) + (0,-0.9)$);
-\draw[dashedarrow] (deploy.south) -- (deploy.south |- lowY)
-    -- node[dlbl, below=2pt, pos=0.5] {Backup de sécurité immédiat avant chaque déploiement}
-       (storage.south |- lowY)
-    -- (storage.south);
-
-% ===== Zones de fond =====
-\coordinate (prodBL) at ($(lowY)+(0,-0.5)$);
-\coordinate (prodL) at (git.west |- k8s);
-\begin{scope}[on background layer]
-    \node[zone=orange, fit=(git)(build)(test)(reg)] (zci) {};
-    \node[zone=blue, fit=(storage)(k8s)(deploy)(prodBL)(prodL)] (zprod) {};
-\end{scope}
-\node[zonetitle=orange] at ($(zci.north west)+(0.15,0.05)$) {Intégration \& livraison continues (GitLab)};
-\node[zonetitle=blue]   at ($(zprod.north west)+(0.15,0.05)$) {Environnement de production};
-
-\end{tikzpicture}
-
-\end{document}
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
