@@ -1,14 +1,8 @@
-@echo off
-REM Tests the connection to Jira. Optional: give a project key, e.g.  check_connection.bat ABC
-setlocal
-cd /d "%~dp0"
-if not exist ".venv\Scripts\python.exe" (
-    echo The tool is not installed yet: double-click setup.bat first.
-    pause
-    exit /b 1
-)
-".venv\Scripts\python.exe" check_connection.py %*
-set "RESULT=%ERRORLEVEL%"
-echo.
-pause
-exit /b %RESULT%
+# List of projects to archive, one project key per line.
+# Copy this file (e.g. "projects.txt"), edit it, then run:
+#     archive.bat --file projects.txt
+# Lines starting with # are ignored. Text after a # is ignored too.
+
+OLDPROJ
+LEGACY     # finished in 2019
+12345      # a numeric project ID also works
