@@ -1,137 +1,401 @@
-"""Check that the connection to Jira works, step by step, with clear explanations.
+# automatic-jira-archiving
 
-Usage:
+Archive old Jira projects before removing them from Jira.
 
-    py check_connection.py            # checks server, certificate, token, admin rights
-    py check_connection.py PROJKEY    # also checks access to one project
+For each project, the tool creates **one ZIP file** that contains:
 
-Nothing is ever modified in Jira: this script only reads information.
-"""
+- **`project.json`**: all the data of the project and of every issue, including empty fields, comments, work logs, full change history, links and the attachment list.
+- **`pdf/`**: one detailed PDF per issue, ready to read or print.
+- **`attachments/`**: every file attached to the issues.
+- **`manifest.json`**: the list of all files with a digital fingerprint (SHA-256), to prove later that nothing was changed or damaged.
+- **`README.txt`**: a short explanation for whoever opens the archive in a few years.
 
-from __future__ import annotations
+The tool **only reads** Jira. It never creates, changes or deletes anything in Jira.
 
-import platform
-import sys
-from importlib import metadata
-from pathlib import Path
-from urllib.parse import quote
+Built for **Jira Data Center 11.x**, running on **Windows** with **Python 3.10 or newer** (tested with 3.12).
 
-from jira_archiver import __version__
-from jira_archiver.bootstrap import pause_if_double_clicked, started_by_double_click, use_project_venv
+---
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+## Table of contents
 
-# Must run before the third-party libraries are imported (see bootstrap.py).
-use_project_venv(PROJECT_ROOT)
+1. [Installation (first time only)](#1-installation-first-time-only)
+2. [Configuration: URL and token](#2-configuration-url-and-token)
+3. [Test the connection](#3-test-the-connection)
+4. [Archive projects](#4-archive-projects)
+5. [What you get](#5-what-you-get)
+6. [Load on the Jira server](#6-load-on-the-jira-server)
+7. [Updating the tool](#7-updating-the-tool)
+8. [Troubleshooting](#8-troubleshooting)
+9. [Security](#9-security)
+10. [Known limitations](#10-known-limitations)
+11. [For maintainers](#11-for-maintainers)
 
-# Standard library only: these imports work even when the libraries are missing.
-from jira_archiver.config import ConfigError, load_settings  # noqa: E402
-from jira_archiver.utils import PROJECT_KEY_RE  # noqa: E402
+---
 
-OK, FAIL, WARN = "[ OK ]", "[FAIL]", "[WARN]"
+## 1. Installation (first time only)
 
+You do **not** need to know Python. Follow these steps.
 
-def report(status: str, message: str, hint: str = "") -> None:
-    print(f"{status} {message}")
-    if hint:
-        print(f"       -> {hint}")
+### How to type the commands
 
+Every command in this guide is typed in a **terminal opened in the tool's folder**:
 
-def package_version(name: str) -> str | None:
-    try:
-        return metadata.version(name)
-    except metadata.PackageNotFoundError:
-        return None
+1. Open the tool's folder in the Windows Explorer.
+2. Click the address bar at the top, type `cmd`, then press **Enter**. A black window opens, already in the right folder.
+3. Type the command, then press **Enter**.
 
+`py` is the Python launcher installed with Python on Windows. If the `py` command is not found, use `python` instead (e.g. `python install.py`).
 
-def main(argv: list[str]) -> int:
-    print(f"Jira connection check (automatic-jira-archiving {__version__})")
-    print("-" * 60)
+> **Why no `.bat` files?** Company policy blocks `.bat` files on the workstations. The tool is therefore started directly with Python. You can also double-click `install.py`, `check_connection.py` or `archive_project.py`: the window then stays open at the end so you can read the result.
 
-    # 1. Python and libraries ------------------------------------------------
-    report(OK, f"Python {platform.python_version()} on {platform.system()} {platform.release()}")
-    missing = []
-    for package in ("requests", "reportlab", "pillow", "pip-system-certs"):
-        version = package_version(package)
-        if version:
-            report(OK, f"Library {package} {version}")
-        else:
-            missing.append(package)
-            report(FAIL if package != "pip-system-certs" else WARN, f"Library {package} is not installed",
-                   "Run the installation again: py install.py   (see README.md, section 1)")
-    if any(p != "pip-system-certs" for p in missing):
-        return 1
+**Step 1: get the files.** In a terminal opened in the folder where you want the tool, run:
 
-    # 2. Configuration -------------------------------------------------------
-    try:
-        settings = load_settings(PROJECT_ROOT)
-    except ConfigError as exc:
-        report(FAIL, "Configuration", str(exc))
-        return 1
-    report(OK, f"Configuration loaded: JIRA_BASE_URL = {settings.base_url}")
-    report(OK, f"Token present ({len(settings.token)} characters, not displayed for security)")
+```
+git clone <URL of this git repository>
+cd automatic-jira-archiving
+```
 
-    from jira_archiver.jira_client import JiraClient, JiraError  # needs "requests", checked above
+**Step 2: install.**
 
-    client = JiraClient(settings)
+```
+py install.py
+```
 
-    # 3. Server reachable + certificate --------------------------------------
-    try:
-        info = client.server_info()
-    except JiraError as exc:
-        hint = ("Check the URL in .env, that you are on the company network (or VPN), "
-                "and that 'pip_system_certs' is installed for the internal certificate.")
-        report(FAIL, f"Cannot reach the Jira server: {exc}", hint)
-        return 1
-    security = "HTTPS certificate valid" if settings.base_url.startswith("https://") else "WARNING: not HTTPS"
-    report(OK, f"Server reachable ({security}): {info.get('serverTitle', 'Jira')} "
-               f"version {info.get('version')} ({info.get('deploymentType', 'unknown type')})")
-    if not str(info.get("version", "")).startswith("11."):
-        report(WARN, "This tool was written for Jira Data Center 11.x; other versions may differ.")
+It does three things:
 
-    # 4. Token valid ------------------------------------------------------------
-    try:
-        me = client.myself()
-    except JiraError as exc:
-        report(FAIL, f"Authentication refused: {exc}",
-               "Create a new Personal Access Token in Jira (Profile > Personal Access Tokens) "
-               "and put it in .env (JIRA_PAT=...).")
-        return 1
-    report(OK, f"Authenticated as {me.get('displayName')} ({me.get('name')})")
+- It creates a private Python environment in a `.venv` folder. Nothing is installed system-wide.
+- It installs the 4 libraries listed in `requirements.txt`: `requests`, `reportlab`, `pillow` and `pip-system-certs`.
+- It creates your configuration file `.env` from `.env.example`.
 
-    # 5. Admin rights ---------------------------------------------------------
-    try:
-        perms = client.get_json(f"{client.API}/mypermissions", {"permissions": "ADMINISTER"})
-        is_admin = bool(perms.get("permissions", {}).get("ADMINISTER", {}).get("havePermission"))
-    except JiraError:
-        is_admin = False
-    if is_admin:
-        report(OK, "Account has Jira administrator rights")
-    else:
-        report(WARN, "Account is NOT a Jira administrator",
-               "Some project configuration (schemes, roles) may be missing from the archives.")
+When it finishes, you see `=== Installation finished ===`.
 
-    # 6. Optional project ------------------------------------------------------
-    if argv:
-        project_ref = argv[0]
-        if not (project_ref.isdigit() or PROJECT_KEY_RE.match(project_ref)):
-            report(FAIL, f"'{project_ref}' is not a valid project key or ID")
-            return 1
-        try:
-            project = client.get_json(f"{client.API}/project/{quote(project_ref)}")
-            total = client.search(f'project = "{project["key"]}"', 0, 0, ["key"]).get("total", 0)
-        except JiraError as exc:
-            report(FAIL, f"Cannot read project {project_ref}: {exc}")
-            return 1
-        report(OK, f"Project {project['key']} - {project.get('name')}: {total} issue(s) visible")
+You never need to "activate" the `.venv` folder: `check_connection.py` and `archive_project.py` find it and use it by themselves.
 
-    print("-" * 60)
-    print("All checks passed. You can now run: py archive_project.py <PROJECT KEY>")
-    return 0
+### Installation without `.venv`
 
+If the installation says that *the Python of the .venv folder cannot start* (some company policies block programs in user folders), delete the `.venv` folder and run:
 
-if __name__ == "__main__":
-    _double_clicked = started_by_double_click()
-    _exit_code = main(sys.argv[1:])
-    pause_if_double_clicked(_double_clicked)
-    sys.exit(_exit_code)
+```
+py install.py --no-venv
+```
+
+The libraries are then installed in your Windows user profile instead. Everything else works the same way.
+
+> **Note:** `pip-system-certs` lets Python trust the company's internal certificate, which is installed in Windows. Without it, the connection to Jira fails with a "certificate" error.
+
+---
+
+## 2. Configuration: URL and token
+
+Open the **`.env`** file with Notepad and fill in two lines:
+
+```
+JIRA_BASE_URL=https://jira.mycompany.local
+JIRA_PAT=your-personal-access-token
+```
+
+- **`JIRA_BASE_URL`**: the address of Jira, exactly as in your browser, without the trailing `/`.
+- **`JIRA_PAT`**: your *Personal Access Token*. This is a kind of password just for scripts. To create one in Jira:
+  1. Click your avatar (top right), then **Profile**.
+  2. Open **Personal Access Tokens** and click **Create token**.
+  3. Give it a name (e.g. `automatic-jira-archiving`) and an expiry date.
+  4. Copy the token right away: Jira shows it only once.
+
+Use the token of an account with **Jira administrator** rights. Otherwise some project settings (schemes, roles) cannot be read.
+
+> ⚠️ The `.env` file contains your token. **Never send it, never put it on git.** It is already excluded by `.gitignore`. If the token leaks, revoke it in Jira on the same page.
+
+Other optional settings (output folder, timeout, etc.) are explained in `.env.example`.
+
+---
+
+## 3. Test the connection
+
+```
+py check_connection.py
+```
+
+To also check access to one project, add its key:
+
+```
+py check_connection.py ABC
+```
+
+The script checks, one by one:
+
+1. Python and the libraries.
+2. The configuration.
+3. That the server answers and the certificate is valid.
+4. That the token is accepted.
+5. That the account is an administrator.
+6. *(optional)* That the project can be read, and how many issues it has.
+
+Each line shows `[ OK ]`, `[WARN]` or `[FAIL]`, with a hint (`->`) explaining what to do when something goes wrong.
+
+---
+
+## 4. Archive projects
+
+### One project
+
+```
+py archive_project.py ABC
+```
+
+Without a project key (or with a double-click on `archive_project.py`), the tool asks for it.
+
+### Several projects
+
+```
+py archive_project.py ABC DEF GHI
+```
+
+Or put the keys in a text file, one per line (see `projects.example.txt`):
+
+```
+py archive_project.py --file projects.txt
+```
+
+### Small projects first
+
+`--max-issues` skips any project with more issues than the number you give. This is useful to archive the many small projects first:
+
+```
+py archive_project.py --file projects.txt --max-issues 1000
+```
+
+### All options
+
+| Option | What it does |
+|---|---|
+| `--file FILE` | Read the project keys from a text file. |
+| `--max-issues N` | Skip projects with more than N issues. |
+| `--output FOLDER` | Put the archives in another folder (default: `output`). |
+| `--no-attachments` | Do not download attachment files. They stay listed in the JSON and PDFs. |
+| `--keep-work` | Keep the temporary working folder after success (for debugging). |
+| `--verbose` | Show more details in the window. |
+| `--help` | Show the help. |
+
+### If it stops in the middle (network cut, PC restarted…)
+
+**Run the same command again.** Issues already exported are skipped, and the tool continues where it stopped. This matters for big projects, which can take hours.
+
+If some issues fail, the project is reported as `INCOMPLETE` and **no ZIP is created**. This way you can never get an archive with missing issues by mistake. Run the command again to retry them. The reasons are listed in `output/work/<KEY>/state/failures.json` and in the log file.
+
+### At the end
+
+The window shows a summary:
+
+```
+SUMMARY
+  ABC             OK  ABC_jira_archive_20261105.zip
+  DEF             SKIPPED (too many issues)
+  GHI             INCOMPLETE (2 issue(s) failed, run again)
+```
+
+### How long does it take?
+
+The tool is **deliberately slow** so it does not disturb Jira (see [section 6](#6-load-on-the-jira-server)). It needs about one request per issue, plus one per attachment. At most 2 requests per second gives roughly these durations:
+
+| Issues in the project | Approximate duration |
+|---|---|
+| 100 | 1 to 3 minutes |
+| 1,000 | 10 to 30 minutes |
+| 10,000 | 2 to 5 hours |
+| 70,000 | 15 to 30 hours |
+
+Durations grow when there are many attachments or when Jira is busy. For big projects, run the tool overnight or over a weekend. If it stops, just restart it.
+
+---
+
+## 5. What you get
+
+In the `output` folder:
+
+```
+output/
+├── ABC_jira_archive_20261105.zip          <- the archive to keep
+├── ABC_jira_archive_20261105.zip.sha256   <- fingerprint of the ZIP file
+└── logs/archive_20261105_101500.log       <- detailed log of the run
+```
+
+Inside the ZIP:
+
+```
+ABC_jira_archive_20261105/
+├── README.txt
+├── project.json
+├── manifest.json
+├── pdf/
+│   ├── ABC-1.pdf
+│   └── ABC-2.pdf ...
+└── attachments/
+    └── ABC-1/
+        └── 10200_screenshot.png ...
+```
+
+### The PDF of an issue
+
+Each PDF contains, in this order:
+
+- **Header:** project, key and summary.
+- **Details:** type, status, priority, resolution, versions, components, labels.
+- **People:** assignee, reporter, creator, votes, watchers.
+- **Dates:** created, updated, resolved, due.
+- **Time tracking**, if any.
+- **Description and Environment**, with their formatting: titles, lists, tables, code, quotes and images.
+- **Every other non-empty field** ("Other Fields"). Long text fields are shown in full.
+- **Links:** issue links, sub-tasks and web links.
+- **Attachments:** the list of files, plus previews of the images.
+- **Comments**, with author, date, "edited" and "restricted" information.
+- **Work log.**
+- **Complete history** of changes (who changed what, when, old and new value).
+- **A footer on every page:** issue key, archive date, "Page X of Y".
+
+All labels are in English. The content stays in its original language (French, English, German…).
+
+To keep the PDFs readable, empty fields are not shown there. They **are** all present in `project.json`, with the value `null`. Very long values in history tables are cut in the PDF (it says so). The full value is always in `project.json`.
+
+### The JSON file
+
+`project.json` is fully described in [docs/ARCHIVE_FORMAT.md](docs/ARCHIVE_FORMAT.md).
+
+### Checking an archive later
+
+`manifest.json` lists every file with its SHA-256 fingerprint. A fingerprint is like a unique signature of the file content: if a single byte changes, the fingerprint changes completely. To check a file in PowerShell:
+
+```powershell
+Get-FileHash .\pdf\ABC-1.pdf -Algorithm SHA256
+```
+
+The value must be the same as in `manifest.json` (upper or lower case does not matter). The fingerprint of the whole ZIP is in the `.sha256` file next to it:
+
+```powershell
+Get-FileHash .\ABC_jira_archive_20261105.zip -Algorithm SHA256
+```
+
+---
+
+## 6. Load on the Jira server
+
+Archiving must never slow down or endanger Jira for its users. The tool is therefore **gentle by design**. These protections are always on:
+
+| Protection | What it means |
+|---|---|
+| **One request at a time** | The tool never sends two requests to Jira at the same time. |
+| **At most 2 requests per second** | There is always at least 0.5 s between two requests (`JIRA_REQUEST_DELAY`). It cannot be set below 0.2 s, even by mistake. |
+| **Slows down when Jira is slow** | If Jira took 3 s to answer, the tool waits at least 3 s before the next request (up to 30 s). When Jira is busy, the tool automatically gives it room. In practice, the tool uses less than half of the time of a single Jira worker. |
+| **Backs off when Jira says so** | If Jira answers "too many requests" (HTTP 429) or "unavailable" (HTTP 503), the tool waits the time Jira asks for, retries, and doubles its pause (up to 5 s between requests). After 200 normal answers in a row, it speeds up again step by step. |
+| **Small requests** | Issues are fetched 25 at a time (`JIRA_PAGE_SIZE`), so each request stays light for the server. |
+| **One run at a time** | If someone starts a second archive run from the same installation while one is running, it is refused. |
+
+At the end of each project, the log shows the load created, for example: `Load on Jira so far: 1250 API request(s), 180 s spent waiting for Jira`.
+
+**Recommendations:**
+
+- **Do not run the tool on several computers at the same time.** The protections work per run. Two runs on two PCs mean twice the load.
+- Run big projects outside working hours (evening, night, weekend).
+- To be even gentler, raise the pause in `.env`, e.g. `JIRA_REQUEST_DELAY=1` (1 request per second at most).
+- The Jira administrators can also set a *rate limit* on the account used (Jira administration > System > Rate limiting). The tool respects it automatically.
+
+---
+
+## 7. Updating the tool
+
+```
+git pull
+py install.py
+```
+
+Running `install.py` again installs any new library. It keeps your `.env` file. (If you installed with `--no-venv`, add it again: `py install.py --no-venv`.)
+
+---
+
+## 8. Troubleshooting
+
+| Message | What it means / what to do |
+|---|---|
+| `'py' is not recognized...` | Use `python` instead of `py`. If neither works, install Python 3.12 (tick *Add python.exe to PATH*). |
+| `This program is blocked by group policy` / `.venv Python cannot start` | See [Installation without .venv](#installation-without-venv). |
+| `ERROR: a required library is missing` | The installation was not done or failed. Run `py install.py` again. |
+| `pip install` fails on a library | The internal package mirror may not have it. Note the name and version, and ask for it to be made available. The accepted versions are in `requirements.txt`. |
+| `CONFIGURATION ERROR: JIRA_BASE_URL is not set` | The `.env` file is missing or empty. Run `py install.py`, then fill in `.env`. |
+| `TLS/SSL certificate error` | Python does not trust the company certificate. Check that `pip-system-certs` is installed (`py check_connection.py` shows it). Otherwise, ask for the certificate file (`.pem`) and set `JIRA_CA_BUNDLE` in `.env`. |
+| `Network error` / `Cannot reach the Jira server` | Check the URL in `.env`, and that you are on the company network or VPN. |
+| `HTTP 401 ... authentication failed` | The token is wrong, expired or revoked. Create a new one (section 2). |
+| `HTTP 403 ... access denied` | The account lacks a permission. Use an administrator account. |
+| `HTTP 404 ... not found` on a project | Wrong project key, or the account cannot see the project. |
+| `Jira answered HTTP 429 ... slowing down` | Jira asked the tool to slow down. Nothing to do: it adapts by itself. If it happens often, set `JIRA_REQUEST_DELAY=1` in `.env`. |
+| `Another archive run is already in progress` | An archive run is already working from this folder. Wait for it to finish (one run at a time protects Jira). |
+| A project is `INCOMPLETE` | Run the same command again. See `output/work/<KEY>/state/failures.json` and the log. |
+| `PDF rendered in simplified mode` (in `manifest.json`) | The issue had very complex content (e.g. a gigantic table). The PDF was still created, with simpler formatting. All the data is in `project.json`. |
+| `Attachment ... could not be downloaded: HTTP 404` | The file no longer exists on the Jira server (already lost in Jira). It is recorded in the archive notes of the issue and in `manifest.json`. |
+
+The log file in `output/logs/` always holds the full details. **It never contains the token.**
+
+---
+
+## 9. Security
+
+- **Token stored locally only.** The token is read from `.env`, which is excluded from git. It is never written in logs (a filter hides it, just in case) and never shown on screen.
+- **Encrypted connection only.** HTTPS is mandatory, and certificates are always verified. There is no "ignore certificate" option.
+- **The token never leaves Jira.** It is only ever sent to the Jira server set in `JIRA_BASE_URL`. Any link to another server is refused. Images from outside sites, inside descriptions, are never downloaded.
+- **Read-only.** The tool only reads Jira. Its only `POST` request is the issue search, which changes nothing.
+- **Validated input.** Project keys are checked before use. File names coming from Jira are cleaned, which prevents writing outside the archive folder and avoids names Windows refuses.
+- **Archives are not encrypted.** They contain all the data of the projects, possibly confidential. Store them in a place with appropriate access rights.
+
+---
+
+## 10. Known limitations
+
+- **Screens:** Jira Data Center has no official API that says which screen is used by which project and issue type. For each issue type, the archive therefore records the **fields configured for it**: name, required or not, allowed values, default value. They come from the official *create issue* API (`issue_types[].create_screen_fields` in the JSON). The names and tabs of the screens themselves are not included.
+- **Workflows:** the statuses of each issue type are archived, but not the workflow diagrams (transitions).
+- **Plugins:** data stored by add-ons outside standard Jira fields is not exported, for example test management tools or some time-tracking add-ons. Their custom fields, however, are exported like any other field.
+- **Fonts:** the PDFs use Arial and Consolas from Windows. A character missing from these fonts (some emojis, for example) may show as a small square in the PDF. It is still correct in `project.json`.
+
+---
+
+## 11. For maintainers
+
+### Code layout
+
+```
+install.py                Installation: .venv + libraries + .env (standard library only)
+archive_project.py        Command-line entry point: archive projects
+check_connection.py       Command-line entry point: connection diagnostics
+jira_archiver/
+├── bootstrap.py          Re-starts the scripts with the .venv Python; keeps double-clicked windows open
+├── config.py             Settings from environment variables / .env
+├── jira_client.py        Read-only REST client (auth, retries, throttling, host check, downloads)
+├── exporter.py           Fetches project metadata and issues, resumable working folder
+├── pdf_renderer.py       Layout of the PDF of an issue
+├── html_to_pdf.py        Converts Jira's rendered HTML into PDF elements
+├── pdf_styles.py         Fonts, colors, text styles, image scaling
+├── formatting.py         Human-readable text for Jira values (users, dates, options...)
+├── packager.py           Writes project.json, manifest.json, README.txt and the ZIP
+├── logging_setup.py      Console + file logs, token redaction
+└── utils.py              File names, hashing, atomic writes
+docs/ARCHIVE_FORMAT.md    Description of the archive and of the JSON structure
+```
+
+### How a project is processed
+
+1. `exporter.py` reads the project configuration, then the list of all issues. Both are cached in `output/work/<KEY>/state/`.
+2. Issues are fetched in batches of `JIRA_PAGE_SIZE`, through `POST /rest/api/2/search` with `expand=renderedFields,changelog`. Missing comments and work logs are completed with dedicated calls.
+3. For each issue: attachments are downloaded, the PDF is generated, then the issue JSON is written **last** to `state/issues/<KEY>.json`. If that file exists, the issue is done, and this is what makes resuming possible.
+4. `packager.py` streams all issue files into `project.json`, so even 70,000+ issues do not fill the memory. It then writes the manifest, builds the ZIP, verifies it and writes its fingerprint.
+
+### Jira REST endpoints used (all read-only)
+
+`/serverInfo`, `/myself`, `/mypermissions`, `/field`, `/project/{key}` (+ `/components`, `/versions`, `/statuses`, `/role`, `/permissionscheme`, `/notificationscheme`, `/issuesecuritylevelscheme`), `/issue/createmeta/{key}/issuetypes/{id}`, `POST /search`, `/issue/{id}/comment`, `/issue/{id}/worklog`, `/issue/{id}/remotelink`, `/secure/attachment/{id}/{name}`.
+
+### Quality checks
+
+```
+.venv\Scripts\python.exe -m pip install ruff
+.venv\Scripts\python.exe -m ruff check .
+```
+
+Any change to the JSON structure must update `ARCHIVE_FORMAT_VERSION` in `jira_archiver/__init__.py` and `docs/ARCHIVE_FORMAT.md`.
+
+Do not add `.bat`, `.cmd` or `.ps1` files: scripts of this kind are blocked on the workstations. Every entry point is a Python script started with `py`. Entry points must call `use_project_venv()` (see `jira_archiver/bootstrap.py`) before importing any third-party library.
