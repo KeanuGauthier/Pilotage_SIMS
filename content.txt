@@ -1,317 +1,58 @@
-"""Minimal, read-only client for the Jira Data Center REST API (v2).
-
-Security notes
---------------
-* Authentication uses a Personal Access Token sent as a ``Bearer`` header.
-* The token is only ever sent to the configured Jira host: any absolute URL
-  pointing elsewhere is refused (prevents leaking the token to third parties).
-* TLS certificates are always verified (Windows certificate store through
-  ``pip_system_certs``, or a custom CA bundle via ``JIRA_CA_BUNDLE``).
-* The client only reads data. The single POST request used (``/search``) is a
-  read-only search endpoint; nothing is ever created, changed or deleted in Jira.
-
-Protecting the Jira server (throttling)
----------------------------------------
-Every request goes through :meth:`JiraClient._slot`, which enforces:
-
-1. **One request at a time**: never two requests in flight simultaneously.
-2. **A minimum pause between two requests** (``JIRA_REQUEST_DELAY``, default
-   0.5 s, i.e. at most 2 requests per second; it cannot be set below 0.2 s).
-3. **Adaptive pause**: after a request that took N seconds (including the
-   download of the answer), the client waits at least N seconds before the next
-   one (capped at 30 s). The tool therefore occupies at most about half of the
-   time of a single Jira worker thread, and automatically slows down when Jira
-   is loaded and answers slowly.
-4. **Back-off when Jira asks for it**: answers 429 (too many requests) and 503
-   (unavailable) are retried later (honoring ``Retry-After``), and the minimum
-   pause is doubled (up to 5 s). After 200 requests in a row without such an
-   answer, the pause is halved again, step by step, back to the configured value.
-"""
+"""Logging configuration: readable console output plus a detailed log file."""
 
 from __future__ import annotations
 
-import os
-import threading
-import time
-from collections.abc import Iterator
-from contextlib import contextmanager
+import logging
+import sys
 from pathlib import Path
-from typing import Any
-from urllib.parse import urljoin, urlparse
 
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from .utils import utc_now
 
-from . import __version__
-from .config import Settings
-from .logging_setup import get_logger
-
-log = get_logger("client")
-
-#: Lowest pause allowed between two requests, whatever the configuration says.
-MIN_REQUEST_DELAY = 0.2
-#: Upper bound of the pause after a slow answer (adaptive throttling).
-MAX_ADAPTIVE_PAUSE = 30.0
-#: Upper bound of the minimum pause after Jira asked us to slow down (429/503).
-MAX_BACKOFF_DELAY = 5.0
-#: Successful requests in a row needed before speeding up again after a slow-down.
-RECOVERY_STREAK = 200
-_SLOW_DOWN_STATUSES = {429, 503}
+LOGGER_NAME = "jira_archiver"
 
 
-class JiraError(Exception):
-    """An error returned by Jira (or a network problem talking to it)."""
+class _RedactingFilter(logging.Filter):
+    """Defense in depth: replaces any occurrence of the secret token in log records."""
 
-    def __init__(self, message: str, status_code: int | None = None) -> None:
-        super().__init__(message)
-        self.status_code = status_code
+    def __init__(self, secret: str) -> None:
+        super().__init__()
+        self._secret = secret
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if self._secret and len(self._secret) >= 8:
+            message = record.getMessage()
+            if self._secret in message:
+                record.msg = message.replace(self._secret, "***REDACTED***")
+                record.args = ()
+        return True
 
 
-class JiraClient:
-    """Thin wrapper around :class:`requests.Session` with retries and safety checks."""
+def setup_logging(log_dir: Path | None, secret: str = "", verbose: bool = False) -> Path | None:
+    """Configure logging. Returns the path of the log file (or ``None``)."""
+    logger = logging.getLogger(LOGGER_NAME)
+    logger.setLevel(logging.DEBUG)
+    logger.handlers.clear()
+    redactor = _RedactingFilter(secret)
 
-    API = "/rest/api/2"
+    console = logging.StreamHandler(sys.stdout)
+    console.setLevel(logging.DEBUG if verbose else logging.INFO)
+    console.setFormatter(logging.Formatter("%(asctime)s  %(levelname)-7s %(message)s", "%H:%M:%S"))
+    console.addFilter(redactor)
+    logger.addHandler(console)
 
-    def __init__(self, settings: Settings) -> None:
-        self.base_url = settings.base_url.rstrip("/")
-        parsed = urlparse(self.base_url)
-        self._origin = (parsed.scheme.lower(), parsed.netloc.lower())
-        self._timeout = settings.timeout
-        self._base_interval = max(settings.request_delay, MIN_REQUEST_DELAY)
-        self._min_interval = self._base_interval
-        self._calm_streak = 0  # requests in a row without "slow down" answers
-        self._lock = threading.Lock()
-        self._next_allowed = 0.0
-        self.request_count = 0
-        self.busy_seconds = 0.0  # time spent waiting for Jira answers
-
-        retry = Retry(
-            total=5,
-            connect=5,
-            read=3,
-            backoff_factor=2,  # waits 0s, 4s, 8s, 16s, 32s between attempts
-            status_forcelist=(429, 500, 502, 503, 504),
-            allowed_methods=frozenset({"GET", "POST"}),
-            respect_retry_after_header=True,
-            raise_on_status=False,
+    log_file = None
+    if log_dir is not None:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / f"archive_{utc_now().strftime('%Y%m%d_%H%M%S')}.log"
+        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)-7s [%(name)s] %(message)s")
         )
-        adapter = HTTPAdapter(max_retries=retry, pool_connections=1, pool_maxsize=1)
+        file_handler.addFilter(redactor)
+        logger.addHandler(file_handler)
+    return log_file
 
-        self._session = requests.Session()
-        self._session.mount("https://", adapter)
-        self._session.mount("http://", adapter)
-        self._session.verify = settings.ca_bundle or True
-        self._session.headers.update(
-            {
-                "Authorization": f"Bearer {settings.token}",
-                "Accept": "application/json",
-                "User-Agent": f"jira-archiver/{__version__}",
-            }
-        )
 
-    # ------------------------------------------------------------------ helpers
-    def resolve_url(self, path_or_url: str) -> str:
-        """Turn an API path or a URL returned by Jira into an absolute URL on the Jira host."""
-        if path_or_url.startswith(("http://", "https://")):
-            url = path_or_url
-        elif path_or_url.startswith("/rest/") or path_or_url.startswith("/secure/"):
-            url = self.base_url + path_or_url
-        else:
-            url = urljoin(self.base_url + "/", path_or_url)
-        return url
-
-    def is_same_origin(self, url: str) -> bool:
-        parsed = urlparse(url)
-        return (parsed.scheme.lower(), parsed.netloc.lower()) == self._origin
-
-    def _checked_url(self, path_or_url: str) -> str:
-        url = self.resolve_url(path_or_url)
-        if not self.is_same_origin(url):
-            raise JiraError(f"Refusing to send credentials to a foreign host: {urlparse(url).netloc}")
-        return url
-
-    @contextmanager
-    def _slot(self) -> Iterator[None]:
-        """Throttling: see the module docstring. Wraps the whole request, body download included."""
-        with self._lock:
-            wait = self._next_allowed - time.monotonic()
-            if wait > 0:
-                time.sleep(wait)
-            start = time.monotonic()
-            try:
-                yield
-            finally:
-                elapsed = time.monotonic() - start
-                self.request_count += 1
-                self.busy_seconds += elapsed
-                pause = max(self._min_interval, min(elapsed, MAX_ADAPTIVE_PAUSE))
-                self._next_allowed = time.monotonic() + pause
-
-    def _slow_down(self, status: int) -> None:
-        self._calm_streak = 0
-        new_interval = min(self._min_interval * 2, MAX_BACKOFF_DELAY)
-        if new_interval > self._min_interval:
-            self._min_interval = new_interval
-            log.warning("Jira answered HTTP %s (overloaded / rate limited): slowing down to at most "
-                        "one request every %.1f s.", status, self._min_interval)
-
-    def _recover(self) -> None:
-        self._calm_streak += 1
-        if self._min_interval > self._base_interval and self._calm_streak >= RECOVERY_STREAK:
-            self._min_interval = max(self._base_interval, self._min_interval / 2)
-            self._calm_streak = 0
-            log.info("Jira looks fine again: minimum pause back to %.1f s.", self._min_interval)
-
-    def _request(self, method: str, path_or_url: str, **kwargs: Any) -> requests.Response:
-        """Send one request (call it inside :meth:`_slot`)."""
-        url = self._checked_url(path_or_url)
-        log.debug("%s %s", method, url.split("?")[0])
-        try:
-            response = self._session.request(method, url, timeout=self._timeout, **kwargs)
-        except requests.exceptions.SSLError as exc:
-            raise JiraError(
-                "TLS/SSL certificate error. Is 'pip_system_certs' installed in the virtual "
-                f"environment, or JIRA_CA_BUNDLE set? Details: {exc}"
-            ) from exc
-        except requests.exceptions.RequestException as exc:
-            raise JiraError(f"Network error while calling Jira: {exc}") from exc
-
-        retries = getattr(response.raw, "retries", None)
-        history = getattr(retries, "history", None) or ()
-        statuses = {h.status for h in history} | {response.status_code}
-        overloaded = statuses & _SLOW_DOWN_STATUSES
-        for status in overloaded:
-            self._slow_down(status)
-        if not overloaded:
-            self._recover()
-
-        if response.status_code >= 400:
-            raise JiraError(self._describe_error(response), response.status_code)
-        return response
-
-    @staticmethod
-    def _describe_error(response: requests.Response) -> str:
-        hints = {
-            401: "authentication failed (token invalid, expired or revoked)",
-            403: "access denied (the account lacks the required permission)",
-            404: "not found (wrong project key/ID, or no permission to see it)",
-            429: "too many requests (Jira rate limiting)",
-        }
-        detail = ""
-        try:
-            body = response.json()
-            messages = list(body.get("errorMessages") or []) + [
-                f"{k}: {v}" for k, v in (body.get("errors") or {}).items()
-            ]
-            detail = "; ".join(messages)
-        except ValueError:
-            detail = response.text[:200]
-        hint = hints.get(response.status_code, "request failed")
-        path = urlparse(response.url).path
-        return f"HTTP {response.status_code} on {path}: {hint}. {detail}".strip()
-
-    # --------------------------------------------------------------- public API
-    def get_json(self, path_or_url: str, params: dict[str, Any] | None = None) -> Any:
-        with self._slot():
-            return self._request("GET", path_or_url, params=params).json()
-
-    def post_json(self, path: str, payload: dict[str, Any]) -> Any:
-        with self._slot():
-            return self._request("POST", path, json=payload).json()
-
-    def get_bytes(self, path_or_url: str, max_bytes: int) -> bytes:
-        """Download a small resource (e.g. an inline image) fully into memory."""
-        with self._slot():
-            response = self._request("GET", path_or_url, stream=True, headers={"Accept": "*/*"})
-            data = bytearray()
-            try:
-                for chunk in response.iter_content(64 * 1024):
-                    data.extend(chunk)
-                    if len(data) > max_bytes:
-                        raise JiraError(f"Resource larger than {max_bytes} bytes, skipped.")
-            except requests.exceptions.RequestException as exc:
-                raise JiraError(f"Download interrupted: {exc}") from exc
-            finally:
-                response.close()
-            return bytes(data)
-
-    def download(self, path_or_url: str, destination: Path) -> int:
-        """Stream a file (e.g. an attachment) to *destination*. Returns the number of bytes."""
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        tmp = destination.with_name(destination.name + ".part")
-        written = 0
-        with self._slot():
-            response = self._request("GET", path_or_url, stream=True, headers={"Accept": "*/*"})
-            try:
-                with tmp.open("wb") as handle:
-                    for chunk in response.iter_content(1024 * 1024):
-                        handle.write(chunk)
-                        written += len(chunk)
-            except requests.exceptions.RequestException as exc:
-                tmp.unlink(missing_ok=True)
-                raise JiraError(f"Download interrupted: {exc}") from exc
-            finally:
-                response.close()
-        os.replace(tmp, destination)
-        return written
-
-    def stats(self) -> str:
-        """Short summary of the load put on Jira so far."""
-        return (f"{self.request_count} API request(s), {self.busy_seconds:.0f} s spent waiting for Jira, "
-                f"current minimum pause {self._min_interval:.1f} s")
-
-    # ---------------------------------------------------------- Jira shortcuts
-    def server_info(self) -> dict[str, Any]:
-        return self.get_json(f"{self.API}/serverInfo")
-
-    def myself(self) -> dict[str, Any]:
-        return self.get_json(f"{self.API}/myself")
-
-    def search(
-        self,
-        jql: str,
-        start_at: int,
-        max_results: int,
-        fields: list[str],
-        expand: list[str] | None = None,
-    ) -> dict[str, Any]:
-        payload: dict[str, Any] = {
-            "jql": jql,
-            "startAt": start_at,
-            "maxResults": max_results,
-            "fields": fields,
-            "validateQuery": "strict",
-        }
-        if expand:
-            payload["expand"] = expand
-        return self.post_json(f"{self.API}/search", payload)
-
-    def iter_search(self, jql: str, fields: list[str], page_size: int) -> Iterator[dict[str, Any]]:
-        """Yield every issue matching *jql*, following pagination."""
-        start = 0
-        while True:
-            page = self.search(jql, start, page_size, fields)
-            issues = page.get("issues") or []
-            yield from issues
-            start += len(issues)
-            if not issues or start >= int(page.get("total", 0)):
-                return
-
-    def paged_values(self, path: str, page_size: int = 100, params: dict[str, Any] | None = None) -> list[Any]:
-        """Collect all ``values`` of a Jira "paged" endpoint (``isLast`` / ``startAt`` style)."""
-        results: list[Any] = []
-        start = 0
-        while True:
-            query = dict(params or {}, startAt=start, maxResults=page_size)
-            page = self.get_json(path, query)
-            values = page.get("values") or []
-            results.extend(values)
-            start += len(values)
-            total = page.get("total")
-            if not values or page.get("isLast") is True:
-                return results
-            if total is not None and start >= int(total):
-                return results
-            if total is None and "isLast" not in page and len(values) < page_size:
-                return results
+def get_logger(name: str = "") -> logging.Logger:
+    return logging.getLogger(f"{LOGGER_NAME}.{name}" if name else LOGGER_NAME)
