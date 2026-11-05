@@ -1,9 +1,5 @@
 @echo off
-REM Archives one or more Jira projects.
-REM   Double-click        : asks for the project key
-REM   archive.bat ABC     : archives project ABC
-REM   archive.bat --file projects.txt --max-issues 1000
-REM   archive.bat --help  : shows every option
+REM Tests the connection to Jira. Optional: give a project key, e.g.  check_connection.bat ABC
 setlocal
 cd /d "%~dp0"
 if not exist ".venv\Scripts\python.exe" (
@@ -11,16 +7,7 @@ if not exist ".venv\Scripts\python.exe" (
     pause
     exit /b 1
 )
-if "%~1"=="" (
-    set /p "PROJECT=Key of the project to archive (e.g. ABC): "
-) else (
-    set "PROJECT="
-)
-if "%~1"=="" (
-    ".venv\Scripts\python.exe" archive_project.py "%PROJECT%"
-) else (
-    ".venv\Scripts\python.exe" archive_project.py %*
-)
+".venv\Scripts\python.exe" check_connection.py %*
 set "RESULT=%ERRORLEVEL%"
 echo.
 pause
