@@ -1,8 +1,20 @@
-# List of projects to archive, one project key per line.
-# Copy this file (e.g. "projects.txt"), edit it, then run:
-#     archive.bat --file projects.txt
-# Lines starting with # are ignored. Text after a # is ignored too.
+[project]
+name = "jira-archiver"
+version = "1.0.0"
+description = "Archive Jira Data Center projects to JSON + PDF + attachments, packed in a ZIP file."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31,<3",
+    "reportlab>=4.0,<6",
+    "pillow>=10.0",
+    "pip-system-certs>=4.0",
+]
 
-OLDPROJ
-LEGACY     # finished in 2019
-12345      # a numeric project ID also works
+# Code style / static checks (optional, for maintainers): pip install ruff && ruff check .
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "S", "UP", "N", "I"]
