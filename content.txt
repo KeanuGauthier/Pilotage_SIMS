@@ -1,22 +1,6 @@
-# Secrets: never commit them
-.env
-*.pem
+# Normalize line endings in the repository
+* text=auto
 
-# Archives, working files and logs produced by the tool
-output/
-.archiver.lock
-
-# Python
-.venv/
-venv/
-__pycache__/
-*.py[cod]
-.ruff_cache/
-.pytest_cache/
-
-# Editors / OS
-.vscode/
-.idea/
-.DS_Store
-Thumbs.db
-desktop.ini
+# Windows batch files MUST use CRLF line endings or cmd.exe may misbehave
+*.bat text eol=crlf
+*.cmd text eol=crlf
