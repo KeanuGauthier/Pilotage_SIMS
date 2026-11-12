@@ -1,425 +1,431 @@
-"""Extract all data of one Jira project into a local working folder.
+# automatic-jira-archiving
 
-How it works
-------------
-1. **Project metadata**: project, components, versions, roles, statuses,
-   schemes, the field catalog and the fields configured per issue type
-   ("create screen" configuration).
-2. **Inventory**: the list of every issue (id + key) of the project.
-3. **Issues**: fetched in batches with all fields, rendered fields, changelog,
-   comments, work logs, remote links and attachments. For each issue, the
-   attachments are downloaded, the PDF is generated, and finally the issue JSON
-   is written to ``state/issues/<KEY>.json``.
+Archive old Jira projects before removing them from Jira.
 
-Because step 3 writes the issue JSON *last*, an interrupted run can simply be
-restarted: issues that already have their JSON file are skipped (resume).
-"""
+For each project, the tool creates **one ZIP file** that contains:
 
-from __future__ import annotations
+- **`project.json`**: all the data of the project and of every issue, including empty fields, comments, work logs, full change history, links and the attachment list.
+- **`pdf/`**: one detailed PDF per issue, ready to read or print.
+- **`attachments/`**: every file attached to the issues.
+- **`manifest.json`**: the list of all files with a digital fingerprint (SHA-256), to prove later that nothing was changed or damaged.
+- **`README.txt`**: a short explanation for whoever opens the archive in a few years.
 
-import re
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any
-from urllib.parse import quote
+The tool **only reads** Jira. It never creates, changes or deletes anything in Jira.
 
-from .jira_client import JiraClient, JiraError
-from .logging_setup import get_logger
-from .pdf_renderer import IssuePdfRenderer
-from .utils import atomic_write_json, chunks, is_empty, read_json, safe_filename, sha256_file, utc_now
+Built for **Jira Data Center 11.x**, running on **Windows** with **Python 3.10 or newer** (tested with 3.12).
 
-log = get_logger("export")
+---
 
-API = JiraClient.API
+## Table of contents
 
-#: System fields always kept in the JSON, even when empty.
-CORE_FIELDS = {
-    "summary", "issuetype", "status", "priority", "resolution", "resolutiondate", "created", "updated",
-    "creator", "reporter", "assignee", "labels", "components", "versions", "fixVersions", "description",
-    "environment", "duedate", "issuelinks", "subtasks", "project", "security", "timetracking", "votes",
-    "watches",
-}
-#: Fields moved to their own sections of the issue record (comments, worklogs, attachments).
-SECTION_FIELDS = {"comment", "worklog", "attachment"}
-#: Fields describing the person running the export, not the issue.
-EXCLUDED_FIELDS = {"lastViewed"}
-#: Keys removed everywhere: links to avatars/icons/REST resources, useless once Jira is gone.
-NOISE_KEYS = {"avatarUrls", "self", "iconUrl"}
+1. [Installation (first time only)](#1-installation-first-time-only)
+2. [Configuration: URL and token](#2-configuration-url-and-token)
+3. [Test the connection](#3-test-the-connection)
+4. [Archive projects](#4-archive-projects)
+5. [What you get](#5-what-you-get)
+6. [Load on the Jira server](#6-load-on-the-jira-server)
+7. [Updating the tool](#7-updating-the-tool)
+8. [Troubleshooting](#8-troubleshooting)
+9. [Security](#9-security)
+10. [Known limitations](#10-known-limitations)
+11. [For maintainers](#11-for-maintainers)
 
-_ATTACHMENT_SRC = re.compile(r"/secure/(?:attachment|thumbnail)/(\d+)/")
-MAX_INLINE_IMAGE_BYTES = 15 * 1024 * 1024
-MAX_IMAGE_CACHE = 200
+---
 
+## 1. Installation (first time only)
 
-class ProjectTooLargeError(Exception):
-    """The project has more issues than the configured limit."""
+You do **not** need to know Python. Follow these steps.
 
+### How to type the commands
 
-class IncompleteExportError(Exception):
-    """Some issues could not be exported; re-running the command will retry them."""
+Every command in this guide is typed in a **terminal opened in the tool's folder**:
 
+1. Open the tool's folder in the Windows Explorer.
+2. Click the address bar at the top, type `cmd`, then press **Enter**. A black window opens, already in the right folder.
+3. Type the command, then press **Enter**.
 
-def strip_noise(value: Any) -> Any:
-    """Recursively drop :data:`NOISE_KEYS` from Jira objects."""
-    if isinstance(value, dict):
-        return {k: strip_noise(v) for k, v in value.items() if k not in NOISE_KEYS}
-    if isinstance(value, list):
-        return [strip_noise(v) for v in value]
-    return value
+`py` is the Python launcher installed with Python on Windows. If the `py` command is not found, use `python` instead (e.g. `python install.py`).
 
+> **Why no `.bat` files?** Company policy blocks `.bat` files on the workstations. The tool is therefore started directly with Python. You can also double-click `install.py`, `check_connection.py` or `archive_project.py`: the window then stays open at the end so you can read the result.
 
-@dataclass
-class WorkPaths:
-    """Folder layout of a project being exported (``<output>/work/<KEY>/``)."""
+**Step 1: get the files.** In a terminal opened in the folder where you want the tool, run:
 
-    root: Path
+```
+git clone <URL of this git repository>
+cd automatic-jira-archiving
+```
 
-    @property
-    def state(self) -> Path:
-        return self.root / "state"
+**Step 2: install.**
 
-    @property
-    def issues(self) -> Path:
-        return self.state / "issues"
+```
+py install.py
+```
 
-    @property
-    def archive(self) -> Path:
-        """Content that ends up in the ZIP file."""
-        return self.root / "archive"
+It does three things:
 
-    @property
-    def pdf(self) -> Path:
-        return self.archive / "pdf"
+- It creates a private Python environment in a `.venv` folder. Nothing is installed system-wide.
+- It installs the 4 libraries listed in `requirements.txt`: `requests`, `reportlab`, `pillow` and `pip-system-certs`.
+- It creates your configuration file `.env` from `.env.example`.
 
-    @property
-    def attachments(self) -> Path:
-        return self.archive / "attachments"
+When it finishes, you see `=== Installation finished ===`.
 
-    def create(self) -> None:
-        for path in (self.issues, self.pdf, self.attachments):
-            path.mkdir(parents=True, exist_ok=True)
+You never need to "activate" the `.venv` folder: `check_connection.py` and `archive_project.py` find it and use it by themselves.
 
+### Installation without `.venv`
 
-@dataclass
-class ExportResult:
-    project_key: str
-    paths: WorkPaths
-    metadata: dict[str, Any]
-    inventory: list[dict[str, str]]
-    failures: dict[str, str] = field(default_factory=dict)
+If the installation says that *the Python of the .venv folder cannot start* (some company policies block programs in user folders), delete the `.venv` folder and run:
 
+```
+py install.py --no-venv
+```
 
-class ProjectExporter:
-    """Exports one project. See the module docstring for the overall flow."""
+The libraries are then installed in your Windows user profile instead. Everything else works the same way.
 
-    def __init__(self, client: JiraClient, project_ref: str, work_root: Path, *, page_size: int = 25,
-                 max_issues: int | None = None, include_attachments: bool = True) -> None:
-        self.client = client
-        self.project_ref = project_ref
-        self.work_root = work_root
-        self.page_size = page_size
-        self.max_issues = max_issues
-        self.include_attachments = include_attachments
-        self._image_cache: dict[str, bytes | None] = {}
+> **Note:** `pip-system-certs` lets Python trust the company's internal certificate, which is installed in Windows. Without it, the connection to Jira fails with a "certificate" error.
 
-    # ================================================================== run
-    def run(self) -> ExportResult:
-        project = self._get_project()
-        key = project["key"]
-        if self.max_issues is not None:  # checked before anything is written to disk
-            total = int(self.client.search(f'project = "{key}"', 0, 0, ["key"]).get("total", 0))
-            if total > self.max_issues:
-                raise ProjectTooLargeError(f"{key} has {total} issues (limit is {self.max_issues}).")
-        paths = WorkPaths(self.work_root / key)
-        paths.create()
+---
 
-        metadata = self._metadata(paths, project)
-        inventory = self._inventory(paths, key)
-        log.info("[%s] %d issue(s) in the project.", key, len(inventory))
+## 2. Configuration: URL and token
 
-        done = {p.stem for p in paths.issues.glob("*.json")}
-        todo = [item for item in inventory if item["key"] not in done]
-        if done:
-            log.info("[%s] Resuming: %d already exported, %d remaining.", key, len(inventory) - len(todo), len(todo))
+Open the **`.env`** file with Notepad and fill in two lines:
 
-        renderer = IssuePdfRenderer(metadata["field_catalog"], self.client.base_url, metadata["export_started_at"])
-        result = ExportResult(key, paths, metadata, inventory)
-        processed = 0
-        for batch in chunks(todo, self.page_size):
-            try:
-                issues = self._fetch_batch([item["id"] for item in batch])
-            except JiraError as exc:
-                for item in batch:
-                    result.failures[item["key"]] = str(exc)
-                log.error("[%s] Batch failed: %s", key, exc)
-                continue
-            returned = {str(issue["id"]) for issue in issues}
-            for item in batch:
-                if item["id"] not in returned:
-                    result.failures[item["key"]] = "Issue not returned by Jira (deleted or moved during export?)"
-            for raw in issues:
-                try:
-                    self._process_issue(raw, metadata, paths, renderer, project)
-                except Exception as exc:  # one broken issue must not stop the run
-                    result.failures[raw.get("key", raw.get("id", "?"))] = repr(exc)
-                    log.error("[%s] Issue %s failed: %r", key, raw.get("key"), exc)
-                processed += 1
-            log.info("[%s] Progress: %d / %d issue(s) exported.", key,
-                     len(inventory) - len(todo) + processed, len(inventory))
+```
+JIRA_BASE_URL=https://jira.mycompany.local
+JIRA_PAT=your-personal-access-token
+```
 
-        failures_file = paths.state / "failures.json"
-        if result.failures:
-            atomic_write_json(failures_file, result.failures)
-        else:
-            failures_file.unlink(missing_ok=True)
-        return result
+- **`JIRA_BASE_URL`**: the address of Jira, exactly as in your browser, without the trailing `/`.
+- **`JIRA_PAT`**: your *Personal Access Token*. This is a kind of password just for scripts. To create one in Jira:
+  1. Click your avatar (top right), then **Profile**.
+  2. Open **Personal Access Tokens** and click **Create token**.
+  3. Give it a name (e.g. `automatic-jira-archiving`) and an expiry date.
+  4. Copy the token right away: Jira shows it only once.
 
-    # ============================================================= metadata
-    def _get_project(self) -> dict[str, Any]:
-        return self.client.get_json(f"{API}/project/{quote(self.project_ref)}",
-                                    {"expand": "description,lead,url,projectKeys,issueTypes"})
+**Which account?** Being *Jira Administrator* is **not** required. What matters are the account's permissions **on each project to archive** (given by the project's permission scheme, often through groups):
 
-    def _optional(self, warnings: list[str], label: str, path: str, params: dict | None = None) -> Any:
-        """Fetch an optional piece of metadata; record a warning instead of failing."""
-        try:
-            return strip_noise(self.client.get_json(path, params))
-        except JiraError as exc:
-            if exc.status_code == 404:
-                return None
-            warnings.append(f"{label}: {exc}")
-            log.warning("Could not read %s: %s", label, exc)
-            return None
+| Permission on the project | Needed for | If missing |
+|---|---|---|
+| **Browse Projects** | Issues, comments, history, work logs, attachments | ❌ The project cannot be archived. |
+| **Administer Projects** | Roles and schemes of the project | ⚠️ Archived, but without roles and schemes. |
+| **Create Issues** | List of fields configured per issue type | ⚠️ Archived; fields with a value are all kept, but some *empty* fields may be missing. |
 
-    def _metadata(self, paths: WorkPaths, project: dict[str, Any]) -> dict[str, Any]:
-        cache = paths.state / "metadata.json"
-        if cache.is_file():
-            return read_json(cache)
+The token always has exactly the same rights as the account that created it. Section 3 explains how to check all this.
 
-        key = project["key"]
-        log.info("[%s] Reading project configuration...", key)
-        warnings: list[str] = []
-        base = f"{API}/project/{quote(key)}"
+> ⚠️ The `.env` file contains your token. **Never send it, never put it on git.** It is already excluded by `.gitignore`. If the token leaks, revoke it in Jira on the same page.
 
-        roles: dict[str, Any] = {}
-        for name, url in (self._optional(warnings, "project roles", f"{base}/role") or {}).items():
-            role = self._optional(warnings, f"role {name}", url) if isinstance(url, str) else None
-            if role is not None:
-                roles[name] = role
+Other optional settings (output folder, timeout, etc.) are explained in `.env.example`.
 
-        all_fields = self.client.get_json(f"{API}/field")
-        catalog = {f["id"]: strip_noise(f) for f in all_fields}
+---
 
-        issue_types = []
-        for issue_type in project.get("issueTypes") or []:
-            fields = self._create_screen_fields(warnings, key, issue_type)
-            issue_types.append({**strip_noise(issue_type), "create_screen_fields": fields})
+## 3. Test the connection
 
-        metadata = {
-            "export_started_at": utc_now().isoformat(),
-            "project": strip_noise(project),
-            "components": self._optional(warnings, "components", f"{base}/components") or [],
-            "versions": self._optional(warnings, "versions", f"{base}/versions") or [],
-            "statuses_by_issue_type": self._optional(warnings, "statuses", f"{base}/statuses") or [],
-            "roles": roles,
-            "permission_scheme": self._optional(warnings, "permission scheme", f"{base}/permissionscheme"),
-            "notification_scheme": self._optional(warnings, "notification scheme", f"{base}/notificationscheme"),
-            "issue_security_scheme": self._optional(warnings, "issue security scheme",
-                                                    f"{base}/issuesecuritylevelscheme"),
-            "issue_types": issue_types,
-            "field_catalog": catalog,
-            "warnings": warnings,
-        }
-        atomic_write_json(cache, metadata)
-        return metadata
+```
+py check_connection.py
+```
 
-    def _create_screen_fields(self, warnings: list[str], key: str, issue_type: dict[str, Any]) -> list[dict]:
-        """Fields configured for an issue type (as on its create screen), with rules and allowed values."""
-        path = f"{API}/issue/createmeta/{quote(key)}/issuetypes/{quote(str(issue_type['id']))}"
-        try:
-            values = self.client.paged_values(path, page_size=100)
-        except JiraError as exc:
-            warnings.append(f"field configuration of issue type {issue_type.get('name')}: {exc}")
-            log.warning("Could not read fields of issue type %s: %s", issue_type.get("name"), exc)
-            return []
-        if not values:
-            # Typically: the account lacks the "Create Issues" permission on the project.
-            warnings.append(f"field configuration of issue type {issue_type.get('name')}: Jira returned no field "
-                            "(the account may lack the 'Create Issues' permission). Fields with a value are all "
-                            "kept; empty fields of this issue type may be missing.")
-            log.warning("No field configuration returned for issue type %s", issue_type.get("name"))
-        return [strip_noise(v) for v in values]
+The script checks, one by one:
 
-    # ============================================================ inventory
-    def _inventory(self, paths: WorkPaths, key: str) -> list[dict[str, str]]:
-        cache = paths.state / "inventory.json"
-        if cache.is_file():
-            return read_json(cache)
-        jql = f'project = "{key}" ORDER BY id ASC'
-        log.info("[%s] Listing issues...", key)
-        inventory = [{"id": str(i["id"]), "key": i["key"]}
-                     for i in self.client.iter_search(jql, ["key"], page_size=1000)]
-        atomic_write_json(cache, inventory)
-        return inventory
+1. Python and the libraries.
+2. The configuration.
+3. That the server answers and the certificate is valid.
+4. That the token is accepted.
+5. The global rights of the account (*Jira Administrators*, *Jira System Administrators*). This is **for information only**: they are not required.
 
-    # =============================================================== issues
-    def _fetch_batch(self, ids: list[str]) -> list[dict[str, Any]]:
-        jql = f"id in ({','.join(ids)}) ORDER BY id ASC"
-        page = self.client.search(jql, 0, len(ids), ["*all"], expand=["renderedFields", "changelog"])
-        return page.get("issues") or []
+Each line shows `[ OK ]`, `[INFO]`, `[WARN]` or `[FAIL]`, with a hint (`->`) explaining what to do when something goes wrong.
 
-    def _process_issue(self, raw: dict[str, Any], metadata: dict[str, Any], paths: WorkPaths,
-                       renderer: IssuePdfRenderer, project: dict[str, Any]) -> None:
-        key = raw["key"]
-        log.debug("Processing %s", key)
-        notes: list[str] = []
-        record = self._normalize(raw, metadata)
-        record["comments"] = self._comments(raw)
-        record["worklogs"] = self._worklogs(raw)
-        record["changelog"] = self._changelog(raw)
-        record["remote_links"] = self._remote_links(raw)
-        record["attachments"] = self._attachments(raw, paths, notes)
-        record["archive_notes"] = notes
+### Check one project in detail
 
-        local_images = {
-            str(att["id"]): paths.archive / att["archive"]["path"]
-            for att in record["attachments"] if att["archive"].get("path")
-        }
-        pdf_path = paths.pdf / f"{key}.pdf"
-        notes += renderer.render(record, metadata["project"], pdf_path, paths.archive,
-                                 lambda src: self._resolve_image(src, local_images))
-        record["pdf"] = {"path": f"pdf/{key}.pdf", "sha256": sha256_file(pdf_path)}
-        record["archive_notes"] = notes
-        atomic_write_json(paths.issues / f"{key}.json", record)  # written last => issue is "done"
+```
+py check_connection.py ABC
+```
 
-    def _normalize(self, raw: dict[str, Any], metadata: dict[str, Any]) -> dict[str, Any]:
-        catalog = metadata["field_catalog"]
-        fields = raw.get("fields") or {}
-        rendered = raw.get("renderedFields") or {}
-        issue_type = fields.get("issuetype") or {}
+Several keys can be given (`py check_connection.py ABC DEF`). For each project, the script:
 
-        configured: set[str] = set()
-        for it in metadata["issue_types"]:
-            if str(it.get("id")) == str(issue_type.get("id")):
-                configured = {f.get("fieldId") for f in it.get("create_screen_fields") or [] if f.get("fieldId")}
+- shows how many issues it has;
+- checks the 3 permissions of section 2 (*Browse Projects*, *Administer Projects*, *Create Issues*);
+- **really tries** the reads done by the archive (roles, schemes, fields of each issue type). This is the surest proof, however the permissions are given;
+- warns if the project uses **issue security** (see the box below).
 
-        wanted = (configured | CORE_FIELDS | {fid for fid, value in fields.items() if not is_empty(value)})
-        wanted -= SECTION_FIELDS | EXCLUDED_FIELDS
+It ends with one line: `OK` (can be archived), `WARNING` (can be archived, read the warnings), or `BLOCKED` (cannot be archived with this account).
 
-        def order(field_id: str) -> tuple[int, str]:
-            info = catalog.get(field_id) or {}
-            return (1 if info.get("custom") else 0, str(info.get("name", field_id)).lower())
+### Check a whole list of projects before archiving
 
-        out: dict[str, Any] = {}
-        for field_id in sorted(wanted, key=order):
-            value = strip_noise(fields.get(field_id))
-            entry: dict[str, Any] = {"name": (catalog.get(field_id) or {}).get("name", field_id), "value": value}
-            html = rendered.get(field_id)
-            schema_type = ((catalog.get(field_id) or {}).get("schema") or {}).get("type")
-            if isinstance(html, str) and html.strip() and schema_type == "string" and html != value:
-                entry["rendered_html"] = html
-            out[field_id] = entry
+```
+py check_connection.py --file projects.txt
+```
 
-        return {
-            "id": str(raw["id"]),
-            "key": raw["key"],
-            "issue_type": {"id": issue_type.get("id"), "name": issue_type.get("name"),
-                           "subtask": issue_type.get("subtask")},
-            "fields": out,
-        }
+A quick check of every project in the list: access, permissions and number of issues. The result is shown in the window and saved in a report that opens in Excel: `output/project_check_<date>_<time>.csv`. Use it to find the blocked projects **before** starting the archives, and to see their sizes.
 
-    def _comments(self, raw: dict[str, Any]) -> list[dict[str, Any]]:
-        block = (raw.get("fields") or {}).get("comment") or {}
-        comments = block.get("comments") or []
-        rendered = {c.get("id"): c.get("body") for c in
-                    (((raw.get("renderedFields") or {}).get("comment") or {}).get("comments") or [])}
-        if int(block.get("total", len(comments))) > len(comments):
-            comments, start = [], 0
-            while True:
-                page = self.client.get_json(f"{API}/issue/{raw['id']}/comment",
-                                            {"startAt": start, "maxResults": 100, "expand": "renderedBody"})
-                batch = page.get("comments") or []
-                comments += batch
-                start += len(batch)
-                if not batch or start >= int(page.get("total", 0)):
-                    break
-        result = []
-        for comment in comments:
-            item = strip_noise(comment)
-            item.setdefault("renderedBody", rendered.get(comment.get("id")))
-            result.append(item)
-        return result
+It respects the same load limits as the archive (about 3 requests per project), so it takes time: count roughly **1 hour for 2,000 projects**. It cannot run at the same time as an archive run on the same installation.
 
-    def _worklogs(self, raw: dict[str, Any]) -> list[dict[str, Any]]:
-        block = (raw.get("fields") or {}).get("worklog") or {}
-        worklogs = block.get("worklogs") or []
-        if int(block.get("total", len(worklogs))) > len(worklogs):
-            worklogs = self.client.get_json(f"{API}/issue/{raw['id']}/worklog").get("worklogs") or []
-        return strip_noise(worklogs)
+> **Issue security.** If a project uses an *issue security scheme*, Jira hides the issues of a security level the account is not part of. They are invisible, **even to Jira administrators**: Jira does not even count them, so the tool cannot know they exist, and they would not be archived. When the detailed check shows this warning, ask the project owners or the Jira team to add the account to every security level of the project before archiving.
 
-    def _changelog(self, raw: dict[str, Any]) -> list[dict[str, Any]]:
-        changelog = raw.get("changelog") or {}
-        histories = changelog.get("histories") or []
-        if int(changelog.get("total", len(histories))) > len(histories):
-            full = self.client.get_json(f"{API}/issue/{raw['id']}", {"expand": "changelog", "fields": "key"})
-            histories = (full.get("changelog") or {}).get("histories") or histories
-        return strip_noise(histories)
+---
 
-    def _remote_links(self, raw: dict[str, Any]) -> list[dict[str, Any]]:
-        try:
-            return strip_noise(self.client.get_json(f"{API}/issue/{raw['id']}/remotelink")) or []
-        except JiraError as exc:
-            if exc.status_code == 404:
-                return []
-            raise
+## 4. Archive projects
 
-    def _attachments(self, raw: dict[str, Any], paths: WorkPaths, notes: list[str]) -> list[dict[str, Any]]:
-        key = raw["key"]
-        result = []
-        for attachment in (raw.get("fields") or {}).get("attachment") or []:
-            item = strip_noise(attachment)
-            item.pop("content", None)
-            item.pop("thumbnail", None)
-            att_id = str(attachment["id"])
-            filename = attachment.get("filename") or "file"
-            relative = f"attachments/{key}/{att_id}_{safe_filename(filename)}"
-            target = paths.archive / relative
-            archive: dict[str, Any] = {"path": None, "status": "skipped"}
-            if self.include_attachments:
-                # The URL is rebuilt from the configured base URL on purpose: the "content" URL
-                # returned by Jira may use another host name (Jira's own "Base URL" setting).
-                url = f"{self.client.base_url}/secure/attachment/{quote(att_id)}/{quote(filename)}"
-                try:
-                    size = self.client.download(url, target)
-                    archive = {"path": relative, "status": "ok", "size": size, "sha256": sha256_file(target)}
-                    expected = attachment.get("size")
-                    if isinstance(expected, int) and expected != size:
-                        notes.append(f"Attachment {filename}: size {size} differs from Jira metadata ({expected}).")
-                except JiraError as exc:
-                    if exc.status_code not in (403, 404):
-                        raise  # temporary problem: the issue will be retried on the next run
-                    archive = {"path": None, "status": f"missing on server (HTTP {exc.status_code})"}
-                    notes.append(f"Attachment {filename} (id {att_id}) could not be downloaded: {exc}")
-                    log.warning("[%s] Attachment %s not downloadable: %s", key, filename, exc)
-            item["archive"] = archive
-            result.append(item)
-        return result
+### One project
 
-    def _resolve_image(self, src: str, local_images: dict[str, Path]) -> bytes | Path | None:
-        """Find the data of an image referenced in rich text (for the PDF)."""
-        match = _ATTACHMENT_SRC.search(src)
-        if match and match.group(1) in local_images:
-            return local_images[match.group(1)]
-        url = self.client.resolve_url(src)
-        if not self.client.is_same_origin(url):
-            return None  # never fetch external content (privacy) nor send the token elsewhere
-        if url in self._image_cache:
-            return self._image_cache[url]
-        try:
-            data: bytes | None = self.client.get_bytes(url, MAX_INLINE_IMAGE_BYTES)
-        except JiraError as exc:
-            log.debug("Inline image %s not available: %s", url, exc)
-            data = None
-        if len(self._image_cache) >= MAX_IMAGE_CACHE:
-            self._image_cache.clear()
-        self._image_cache[url] = data
-        return data
+```
+py archive_project.py ABC
+```
+
+Without a project key (or with a double-click on `archive_project.py`), the tool asks for it.
+
+### Several projects
+
+```
+py archive_project.py ABC DEF GHI
+```
+
+Or put the keys in a text file, one per line (see `projects.example.txt`):
+
+```
+py archive_project.py --file projects.txt
+```
+
+### Small projects first
+
+`--max-issues` skips any project with more issues than the number you give. This is useful to archive the many small projects first (`py check_connection.py --file projects.txt` gives the size of each project beforehand):
+
+```
+py archive_project.py --file projects.txt --max-issues 1000
+```
+
+### All options
+
+| Option | What it does |
+|---|---|
+| `--file FILE` | Read the project keys from a text file. |
+| `--max-issues N` | Skip projects with more than N issues. |
+| `--output FOLDER` | Put the archives in another folder (default: `output`). |
+| `--no-attachments` | Do not download attachment files. They stay listed in the JSON and PDFs. |
+| `--keep-work` | Keep the temporary working folder after success (for debugging). |
+| `--verbose` | Show more details in the window. |
+| `--help` | Show the help. |
+
+### If it stops in the middle (network cut, PC restarted…)
+
+**Run the same command again.** Issues already exported are skipped, and the tool continues where it stopped. This matters for big projects, which can take hours.
+
+If some issues fail, the project is reported as `INCOMPLETE` and **no ZIP is created**. This way you can never get an archive with missing issues by mistake. Run the command again to retry them. The reasons are listed in `output/work/<KEY>/state/failures.json` and in the log file.
+
+### At the end
+
+The window shows a summary:
+
+```
+SUMMARY
+  ABC             OK  ABC_jira_archive_20261105.zip
+  DEF             SKIPPED (too many issues)
+  GHI             INCOMPLETE (2 issue(s) failed, run again)
+```
+
+### How long does it take?
+
+The tool is **deliberately slow** so it does not disturb Jira (see [section 6](#6-load-on-the-jira-server)). It needs about one request per issue, plus one per attachment. At most 2 requests per second gives roughly these durations:
+
+| Issues in the project | Approximate duration |
+|---|---|
+| 100 | 1 to 3 minutes |
+| 1,000 | 10 to 30 minutes |
+| 10,000 | 2 to 5 hours |
+| 70,000 | 15 to 30 hours |
+
+Durations grow when there are many attachments or when Jira is busy. For big projects, run the tool overnight or over a weekend. If it stops, just restart it.
+
+---
+
+## 5. What you get
+
+In the `output` folder:
+
+```
+output/
+├── ABC_jira_archive_20261105.zip          <- the archive to keep
+├── ABC_jira_archive_20261105.zip.sha256   <- fingerprint of the ZIP file
+└── logs/archive_20261105_101500.log       <- detailed log of the run
+```
+
+Inside the ZIP:
+
+```
+ABC_jira_archive_20261105/
+├── README.txt
+├── project.json
+├── manifest.json
+├── pdf/
+│   ├── ABC-1.pdf
+│   └── ABC-2.pdf ...
+└── attachments/
+    └── ABC-1/
+        └── 10200_screenshot.png ...
+```
+
+### The PDF of an issue
+
+Each PDF contains, in this order:
+
+- **Header:** project, key and summary.
+- **Details:** type, status, priority, resolution, versions, components, labels.
+- **People:** assignee, reporter, creator, votes, watchers.
+- **Dates:** created, updated, resolved, due.
+- **Time tracking**, if any.
+- **Description and Environment**, with their formatting: titles, lists, tables, code, quotes and images.
+- **Every other non-empty field** ("Other Fields"). Long text fields are shown in full.
+- **Links:** issue links, sub-tasks and web links.
+- **Attachments:** the list of files, plus previews of the images.
+- **Comments**, with author, date, "edited" and "restricted" information.
+- **Work log.**
+- **Complete history** of changes (who changed what, when, old and new value).
+- **A footer on every page:** issue key, archive date, "Page X of Y".
+
+All labels are in English. The content stays in its original language (French, English, German…).
+
+To keep the PDFs readable, empty fields are not shown there. They **are** all present in `project.json`, with the value `null`. Very long values in history tables are cut in the PDF (it says so). The full value is always in `project.json`.
+
+### The JSON file
+
+`project.json` is fully described in [docs/ARCHIVE_FORMAT.md](docs/ARCHIVE_FORMAT.md).
+
+### Checking an archive later
+
+`manifest.json` lists every file with its SHA-256 fingerprint. A fingerprint is like a unique signature of the file content: if a single byte changes, the fingerprint changes completely. To check a file in PowerShell:
+
+```powershell
+Get-FileHash .\pdf\ABC-1.pdf -Algorithm SHA256
+```
+
+The value must be the same as in `manifest.json` (upper or lower case does not matter). The fingerprint of the whole ZIP is in the `.sha256` file next to it:
+
+```powershell
+Get-FileHash .\ABC_jira_archive_20261105.zip -Algorithm SHA256
+```
+
+---
+
+## 6. Load on the Jira server
+
+Archiving must never slow down or endanger Jira for its users. The tool is therefore **gentle by design**. These protections are always on:
+
+| Protection | What it means |
+|---|---|
+| **One request at a time** | The tool never sends two requests to Jira at the same time. |
+| **At most 2 requests per second** | There is always at least 0.5 s between two requests (`JIRA_REQUEST_DELAY`). It cannot be set below 0.2 s, even by mistake. |
+| **Slows down when Jira is slow** | If Jira took 3 s to answer, the tool waits at least 3 s before the next request (up to 30 s). When Jira is busy, the tool automatically gives it room. In practice, the tool uses less than half of the time of a single Jira worker. |
+| **Backs off when Jira says so** | If Jira answers "too many requests" (HTTP 429) or "unavailable" (HTTP 503), the tool waits the time Jira asks for, retries, and doubles its pause (up to 5 s between requests). After 200 normal answers in a row, it speeds up again step by step. |
+| **Small requests** | Issues are fetched 25 at a time (`JIRA_PAGE_SIZE`), so each request stays light for the server. |
+| **One run at a time** | If someone starts a second archive run from the same installation while one is running, it is refused. |
+
+At the end of each project, the log shows the load created, for example: `Load on Jira so far: 1250 API request(s), 180 s spent waiting for Jira`.
+
+**Recommendations:**
+
+- **Do not run the tool on several computers at the same time.** The protections work per run. Two runs on two PCs mean twice the load.
+- Run big projects outside working hours (evening, night, weekend).
+- To be even gentler, raise the pause in `.env`, e.g. `JIRA_REQUEST_DELAY=1` (1 request per second at most).
+- The Jira administrators can also set a *rate limit* on the account used (Jira administration > System > Rate limiting). The tool respects it automatically.
+
+---
+
+## 7. Updating the tool
+
+```
+git pull
+py install.py
+```
+
+Running `install.py` again installs any new library. It keeps your `.env` file. (If you installed with `--no-venv`, add it again: `py install.py --no-venv`.)
+
+---
+
+## 8. Troubleshooting
+
+| Message | What it means / what to do |
+|---|---|
+| `'py' is not recognized...` | Use `python` instead of `py`. If neither works, install Python 3.12 (tick *Add python.exe to PATH*). |
+| `This program is blocked by group policy` / `.venv Python cannot start` | See [Installation without .venv](#installation-without-venv). |
+| `ERROR: a required library is missing` | The installation was not done or failed. Run `py install.py` again. |
+| `pip install` fails on a library | The internal package mirror may not have it. Note the name and version, and ask for it to be made available. The accepted versions are in `requirements.txt`. |
+| `CONFIGURATION ERROR: JIRA_BASE_URL is not set` | The `.env` file is missing or empty. Run `py install.py`, then fill in `.env`. |
+| `TLS/SSL certificate error` | Python does not trust the company certificate. Check that `pip-system-certs` is installed (`py check_connection.py` shows it). Otherwise, ask for the certificate file (`.pem`) and set `JIRA_CA_BUNDLE` in `.env`. |
+| `Network error` / `Cannot reach the Jira server` | Check the URL in `.env`, and that you are on the company network or VPN. |
+| `HTTP 401 ... authentication failed` | The token is wrong, expired or revoked. Create a new one (section 2). |
+| `HTTP 403 ... access denied` | The account lacks a permission on this project. Run `py check_connection.py <KEY>` to see which one (section 3). |
+| `Global rights: 'Jira Administrators' = no` | Not a problem: this global right is not required. Only the permissions on each project matter (section 2). |
+| `HTTP 404 ... not found` on a project | Wrong project key, or the account cannot see the project. |
+| `Jira answered HTTP 429 ... slowing down` | Jira asked the tool to slow down. Nothing to do: it adapts by itself. If it happens often, set `JIRA_REQUEST_DELAY=1` in `.env`. |
+| `Another archive run is already in progress` | An archive run is already working from this folder. Wait for it to finish (one run at a time protects Jira). |
+| A project is `INCOMPLETE` | Run the same command again. See `output/work/<KEY>/state/failures.json` and the log. |
+| `PDF rendered in simplified mode` (in `manifest.json`) | The issue had very complex content (e.g. a gigantic table). The PDF was still created, with simpler formatting. All the data is in `project.json`. |
+| `Attachment ... could not be downloaded: HTTP 404` | The file no longer exists on the Jira server (already lost in Jira). It is recorded in the archive notes of the issue and in `manifest.json`. |
+
+The log file in `output/logs/` always holds the full details. **It never contains the token.**
+
+---
+
+## 9. Security
+
+- **Token stored locally only.** The token is read from `.env`, which is excluded from git. It is never written in logs (a filter hides it, just in case) and never shown on screen.
+- **Encrypted connection only.** HTTPS is mandatory, and certificates are always verified. There is no "ignore certificate" option.
+- **The token never leaves Jira.** It is only ever sent to the Jira server set in `JIRA_BASE_URL`. Any link to another server is refused. Images from outside sites, inside descriptions, are never downloaded.
+- **Read-only.** The tool only reads Jira. Its only `POST` request is the issue search, which changes nothing.
+- **Validated input.** Project keys are checked before use. File names coming from Jira are cleaned, which prevents writing outside the archive folder and avoids names Windows refuses.
+- **Archives are not encrypted.** They contain all the data of the projects, possibly confidential. Store them in a place with appropriate access rights.
+
+---
+
+## 10. Known limitations
+
+- **Screens:** Jira Data Center has no official API that says which screen is used by which project and issue type. For each issue type, the archive therefore records the **fields configured for it**: name, required or not, allowed values, default value. They come from the official *create issue* API (`issue_types[].create_screen_fields` in the JSON). The names and tabs of the screens themselves are not included.
+- **Issue security and restricted comments:** issues at a security level the account is not part of, and comments or work logs restricted to a group or role the account is not in, are invisible to it, even for a Jira administrator. They cannot be archived. See section 3.
+- **Workflows:** the statuses of each issue type are archived, but not the workflow diagrams (transitions).
+- **Plugins:** data stored by add-ons outside standard Jira fields is not exported, for example test management tools or some time-tracking add-ons. Their custom fields, however, are exported like any other field.
+- **Fonts:** the PDFs use Arial and Consolas from Windows. A character missing from these fonts (some emojis, for example) may show as a small square in the PDF. It is still correct in `project.json`.
+
+---
+
+## 11. For maintainers
+
+### Code layout
+
+```
+install.py                Installation: .venv + libraries + .env (standard library only)
+archive_project.py        Command-line entry point: archive projects
+check_connection.py       Command-line entry point: connection and per-project permission checks
+jira_archiver/
+├── bootstrap.py          Re-starts the scripts with the .venv Python; keeps double-clicked windows open
+├── config.py             Settings from environment variables / .env
+├── jira_client.py        Read-only REST client (auth, retries, throttling, host check, downloads)
+├── exporter.py           Fetches project metadata and issues, resumable working folder
+├── pdf_renderer.py       Layout of the PDF of an issue
+├── html_to_pdf.py        Converts Jira's rendered HTML into PDF elements
+├── pdf_styles.py         Fonts, colors, text styles, image scaling
+├── formatting.py         Human-readable text for Jira values (users, dates, options...)
+├── packager.py           Writes project.json, manifest.json, README.txt and the ZIP
+├── logging_setup.py      Console + file logs, token redaction
+└── utils.py              File names, hashing, atomic writes
+docs/ARCHIVE_FORMAT.md    Description of the archive and of the JSON structure
+```
+
+### How a project is processed
+
+1. `exporter.py` reads the project configuration, then the list of all issues. Both are cached in `output/work/<KEY>/state/`.
+2. Issues are fetched in batches of `JIRA_PAGE_SIZE`, through `POST /rest/api/2/search` with `expand=renderedFields,changelog`. Missing comments and work logs are completed with dedicated calls.
+3. For each issue: attachments are downloaded, the PDF is generated, then the issue JSON is written **last** to `state/issues/<KEY>.json`. If that file exists, the issue is done, and this is what makes resuming possible.
+4. `packager.py` streams all issue files into `project.json`, so even 70,000+ issues do not fill the memory. It then writes the manifest, builds the ZIP, verifies it and writes its fingerprint.
+
+### Jira REST endpoints used (all read-only)
+
+`/serverInfo`, `/myself`, `/mypermissions`, `/field`, `/project/{key}` (+ `/components`, `/versions`, `/statuses`, `/role`, `/permissionscheme`, `/notificationscheme`, `/issuesecuritylevelscheme`), `/issue/createmeta/{key}/issuetypes/{id}`, `POST /search`, `/issue/{id}/comment`, `/issue/{id}/worklog`, `/issue/{id}/remotelink`, `/secure/attachment/{id}/{name}`.
+
+### Quality checks
+
+```
+.venv\Scripts\python.exe -m pip install ruff
+.venv\Scripts\python.exe -m ruff check .
+```
+
+Any change to the JSON structure must update `ARCHIVE_FORMAT_VERSION` in `jira_archiver/__init__.py` and `docs/ARCHIVE_FORMAT.md`.
+
+Do not add `.bat`, `.cmd` or `.ps1` files: scripts of this kind are blocked on the workstations. Every entry point is a Python script started with `py`. Entry points must call `use_project_venv()` (see `jira_archiver/bootstrap.py`) before importing any third-party library.
