@@ -1,127 +1,319 @@
-# Archive format (version 1.0)
+"""Minimal, read-only client for the Jira Data Center REST API (v2).
 
-This document describes the content of an archive produced by automatic-jira-archiving. Its goal is that anyone can understand and reuse an archive in the future, even without Jira and without this tool.
+Security notes
+--------------
+* Authentication uses a Personal Access Token sent as a ``Bearer`` header.
+* The token is only ever sent to the configured Jira host: any absolute URL
+  pointing elsewhere is refused (prevents leaking the token to third parties).
+* TLS certificates are always verified (Windows certificate store through
+  ``pip_system_certs``, or a custom CA bundle via ``JIRA_CA_BUNDLE``).
+* The client only reads data. The single POST request used (``/search``) is a
+  read-only search endpoint; nothing is ever created, changed or deleted in Jira.
 
-## Files
+Protecting the Jira server (throttling)
+---------------------------------------
+Every request goes through :meth:`JiraClient._slot`, which enforces:
 
-| Path in the ZIP | Content |
-|---|---|
-| `README.txt` | Short plain-text description of the archive. |
-| `project.json` | All data: project configuration and every issue. UTF-8 JSON. |
-| `manifest.json` | Every file of the archive with its size and SHA-256 fingerprint, plus counters and warnings. |
-| `pdf/<KEY>-<n>.pdf` | One PDF per issue (human-readable version of the data). |
-| `attachments/<KEY>-<n>/<attachment id>_<file name>` | Attachment files. The id prefix keeps two files with the same name apart. |
+1. **One request at a time**: never two requests in flight simultaneously.
+2. **A minimum pause between two requests** (``JIRA_REQUEST_DELAY``, default
+   0.5 s, i.e. at most 2 requests per second; it cannot be set below 0.2 s).
+3. **Adaptive pause**: after a request that took N seconds (including the
+   download of the answer), the client waits at least N seconds before the next
+   one (capped at 30 s). The tool therefore occupies at most about half of the
+   time of a single Jira worker thread, and automatically slows down when Jira
+   is loaded and answers slowly.
+4. **Back-off when Jira asks for it**: answers 429 (too many requests) and 503
+   (unavailable) are retried later (honoring ``Retry-After``), and the minimum
+   pause is doubled (up to 5 s). After 200 requests in a row without such an
+   answer, the pause is halved again, step by step, back to the configured value.
+"""
 
-Next to the ZIP file, `<zip name>.sha256` contains the SHA-256 fingerprint of the ZIP itself, in the standard `sha256sum` format.
+from __future__ import annotations
 
-## General rules
+import os
+import threading
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any
+from urllib.parse import urljoin, urlparse
 
-- **Raw Jira data.** Jira objects (users, statuses, versions, comments, history…) are kept **as returned by the Jira REST API v2**. Only these keys are removed everywhere: `self`, `avatarUrls` and `iconUrl`. They are links to the Jira server and become useless once Jira is gone.
-- **Dates.** They are kept exactly as Jira gives them, e.g. `2024-03-01T10:15:30.000+0100`, which is local time plus the offset from UTC. Archive timestamps (`generated_at`…) are in UTC.
-- **Empty values.** An empty field is written as `null` (or `[]`). This shows that the field existed for the issue and was empty, rather than forgotten by the export.
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-## `project.json`
+from . import __version__
+from .config import Settings
+from .logging_setup import get_logger
 
-```jsonc
-{
-  "archive": {
-    "format_version": "1.0",
-    "generated_at": "2026-11-05T13:13:59+00:00",   // when the archive was finished (UTC)
-    "export_started_at": "...",                     // when the export started (UTC)
-    "tool": "automatic-jira-archiving 1.0.0",
-    "jira": { "base_url": "...", "version": "11.3.7", "build_number": 0, "deployment_type": "Server" },
-    "issue_count": 25,
-    "warnings": []                                  // project-level problems: a scheme not readable,
-                                                    // fields of an issue type not returned by Jira, ...
-  },
-  "project":   { ... },        // GET /project/{key}: name, description, lead, issue types...
-  "components": [ ... ],
-  "versions":   [ ... ],
-  "roles":      { "Developers": { "actors": [ ... ] } },
-  "schemes": { "permission": {...}, "notification": {...}, "issue_security": null },
-  "statuses_by_issue_type": [ ... ],
-  "issue_types": [
-    {
-      "id": "1", "name": "Bug", "subtask": false, "description": "...",
-      "create_screen_fields": [          // fields configured for this issue type
-        { "fieldId": "summary", "name": "Summary", "required": true,
-          "schema": {...}, "allowedValues": [...], "hasDefaultValue": false, "operations": [...] }
-      ]
-    }
-  ],
-  "fields": {                            // catalog of every field used in this project
-    "customfield_10000": { "id": "...", "name": "Story Points", "custom": true, "schema": {...} }
-  },
-  "issues": [ <issue>, <issue>, ... ]    // sorted by key: ABC-1, ABC-2, ... ABC-10
-}
-```
+log = get_logger("client")
 
-### An issue
+#: Lowest pause allowed between two requests, whatever the configuration says.
+MIN_REQUEST_DELAY = 0.2
+#: Upper bound of the pause after a slow answer (adaptive throttling).
+MAX_ADAPTIVE_PAUSE = 30.0
+#: Upper bound of the minimum pause after Jira asked us to slow down (429/503).
+MAX_BACKOFF_DELAY = 5.0
+#: Successful requests in a row needed before speeding up again after a slow-down.
+RECOVERY_STREAK = 200
+_SLOW_DOWN_STATUSES = {429, 503}
 
-```jsonc
-{
-  "id": "10001",
-  "key": "ABC-1",
-  "issue_type": { "id": "1", "name": "Bug", "subtask": false },
 
-  "fields": {
-    // One entry per field: system fields first, then custom fields, sorted by name.
-    "summary":           { "name": "Summary", "value": "Login fails" },
-    "description":       { "name": "Description",
-                           "value": "Raw Jira *wiki* markup",
-                           "rendered_html": "<p>Raw Jira <b>wiki</b> markup</p>" },
-    "customfield_10000": { "name": "Story Points", "value": null }
-  },
+class JiraError(Exception):
+    """An error returned by Jira (or a network problem talking to it)."""
 
-  "comments":     [ { "id", "author", "updateAuthor", "body", "renderedBody", "created", "updated", "visibility"? } ],
-  "worklogs":     [ { "id", "author", "started", "timeSpent", "timeSpentSeconds", "comment", ... } ],
-  "changelog":    [ { "id", "author", "created",
-                      "items": [ { "field", "fieldtype", "from", "fromString", "to", "toString" } ] } ],
-  "remote_links": [ { "id", "relationship", "object": { "url", "title" } } ],
-  "attachments":  [ { "id", "filename", "author", "created", "size", "mimeType",
-                      "archive": { "status": "ok", "path": "attachments/ABC-1/10200_x.png",
-                                   "size": 1234, "sha256": "..." } } ],
-  "pdf":           { "path": "pdf/ABC-1.pdf", "sha256": "..." },
-  "archive_notes": [ "Attachment x.pdf (id 10201) could not be downloaded: HTTP 404 ..." ]
-}
-```
+    def __init__(self, message: str, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
-### Which fields are included for an issue
 
-The fields of an issue are the union of:
+class JiraClient:
+    """Thin wrapper around :class:`requests.Session` with retries and safety checks."""
 
-1. the fields configured for its issue type (`create_screen_fields`), even when empty;
-2. the main system fields (summary, status, priority, assignee, dates, versions, links…), even when empty;
-3. every other field that has a value.
+    API = "/rest/api/2"
 
-Fields of the Jira instance that do not belong to the project are not included. The field `lastViewed` is also left out: it describes the account that ran the export, not the issue. Comments, work logs and attachments are moved to their own sections (`comments`, `worklogs`, `attachments`).
+    def __init__(self, settings: Settings) -> None:
+        self.base_url = settings.base_url.rstrip("/")
+        parsed = urlparse(self.base_url)
+        self._origin = (parsed.scheme.lower(), parsed.netloc.lower())
+        self._timeout = settings.timeout
+        self._base_interval = max(settings.request_delay, MIN_REQUEST_DELAY)
+        self._min_interval = self._base_interval
+        self._calm_streak = 0  # requests in a row without "slow down" answers
+        self._lock = threading.Lock()
+        self._next_allowed = 0.0
+        self.request_count = 0
+        self.busy_seconds = 0.0  # time spent waiting for Jira answers
 
-### `rendered_html`
+        retry = Retry(
+            total=5,
+            connect=5,
+            read=3,
+            backoff_factor=2,  # waits 0s, 4s, 8s, 16s, 32s between attempts
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset({"GET", "POST"}),
+            respect_retry_after_header=True,
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=1, pool_maxsize=1)
 
-For text fields, Jira stores *wiki markup* (e.g. `*bold*`). The archive also keeps the HTML version produced by Jira at export time. It is the most faithful view of the formatting, and it is what the PDFs show. Links to images inside it (`/secure/attachment/...`) point to the Jira server. The matching files are in `attachments/`, and the attachment id is the number in the link.
+        self._session = requests.Session()
+        self._session.mount("https://", adapter)
+        self._session.mount("http://", adapter)
+        self._session.verify = settings.ca_bundle or True
+        self._session.headers.update(
+            {
+                "Authorization": f"Bearer {settings.token}",
+                "Accept": "application/json",
+                "User-Agent": f"automatic-jira-archiving/{__version__}",
+            }
+        )
 
-### Attachment `archive.status`
+    # ------------------------------------------------------------------ helpers
+    def resolve_url(self, path_or_url: str) -> str:
+        """Turn an API path or a URL returned by Jira into an absolute URL on the Jira host."""
+        if path_or_url.startswith(("http://", "https://")):
+            url = path_or_url
+        elif path_or_url.startswith("/rest/") or path_or_url.startswith("/secure/"):
+            url = self.base_url + path_or_url
+        else:
+            url = urljoin(self.base_url + "/", path_or_url)
+        return url
 
-| Value | Meaning |
-|---|---|
-| `ok` | The file is in the archive at `archive.path`. |
-| `missing on server (HTTP 404)` | Jira lists the file but no longer has it. |
-| `skipped` | The export was run with `--no-attachments`. |
+    def is_same_origin(self, url: str) -> bool:
+        parsed = urlparse(url)
+        return (parsed.scheme.lower(), parsed.netloc.lower()) == self._origin
 
-## `manifest.json`
+    def _checked_url(self, path_or_url: str) -> str:
+        url = self.resolve_url(path_or_url)
+        if not self.is_same_origin(url):
+            raise JiraError(f"Refusing to send credentials to a foreign host: {urlparse(url).netloc}")
+        return url
 
-```jsonc
-{
-  "format_version": "1.0",
-  "generated_at": "...",
-  "tool": "automatic-jira-archiving 1.0.0",
-  "jira": { ... },
-  "project": { "id": "10000", "key": "ABC", "name": "..." },
-  "counts": { "issues": 25, "pdf_files": 25, "attachments": 3, "attachment_bytes": 46028 },
-  "warnings": [ ... ],                          // project-level warnings
-  "issue_notes": { "ABC-4": [ "PDF rendered in simplified mode (complex layout)." ] },
-  "files": [ { "path": "pdf/ABC-1.pdf", "size": 34567, "sha256": "..." } ]
-}
-```
+    @contextmanager
+    def _slot(self) -> Iterator[None]:
+        """Throttling: see the module docstring. Wraps the whole request, body download included."""
+        with self._lock:
+            wait = self._next_allowed - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+            start = time.monotonic()
+            try:
+                yield
+            finally:
+                elapsed = time.monotonic() - start
+                self.request_count += 1
+                self.busy_seconds += elapsed
+                pause = max(self._min_interval, min(elapsed, MAX_ADAPTIVE_PAUSE))
+                self._next_allowed = time.monotonic() + pause
 
-`manifest.json` does not list itself.
+    def _slow_down(self, status: int) -> None:
+        self._calm_streak = 0
+        new_interval = min(self._min_interval * 2, MAX_BACKOFF_DELAY)
+        if new_interval > self._min_interval:
+            self._min_interval = new_interval
+            log.warning("Jira answered HTTP %s (overloaded / rate limited): slowing down to at most "
+                        "one request every %.1f s.", status, self._min_interval)
+
+    def _recover(self) -> None:
+        self._calm_streak += 1
+        if self._min_interval > self._base_interval and self._calm_streak >= RECOVERY_STREAK:
+            self._min_interval = max(self._base_interval, self._min_interval / 2)
+            self._calm_streak = 0
+            log.info("Jira looks fine again: minimum pause back to %.1f s.", self._min_interval)
+
+    def _request(self, method: str, path_or_url: str, **kwargs: Any) -> requests.Response:
+        """Send one request (call it inside :meth:`_slot`)."""
+        url = self._checked_url(path_or_url)
+        log.debug("%s %s", method, url.split("?")[0])
+        try:
+            response = self._session.request(method, url, timeout=self._timeout, **kwargs)
+        except requests.exceptions.SSLError as exc:
+            raise JiraError(
+                "TLS/SSL certificate error. Is 'pip_system_certs' installed in the virtual "
+                f"environment, or JIRA_CA_BUNDLE set? Details: {exc}"
+            ) from exc
+        except requests.exceptions.RequestException as exc:
+            raise JiraError(f"Network error while calling Jira: {exc}") from exc
+
+        retries = getattr(response.raw, "retries", None)
+        history = getattr(retries, "history", None) or ()
+        statuses = {h.status for h in history} | {response.status_code}
+        overloaded = statuses & _SLOW_DOWN_STATUSES
+        for status in overloaded:
+            self._slow_down(status)
+        if not overloaded:
+            self._recover()
+
+        if response.status_code >= 400:
+            raise JiraError(self._describe_error(response), response.status_code)
+        return response
+
+    @staticmethod
+    def _describe_error(response: requests.Response) -> str:
+        hints = {
+            401: "authentication failed (token invalid, expired or revoked)",
+            403: "access denied (the account lacks the required permission)",
+            404: "not found (wrong project key/ID, or no permission to see it)",
+            429: "too many requests (Jira rate limiting)",
+        }
+        detail = ""
+        try:
+            body = response.json()
+            messages = list(body.get("errorMessages") or []) + [
+                f"{k}: {v}" for k, v in (body.get("errors") or {}).items()
+            ]
+            detail = "; ".join(messages)
+        except ValueError:
+            detail = response.text[:200]
+        hint = hints.get(response.status_code, "request failed")
+        path = urlparse(response.url).path
+        return f"HTTP {response.status_code} on {path}: {hint}. {detail}".strip()
+
+    # --------------------------------------------------------------- public API
+    def get_json(self, path_or_url: str, params: dict[str, Any] | None = None) -> Any:
+        with self._slot():
+            return self._request("GET", path_or_url, params=params).json()
+
+    def post_json(self, path: str, payload: dict[str, Any]) -> Any:
+        with self._slot():
+            return self._request("POST", path, json=payload).json()
+
+    def get_bytes(self, path_or_url: str, max_bytes: int) -> bytes:
+        """Download a small resource (e.g. an inline image) fully into memory."""
+        with self._slot():
+            response = self._request("GET", path_or_url, stream=True, headers={"Accept": "*/*"})
+            data = bytearray()
+            try:
+                for chunk in response.iter_content(64 * 1024):
+                    data.extend(chunk)
+                    if len(data) > max_bytes:
+                        raise JiraError(f"Resource larger than {max_bytes} bytes, skipped.")
+            except requests.exceptions.RequestException as exc:
+                raise JiraError(f"Download interrupted: {exc}") from exc
+            finally:
+                response.close()
+            return bytes(data)
+
+    def download(self, path_or_url: str, destination: Path) -> int:
+        """Stream a file (e.g. an attachment) to *destination*. Returns the number of bytes."""
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        tmp = destination.with_name(destination.name + ".part")
+        written = 0
+        with self._slot():
+            response = self._request("GET", path_or_url, stream=True, headers={"Accept": "*/*"})
+            try:
+                with tmp.open("wb") as handle:
+                    for chunk in response.iter_content(1024 * 1024):
+                        handle.write(chunk)
+                        written += len(chunk)
+            except requests.exceptions.RequestException as exc:
+                tmp.unlink(missing_ok=True)
+                raise JiraError(f"Download interrupted: {exc}") from exc
+            finally:
+                response.close()
+        os.replace(tmp, destination)
+        return written
+
+    def stats(self) -> str:
+        """Short summary of the load put on Jira so far."""
+        return (f"{self.request_count} API request(s), {self.busy_seconds:.0f} s spent waiting for Jira, "
+                f"current minimum pause {self._min_interval:.1f} s")
+
+    # ---------------------------------------------------------- Jira shortcuts
+    def server_info(self) -> dict[str, Any]:
+        return self.get_json(f"{self.API}/serverInfo")
+
+    def myself(self) -> dict[str, Any]:
+        return self.get_json(f"{self.API}/myself")
+
+    def search(
+        self,
+        jql: str,
+        start_at: int,
+        max_results: int,
+        fields: list[str],
+        expand: list[str] | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "jql": jql,
+            "startAt": start_at,
+            "maxResults": max_results,
+            "fields": fields,
+            # Jira Data Center expects a boolean here (the "strict"/"warn" strings exist only in Jira Cloud).
+            # True = an invalid query is an error, instead of silently returning fewer issues.
+            "validateQuery": True,
+        }
+        if expand:
+            payload["expand"] = expand
+        return self.post_json(f"{self.API}/search", payload)
+
+    def iter_search(self, jql: str, fields: list[str], page_size: int) -> Iterator[dict[str, Any]]:
+        """Yield every issue matching *jql*, following pagination."""
+        start = 0
+        while True:
+            page = self.search(jql, start, page_size, fields)
+            issues = page.get("issues") or []
+            yield from issues
+            start += len(issues)
+            if not issues or start >= int(page.get("total", 0)):
+                return
+
+    def paged_values(self, path: str, page_size: int = 100, params: dict[str, Any] | None = None) -> list[Any]:
+        """Collect all ``values`` of a Jira "paged" endpoint (``isLast`` / ``startAt`` style)."""
+        results: list[Any] = []
+        start = 0
+        while True:
+            query = dict(params or {}, startAt=start, maxResults=page_size)
+            page = self.get_json(path, query)
+            values = page.get("values") or []
+            results.extend(values)
+            start += len(values)
+            total = page.get("total")
+            if not values or page.get("isLast") is True:
+                return results
+            if total is not None and start >= int(total):
+                return results
+            if total is None and "isLast" not in page and len(values) < page_size:
+                return results
