@@ -1,209 +1,46 @@
-"""Offline web viewer packed into every archive (``OPEN_ARCHIVE.html``).
-
-The viewer is a static web page: after the ZIP file has been extracted, a
-double-click on ``OPEN_ARCHIVE.html`` shows the whole project in the web browser
-(project summary, issue list with filters and search, board, issue pages with
-comments, history, attachments...). It needs no Python, no server, no
-installation and no network access, so anyone can open an archive.
-
-Why the data is written as ``.js`` files instead of ``.json`` files: a page opened
-from the disk (``file://``) is not allowed to read local JSON files, but it may
-load local scripts. Each data file is therefore one single call
-``jaLoad("<kind>", <JSON data>);`` that hands the data to the viewer. The JSON is
-ASCII-only (``\\u00e9`` instead of ``é``), so the files read correctly whatever the
-browser and its encoding settings.
-
-Files written in the archive folder::
-
-    OPEN_ARCHIVE.html             the page to double-click (copied from viewer_assets/)
-    viewer/app.js, viewer/app.css the viewer program and its layout (copied from viewer_assets/)
-    viewer/data/project.js        project configuration (components, versions, roles, ...)
-    viewer/data/index.js          one short line per issue: what the list, filters and board need
-    viewer/data/issues/<KEY>.js   full data of one issue (same content as in project.json)
-    viewer/data/search/<n>.js     text of the issues for the full-text search (500 issues per file)
-
-``project.json`` stays the reference copy of the data. The viewer files are a
-second, browser-friendly copy of the same data.
-"""
-
-from __future__ import annotations
-
-import json
-import re
-import shutil
-import unicodedata
-from collections.abc import Iterable
-from pathlib import Path
-from typing import Any
-
-from .utils import atomic_write_bytes, read_json
-
-ASSETS_DIR = Path(__file__).resolve().parent / "viewer_assets"
-ENTRY_PAGE = "OPEN_ARCHIVE.html"
-VIEWER_DIR = "viewer"
-SEARCH_CHUNK_SIZE = 500
-
-#: Columns of ``index.js`` (one array per issue, in this order).
-INDEX_COLUMNS = [
-    "key", "id", "summary", "type", "subtask", "status", "statusCategory", "priority", "resolution",
-    "assignee", "reporter", "created", "updated", "resolved", "due", "components", "fixVersions",
-    "versions", "labels", "parent", "attachments", "comments", "notes",
-]
-
-_COMBINING_MARKS = re.compile("[̀-ͯ]")
-
-
-def fold(text: str) -> str:
-    """Lower case without accents, for the search (the viewer does exactly the same in JavaScript)."""
-    return _COMBINING_MARKS.sub("", unicodedata.normalize("NFKD", text).lower())
-
-
-def _js(kind: str, *payload: Any) -> bytes:
-    """Content of one data file: ``jaLoad("kind", ...);`` with ASCII-only JSON."""
-    args = ", ".join(json.dumps(item, ensure_ascii=True, separators=(",", ":")) for item in payload)
-    return f"jaLoad({json.dumps(kind)}, {args});\n".encode("ascii")
-
-
-def _value(issue: dict[str, Any], field_id: str) -> Any:
-    return (issue.get("fields", {}).get(field_id) or {}).get("value")
-
-
-def _name(value: Any) -> str:
-    """Display name of a Jira object (user, status, version, option...)."""
-    if isinstance(value, dict):
-        for key in ("displayName", "name", "value", "key"):
-            if isinstance(value.get(key), str) and value[key]:
-                return value[key]
-        return ""
-    return value if isinstance(value, str) else ""
-
-
-def _names(values: Any) -> list[str]:
-    return [name for name in (_name(v) for v in values or []) if name] if isinstance(values, list) else []
-
-
-def index_row(issue: dict[str, Any]) -> list[Any]:
-    """The line of ``index.js`` describing *issue* (see :data:`INDEX_COLUMNS`)."""
-    status = _value(issue, "status") or {}
-    category = (status.get("statusCategory") or {}).get("key", "") if isinstance(status, dict) else ""
-    parent = _value(issue, "parent")
-    labels = _value(issue, "labels")
-    row = {
-        "key": issue["key"],
-        "id": issue.get("id"),
-        "summary": _value(issue, "summary") or "",
-        "type": (issue.get("issue_type") or {}).get("name") or _name(_value(issue, "issuetype")),
-        "subtask": bool((issue.get("issue_type") or {}).get("subtask")),
-        "status": _name(status),
-        "statusCategory": category,
-        "priority": _name(_value(issue, "priority")),
-        "resolution": _name(_value(issue, "resolution")),
-        "assignee": _name(_value(issue, "assignee")),
-        "reporter": _name(_value(issue, "reporter")),
-        "created": _value(issue, "created") or "",
-        "updated": _value(issue, "updated") or "",
-        "resolved": _value(issue, "resolutiondate") or "",
-        "due": _value(issue, "duedate") or "",
-        "components": _names(_value(issue, "components")),
-        "fixVersions": _names(_value(issue, "fixVersions")),
-        "versions": _names(_value(issue, "versions")),
-        "labels": [str(label) for label in labels] if isinstance(labels, list) else [],
-        "parent": parent.get("key", "") if isinstance(parent, dict) else "",
-        "attachments": len(issue.get("attachments") or []),
-        "comments": len(issue.get("comments") or []),
-        "notes": len(issue.get("archive_notes") or []),
-    }
-    return [row[column] for column in INDEX_COLUMNS]
-
-
-def _texts(value: Any) -> Iterable[str]:
-    """Every piece of text of a field value (strings, and names of users/options/versions)."""
-    if isinstance(value, str):
-        yield value
-    elif isinstance(value, list):
-        for item in value:
-            yield from _texts(item)
-    elif isinstance(value, dict):
-        for key in ("displayName", "name", "value"):
-            if isinstance(value.get(key), str):
-                yield value[key]
-        if isinstance(value.get("child"), dict):
-            yield from _texts(value["child"])
-
-
-def search_text(issue: dict[str, Any]) -> str:
-    """Searchable text of an issue: every field, comments, work log comments, file names, web links."""
-    parts: list[str] = []
-    for field_id, entry in (issue.get("fields") or {}).items():
-        if field_id in ("issuelinks", "subtasks", "parent", "project", "watches", "votes"):
-            continue
-        parts.extend(_texts((entry or {}).get("value")))
-    for comment in issue.get("comments") or []:
-        parts.append(str(comment.get("body") or ""))
-    for worklog in issue.get("worklogs") or []:
-        parts.append(str(worklog.get("comment") or ""))
-    for attachment in issue.get("attachments") or []:
-        parts.append(str(attachment.get("filename") or ""))
-    for link in issue.get("remote_links") or []:
-        obj = link.get("object") or {}
-        parts.extend(str(obj.get(k) or "") for k in ("title", "url"))
-    return fold(" ".join(p for p in parts if p))
-
-
-def _project_data(header: dict[str, Any]) -> dict[str, Any]:
-    """Project configuration for the viewer: ``project.json`` without the issues and the bulky parts."""
-    schemes = header.get("schemes") or {}
-    return {
-        "archive": header.get("archive"),
-        "project": header.get("project"),
-        "components": header.get("components"),
-        "versions": header.get("versions"),
-        "roles": header.get("roles"),
-        "schemes": {name: (scheme or {}).get("name") if isinstance(scheme, dict) else None
-                    for name, scheme in schemes.items()},
-        "statuses_by_issue_type": header.get("statuses_by_issue_type"),
-        "issue_types": [{k: v for k, v in it.items() if k != "create_screen_fields"}
-                        for it in header.get("issue_types") or []],
-        "fields": header.get("fields"),
-    }
-
-
-def build_viewer(archive_dir: Path, header: dict[str, Any], issue_files: Iterable[Path]) -> int:
-    """Write the viewer and its data into *archive_dir*. Returns the number of files written.
-
-    *header* is the content of ``project.json`` without the issues, *issue_files*
-    the JSON file of every issue, in key order.
-    """
-    viewer_dir = archive_dir / VIEWER_DIR
-    if viewer_dir.exists():
-        shutil.rmtree(viewer_dir)  # leftovers of an interrupted run
-    data_dir = viewer_dir / "data"
-
-    shutil.copyfile(ASSETS_DIR / ENTRY_PAGE, archive_dir / ENTRY_PAGE)
-    viewer_dir.mkdir(parents=True)
-    for asset in ("app.js", "app.css"):
-        shutil.copyfile(ASSETS_DIR / asset, viewer_dir / asset)
-    written = 3
-
-    atomic_write_bytes(data_dir / "project.js", _js("project", _project_data(header)))
-    written += 1
-
-    rows: list[list[Any]] = []
-    chunk: dict[str, str] = {}
-    chunk_count = 0
-    for path in issue_files:
-        issue = read_json(path)
-        rows.append(index_row(issue))
-        chunk[issue["key"]] = search_text(issue)
-        atomic_write_bytes(data_dir / "issues" / f"{issue['key']}.js", _js("issue", issue))
-        written += 1
-        if len(chunk) >= SEARCH_CHUNK_SIZE:
-            atomic_write_bytes(data_dir / "search" / f"{chunk_count}.js", _js("search", chunk_count, chunk))
-            chunk_count, chunk, written = chunk_count + 1, {}, written + 1
-    if chunk:
-        atomic_write_bytes(data_dir / "search" / f"{chunk_count}.js", _js("search", chunk_count, chunk))
-        chunk_count, written = chunk_count + 1, written + 1
-
-    index = {"columns": INDEX_COLUMNS, "rows": rows, "searchFiles": chunk_count}
-    atomic_write_bytes(data_dir / "index.js", _js("index", index))
-    return written + 1
+<!DOCTYPE html>
+<!--
+  Jira project archive - offline viewer (automatic-jira-archiving).
+  Double-click this file AFTER extracting the ZIP file. It works without Internet access and sends nothing anywhere.
+  The security policy below allows only the scripts and files of this archive, and forbids any network access.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; media-src 'self'; font-src 'self'; connect-src 'none'; frame-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+<meta name="referrer" content="no-referrer">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jira project archive</title>
+<style>
+  /* Start-up screen, kept inside this file: it must show even when nothing else can be loaded. */
+  .startup { font-family: "Segoe UI", system-ui, -apple-system, Roboto, Arial, sans-serif; color: #172b4d;
+             max-width: 640px; margin: 64px auto; padding: 0 16px; line-height: 1.5; }
+  .startup h1 { font-size: 24px; font-weight: 600; margin: 0 0 8px; }
+  .startup-help { opacity: 0; animation: startup-appear 0s 2s forwards; border: 1px solid #ffc400;
+                  background: #fffae6; border-radius: 4px; padding: 4px 20px; margin-top: 24px; }
+  @keyframes startup-appear { to { opacity: 1; } }
+</style>
+<link rel="stylesheet" href="viewer/app.css">
+<script defer src="viewer/app.js"></script>
+<script defer src="viewer/data/project.js"></script>
+<script defer src="viewer/data/index.js"></script>
+</head>
+<body>
+<div id="startup" class="startup">
+  <h1>Jira project archive</h1>
+  <p>Loading the archive&hellip;</p>
+  <div class="startup-help">
+    <p><b>Nothing happens?</b> The archive is probably still inside the ZIP file. Windows can show what a
+      ZIP file contains without extracting it, but this page needs all the other files of the archive.</p>
+    <ol>
+      <li>Close this page.</li>
+      <li>Right-click the ZIP file, choose <b>Extract All&hellip;</b>, then <b>Extract</b>.</li>
+      <li>In the extracted folder, double-click <b>OPEN_ARCHIVE.html</b>.</li>
+    </ol>
+    <p>If the archive is already extracted, check that the <b>viewer</b> folder is next to this file, and that
+      JavaScript is not disabled in your web browser.</p>
+  </div>
+</div>
+<div id="app" hidden></div>
+</body>
+</html>
