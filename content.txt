@@ -1,167 +1,425 @@
-"""Small, dependency-free helpers (file names, hashing, atomic writes, formatting)."""
+"""Extract all data of one Jira project into a local working folder.
+
+How it works
+------------
+1. **Project metadata**: project, components, versions, roles, statuses,
+   schemes, the field catalog and the fields configured per issue type
+   ("create screen" configuration).
+2. **Inventory**: the list of every issue (id + key) of the project.
+3. **Issues**: fetched in batches with all fields, rendered fields, changelog,
+   comments, work logs, remote links and attachments. For each issue, the
+   attachments are downloaded, the PDF is generated, and finally the issue JSON
+   is written to ``state/issues/<KEY>.json``.
+
+Because step 3 writes the issue JSON *last*, an interrupted run can simply be
+restarted: issues that already have their JSON file are skipped (resume).
+"""
 
 from __future__ import annotations
 
-import hashlib
-import json
-import os
 import re
-import unicodedata
-from collections.abc import Iterator
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any
+from urllib.parse import quote
 
-T = TypeVar("T")
+from .jira_client import JiraClient, JiraError
+from .logging_setup import get_logger
+from .pdf_renderer import IssuePdfRenderer
+from .utils import atomic_write_json, chunks, is_empty, read_json, safe_filename, sha256_file, utc_now
 
-# Names Windows refuses to use as file names, whatever the extension.
-_WINDOWS_RESERVED = {
-    "CON", "PRN", "AUX", "NUL",
-    *(f"COM{i}" for i in range(1, 10)),
-    *(f"LPT{i}" for i in range(1, 10)),
+log = get_logger("export")
+
+API = JiraClient.API
+
+#: System fields always kept in the JSON, even when empty.
+CORE_FIELDS = {
+    "summary", "issuetype", "status", "priority", "resolution", "resolutiondate", "created", "updated",
+    "creator", "reporter", "assignee", "labels", "components", "versions", "fixVersions", "description",
+    "environment", "duedate", "issuelinks", "subtasks", "project", "security", "timetracking", "votes",
+    "watches",
 }
-_FORBIDDEN_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+#: Fields moved to their own sections of the issue record (comments, worklogs, attachments).
+SECTION_FIELDS = {"comment", "worklog", "attachment"}
+#: Fields describing the person running the export, not the issue.
+EXCLUDED_FIELDS = {"lastViewed"}
+#: Keys removed everywhere: links to avatars/icons/REST resources, useless once Jira is gone.
+NOISE_KEYS = {"avatarUrls", "self", "iconUrl"}
 
-#: Jira project keys: a letter followed by letters, digits or underscores.
-PROJECT_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,254}$")
-
-
-def safe_filename(name: str, max_length: int = 100) -> str:
-    """Return a file name that is safe on Windows, macOS and Linux.
-
-    Removes path separators (prevents writing outside the target folder),
-    forbidden characters, reserved Windows names, and limits the length while
-    keeping the extension.
-    """
-    name = unicodedata.normalize("NFC", name or "")
-    name = _FORBIDDEN_CHARS.sub("_", name).strip().strip(".")
-    if not name:
-        name = "file"
-    stem, dot, ext = name.rpartition(".")
-    if not dot:
-        stem, ext = name, ""
-    if stem.upper() in _WINDOWS_RESERVED:
-        stem = f"_{stem}"
-    ext = ext[:15]
-    room = max_length - (len(ext) + 1 if ext else 0)
-    stem = stem[: max(room, 1)].rstrip(" .") or "file"
-    return f"{stem}.{ext}" if ext else stem
+_ATTACHMENT_SRC = re.compile(r"/secure/(?:attachment|thumbnail)/(\d+)/")
+MAX_INLINE_IMAGE_BYTES = 15 * 1024 * 1024
+MAX_IMAGE_CACHE = 200
 
 
-def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
-    """Compute the SHA-256 fingerprint of a file without loading it in memory."""
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(chunk_size), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+class ProjectTooLargeError(Exception):
+    """The project has more issues than the configured limit."""
 
 
-def atomic_write_bytes(path: Path, data: bytes) -> None:
-    """Write a file atomically: a crash never leaves a half-written file behind."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".part")
-    tmp.write_bytes(data)
-    os.replace(tmp, path)
+class IncompleteExportError(Exception):
+    """Some issues could not be exported; re-running the command will retry them."""
 
 
-def atomic_write_json(path: Path, data: Any) -> None:
-    """Write *data* as pretty UTF-8 JSON, atomically."""
-    atomic_write_bytes(path, json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"))
+def strip_noise(value: Any) -> Any:
+    """Recursively drop :data:`NOISE_KEYS` from Jira objects."""
+    if isinstance(value, dict):
+        return {k: strip_noise(v) for k, v in value.items() if k not in NOISE_KEYS}
+    if isinstance(value, list):
+        return [strip_noise(v) for v in value]
+    return value
 
 
-def read_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8"))
+@dataclass
+class WorkPaths:
+    """Folder layout of a project being exported (``<output>/work/<KEY>/``)."""
+
+    root: Path
+
+    @property
+    def state(self) -> Path:
+        return self.root / "state"
+
+    @property
+    def issues(self) -> Path:
+        return self.state / "issues"
+
+    @property
+    def archive(self) -> Path:
+        """Content that ends up in the ZIP file."""
+        return self.root / "archive"
+
+    @property
+    def pdf(self) -> Path:
+        return self.archive / "pdf"
+
+    @property
+    def attachments(self) -> Path:
+        return self.archive / "attachments"
+
+    def create(self) -> None:
+        for path in (self.issues, self.pdf, self.attachments):
+            path.mkdir(parents=True, exist_ok=True)
 
 
-def utc_now() -> datetime:
-    return datetime.now(timezone.utc).replace(microsecond=0)
+@dataclass
+class ExportResult:
+    project_key: str
+    paths: WorkPaths
+    metadata: dict[str, Any]
+    inventory: list[dict[str, str]]
+    failures: dict[str, str] = field(default_factory=dict)
 
 
-def human_size(num_bytes: int | float | None) -> str:
-    """Format a byte count, e.g. ``1536`` -> ``"1.5 KB"``."""
-    if num_bytes is None:
-        return ""
-    size = float(num_bytes)
-    for unit in ("B", "KB", "MB", "GB"):
-        if size < 1024 or unit == "GB":
-            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
-        size /= 1024
-    return f"{size:.1f} GB"
+class ProjectExporter:
+    """Exports one project. See the module docstring for the overall flow."""
 
+    def __init__(self, client: JiraClient, project_ref: str, work_root: Path, *, page_size: int = 25,
+                 max_issues: int | None = None, include_attachments: bool = True) -> None:
+        self.client = client
+        self.project_ref = project_ref
+        self.work_root = work_root
+        self.page_size = page_size
+        self.max_issues = max_issues
+        self.include_attachments = include_attachments
+        self._image_cache: dict[str, bytes | None] = {}
 
-def chunks(items: list[T], size: int) -> Iterator[list[T]]:
-    for start in range(0, len(items), size):
-        yield items[start:start + size]
+    # ================================================================== run
+    def run(self) -> ExportResult:
+        project = self._get_project()
+        key = project["key"]
+        if self.max_issues is not None:  # checked before anything is written to disk
+            total = int(self.client.search(f'project = "{key}"', 0, 0, ["key"]).get("total", 0))
+            if total > self.max_issues:
+                raise ProjectTooLargeError(f"{key} has {total} issues (limit is {self.max_issues}).")
+        paths = WorkPaths(self.work_root / key)
+        paths.create()
 
+        metadata = self._metadata(paths, project)
+        inventory = self._inventory(paths, key)
+        log.info("[%s] %d issue(s) in the project.", key, len(inventory))
 
-def issue_sort_key(key: str) -> tuple[str, int]:
-    """Sort ``PROJ-2`` before ``PROJ-10``."""
-    prefix, _, number = key.rpartition("-")
-    return (prefix, int(number)) if number.isdigit() else (key, 0)
+        done = {p.stem for p in paths.issues.glob("*.json")}
+        todo = [item for item in inventory if item["key"] not in done]
+        if done:
+            log.info("[%s] Resuming: %d already exported, %d remaining.", key, len(inventory) - len(todo), len(todo))
 
+        renderer = IssuePdfRenderer(metadata["field_catalog"], self.client.base_url, metadata["export_started_at"])
+        result = ExportResult(key, paths, metadata, inventory)
+        processed = 0
+        for batch in chunks(todo, self.page_size):
+            try:
+                issues = self._fetch_batch([item["id"] for item in batch])
+            except JiraError as exc:
+                for item in batch:
+                    result.failures[item["key"]] = str(exc)
+                log.error("[%s] Batch failed: %s", key, exc)
+                continue
+            returned = {str(issue["id"]) for issue in issues}
+            for item in batch:
+                if item["id"] not in returned:
+                    result.failures[item["key"]] = "Issue not returned by Jira (deleted or moved during export?)"
+            for raw in issues:
+                try:
+                    self._process_issue(raw, metadata, paths, renderer, project)
+                except Exception as exc:  # one broken issue must not stop the run
+                    result.failures[raw.get("key", raw.get("id", "?"))] = repr(exc)
+                    log.error("[%s] Issue %s failed: %r", key, raw.get("key"), exc)
+                processed += 1
+            log.info("[%s] Progress: %d / %d issue(s) exported.", key,
+                     len(inventory) - len(todo) + processed, len(inventory))
 
-def is_empty(value: Any) -> bool:
-    """True for values Jira uses to say "nothing here"."""
-    if value is None:
-        return True
-    if isinstance(value, (str, list, dict, tuple)) and len(value) == 0:
-        return True
-    if isinstance(value, str) and not value.strip():
-        return True
-    return False
+        failures_file = paths.state / "failures.json"
+        if result.failures:
+            atomic_write_json(failures_file, result.failures)
+        else:
+            failures_file.unlink(missing_ok=True)
+        return result
 
+    # ============================================================= metadata
+    def _get_project(self) -> dict[str, Any]:
+        return self.client.get_json(f"{API}/project/{quote(self.project_ref)}",
+                                    {"expand": "description,lead,url,projectKeys,issueTypes"})
 
-def read_project_list(projects: list[str], list_file: Path | None = None) -> list[str]:
-    """Project keys given on the command line and/or in a text file, without duplicates.
-
-    The file holds one key per line; ``#`` starts a comment (whole line or end of line).
-    """
-    keys = list(projects)
-    if list_file:
-        for line in list_file.read_text(encoding="utf-8-sig").splitlines():
-            line = line.split("#", 1)[0].strip()
-            if line:
-                keys.append(line)
-    return list(dict.fromkeys(keys))
-
-
-def is_valid_project_ref(ref: str) -> bool:
-    """A project key (``ABC``) or a numeric project ID (``10000``)."""
-    return ref.isdigit() or bool(PROJECT_KEY_RE.match(ref))
-
-
-class SingleInstanceLock:
-    """Prevents two archive runs from working at the same time on the same machine/output folder.
-
-    Uses an operating-system file lock: it is released automatically if the
-    process stops, even after a crash, so it can never stay "stuck".
-    """
-
-    def __init__(self, path: Path) -> None:
-        self._path = path
-        self._handle: Any = None
-
-    def acquire(self) -> bool:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        handle = self._path.open("a+")
+    def _optional(self, warnings: list[str], label: str, path: str, params: dict | None = None) -> Any:
+        """Fetch an optional piece of metadata; record a warning instead of failing."""
         try:
-            if os.name == "nt":
-                import msvcrt
+            return strip_noise(self.client.get_json(path, params))
+        except JiraError as exc:
+            if exc.status_code == 404:
+                return None
+            warnings.append(f"{label}: {exc}")
+            log.warning("Could not read %s: %s", label, exc)
+            return None
 
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
+    def _metadata(self, paths: WorkPaths, project: dict[str, Any]) -> dict[str, Any]:
+        cache = paths.state / "metadata.json"
+        if cache.is_file():
+            return read_json(cache)
 
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            handle.close()
-            return False
-        self._handle = handle
-        return True
+        key = project["key"]
+        log.info("[%s] Reading project configuration...", key)
+        warnings: list[str] = []
+        base = f"{API}/project/{quote(key)}"
 
-    def release(self) -> None:
-        if self._handle is not None:
-            self._handle.close()  # closing the file releases the lock
-            self._handle = None
+        roles: dict[str, Any] = {}
+        for name, url in (self._optional(warnings, "project roles", f"{base}/role") or {}).items():
+            role = self._optional(warnings, f"role {name}", url) if isinstance(url, str) else None
+            if role is not None:
+                roles[name] = role
+
+        all_fields = self.client.get_json(f"{API}/field")
+        catalog = {f["id"]: strip_noise(f) for f in all_fields}
+
+        issue_types = []
+        for issue_type in project.get("issueTypes") or []:
+            fields = self._create_screen_fields(warnings, key, issue_type)
+            issue_types.append({**strip_noise(issue_type), "create_screen_fields": fields})
+
+        metadata = {
+            "export_started_at": utc_now().isoformat(),
+            "project": strip_noise(project),
+            "components": self._optional(warnings, "components", f"{base}/components") or [],
+            "versions": self._optional(warnings, "versions", f"{base}/versions") or [],
+            "statuses_by_issue_type": self._optional(warnings, "statuses", f"{base}/statuses") or [],
+            "roles": roles,
+            "permission_scheme": self._optional(warnings, "permission scheme", f"{base}/permissionscheme"),
+            "notification_scheme": self._optional(warnings, "notification scheme", f"{base}/notificationscheme"),
+            "issue_security_scheme": self._optional(warnings, "issue security scheme",
+                                                    f"{base}/issuesecuritylevelscheme"),
+            "issue_types": issue_types,
+            "field_catalog": catalog,
+            "warnings": warnings,
+        }
+        atomic_write_json(cache, metadata)
+        return metadata
+
+    def _create_screen_fields(self, warnings: list[str], key: str, issue_type: dict[str, Any]) -> list[dict]:
+        """Fields configured for an issue type (as on its create screen), with rules and allowed values."""
+        path = f"{API}/issue/createmeta/{quote(key)}/issuetypes/{quote(str(issue_type['id']))}"
+        try:
+            values = self.client.paged_values(path, page_size=100)
+        except JiraError as exc:
+            warnings.append(f"field configuration of issue type {issue_type.get('name')}: {exc}")
+            log.warning("Could not read fields of issue type %s: %s", issue_type.get("name"), exc)
+            return []
+        if not values:
+            # Typically: the account lacks the "Create Issues" permission on the project.
+            warnings.append(f"field configuration of issue type {issue_type.get('name')}: Jira returned no field "
+                            "(the account may lack the 'Create Issues' permission). Fields with a value are all "
+                            "kept; empty fields of this issue type may be missing.")
+            log.warning("No field configuration returned for issue type %s", issue_type.get("name"))
+        return [strip_noise(v) for v in values]
+
+    # ============================================================ inventory
+    def _inventory(self, paths: WorkPaths, key: str) -> list[dict[str, str]]:
+        cache = paths.state / "inventory.json"
+        if cache.is_file():
+            return read_json(cache)
+        jql = f'project = "{key}" ORDER BY id ASC'
+        log.info("[%s] Listing issues...", key)
+        inventory = [{"id": str(i["id"]), "key": i["key"]}
+                     for i in self.client.iter_search(jql, ["key"], page_size=1000)]
+        atomic_write_json(cache, inventory)
+        return inventory
+
+    # =============================================================== issues
+    def _fetch_batch(self, ids: list[str]) -> list[dict[str, Any]]:
+        jql = f"id in ({','.join(ids)}) ORDER BY id ASC"
+        page = self.client.search(jql, 0, len(ids), ["*all"], expand=["renderedFields", "changelog"])
+        return page.get("issues") or []
+
+    def _process_issue(self, raw: dict[str, Any], metadata: dict[str, Any], paths: WorkPaths,
+                       renderer: IssuePdfRenderer, project: dict[str, Any]) -> None:
+        key = raw["key"]
+        log.debug("Processing %s", key)
+        notes: list[str] = []
+        record = self._normalize(raw, metadata)
+        record["comments"] = self._comments(raw)
+        record["worklogs"] = self._worklogs(raw)
+        record["changelog"] = self._changelog(raw)
+        record["remote_links"] = self._remote_links(raw)
+        record["attachments"] = self._attachments(raw, paths, notes)
+        record["archive_notes"] = notes
+
+        local_images = {
+            str(att["id"]): paths.archive / att["archive"]["path"]
+            for att in record["attachments"] if att["archive"].get("path")
+        }
+        pdf_path = paths.pdf / f"{key}.pdf"
+        notes += renderer.render(record, metadata["project"], pdf_path, paths.archive,
+                                 lambda src: self._resolve_image(src, local_images))
+        record["pdf"] = {"path": f"pdf/{key}.pdf", "sha256": sha256_file(pdf_path)}
+        record["archive_notes"] = notes
+        atomic_write_json(paths.issues / f"{key}.json", record)  # written last => issue is "done"
+
+    def _normalize(self, raw: dict[str, Any], metadata: dict[str, Any]) -> dict[str, Any]:
+        catalog = metadata["field_catalog"]
+        fields = raw.get("fields") or {}
+        rendered = raw.get("renderedFields") or {}
+        issue_type = fields.get("issuetype") or {}
+
+        configured: set[str] = set()
+        for it in metadata["issue_types"]:
+            if str(it.get("id")) == str(issue_type.get("id")):
+                configured = {f.get("fieldId") for f in it.get("create_screen_fields") or [] if f.get("fieldId")}
+
+        wanted = (configured | CORE_FIELDS | {fid for fid, value in fields.items() if not is_empty(value)})
+        wanted -= SECTION_FIELDS | EXCLUDED_FIELDS
+
+        def order(field_id: str) -> tuple[int, str]:
+            info = catalog.get(field_id) or {}
+            return (1 if info.get("custom") else 0, str(info.get("name", field_id)).lower())
+
+        out: dict[str, Any] = {}
+        for field_id in sorted(wanted, key=order):
+            value = strip_noise(fields.get(field_id))
+            entry: dict[str, Any] = {"name": (catalog.get(field_id) or {}).get("name", field_id), "value": value}
+            html = rendered.get(field_id)
+            schema_type = ((catalog.get(field_id) or {}).get("schema") or {}).get("type")
+            if isinstance(html, str) and html.strip() and schema_type == "string" and html != value:
+                entry["rendered_html"] = html
+            out[field_id] = entry
+
+        return {
+            "id": str(raw["id"]),
+            "key": raw["key"],
+            "issue_type": {"id": issue_type.get("id"), "name": issue_type.get("name"),
+                           "subtask": issue_type.get("subtask")},
+            "fields": out,
+        }
+
+    def _comments(self, raw: dict[str, Any]) -> list[dict[str, Any]]:
+        block = (raw.get("fields") or {}).get("comment") or {}
+        comments = block.get("comments") or []
+        rendered = {c.get("id"): c.get("body") for c in
+                    (((raw.get("renderedFields") or {}).get("comment") or {}).get("comments") or [])}
+        if int(block.get("total", len(comments))) > len(comments):
+            comments, start = [], 0
+            while True:
+                page = self.client.get_json(f"{API}/issue/{raw['id']}/comment",
+                                            {"startAt": start, "maxResults": 100, "expand": "renderedBody"})
+                batch = page.get("comments") or []
+                comments += batch
+                start += len(batch)
+                if not batch or start >= int(page.get("total", 0)):
+                    break
+        result = []
+        for comment in comments:
+            item = strip_noise(comment)
+            item.setdefault("renderedBody", rendered.get(comment.get("id")))
+            result.append(item)
+        return result
+
+    def _worklogs(self, raw: dict[str, Any]) -> list[dict[str, Any]]:
+        block = (raw.get("fields") or {}).get("worklog") or {}
+        worklogs = block.get("worklogs") or []
+        if int(block.get("total", len(worklogs))) > len(worklogs):
+            worklogs = self.client.get_json(f"{API}/issue/{raw['id']}/worklog").get("worklogs") or []
+        return strip_noise(worklogs)
+
+    def _changelog(self, raw: dict[str, Any]) -> list[dict[str, Any]]:
+        changelog = raw.get("changelog") or {}
+        histories = changelog.get("histories") or []
+        if int(changelog.get("total", len(histories))) > len(histories):
+            full = self.client.get_json(f"{API}/issue/{raw['id']}", {"expand": "changelog", "fields": "key"})
+            histories = (full.get("changelog") or {}).get("histories") or histories
+        return strip_noise(histories)
+
+    def _remote_links(self, raw: dict[str, Any]) -> list[dict[str, Any]]:
+        try:
+            return strip_noise(self.client.get_json(f"{API}/issue/{raw['id']}/remotelink")) or []
+        except JiraError as exc:
+            if exc.status_code == 404:
+                return []
+            raise
+
+    def _attachments(self, raw: dict[str, Any], paths: WorkPaths, notes: list[str]) -> list[dict[str, Any]]:
+        key = raw["key"]
+        result = []
+        for attachment in (raw.get("fields") or {}).get("attachment") or []:
+            item = strip_noise(attachment)
+            item.pop("content", None)
+            item.pop("thumbnail", None)
+            att_id = str(attachment["id"])
+            filename = attachment.get("filename") or "file"
+            relative = f"attachments/{key}/{att_id}_{safe_filename(filename)}"
+            target = paths.archive / relative
+            archive: dict[str, Any] = {"path": None, "status": "skipped"}
+            if self.include_attachments:
+                # The URL is rebuilt from the configured base URL on purpose: the "content" URL
+                # returned by Jira may use another host name (Jira's own "Base URL" setting).
+                url = f"{self.client.base_url}/secure/attachment/{quote(att_id)}/{quote(filename)}"
+                try:
+                    size = self.client.download(url, target)
+                    archive = {"path": relative, "status": "ok", "size": size, "sha256": sha256_file(target)}
+                    expected = attachment.get("size")
+                    if isinstance(expected, int) and expected != size:
+                        notes.append(f"Attachment {filename}: size {size} differs from Jira metadata ({expected}).")
+                except JiraError as exc:
+                    if exc.status_code not in (403, 404):
+                        raise  # temporary problem: the issue will be retried on the next run
+                    archive = {"path": None, "status": f"missing on server (HTTP {exc.status_code})"}
+                    notes.append(f"Attachment {filename} (id {att_id}) could not be downloaded: {exc}")
+                    log.warning("[%s] Attachment %s not downloadable: %s", key, filename, exc)
+            item["archive"] = archive
+            result.append(item)
+        return result
+
+    def _resolve_image(self, src: str, local_images: dict[str, Path]) -> bytes | Path | None:
+        """Find the data of an image referenced in rich text (for the PDF)."""
+        match = _ATTACHMENT_SRC.search(src)
+        if match and match.group(1) in local_images:
+            return local_images[match.group(1)]
+        url = self.client.resolve_url(src)
+        if not self.client.is_same_origin(url):
+            return None  # never fetch external content (privacy) nor send the token elsewhere
+        if url in self._image_cache:
+            return self._image_cache[url]
+        try:
+            data: bytes | None = self.client.get_bytes(url, MAX_INLINE_IMAGE_BYTES)
+        except JiraError as exc:
+            log.debug("Inline image %s not available: %s", url, exc)
+            data = None
+        if len(self._image_cache) >= MAX_IMAGE_CACHE:
+            self._image_cache.clear()
+        self._image_cache[url] = data
+        return data
