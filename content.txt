@@ -1,101 +1,419 @@
-"""Start-up helpers shared by the command-line scripts.
+"""Check that the connection to Jira works and that the account can archive the projects.
 
-This module uses the Python standard library only: it runs *before* the
-third-party libraries are imported, possibly with a Python that does not have them.
+Usage (in a terminal opened in the project folder):
 
-Why it exists: on the company workstations ``.bat`` files are blocked, so the
-scripts are started directly with ``py <script>.py``. That command uses the
-system-wide Python. :func:`use_project_venv` makes the script re-start itself
-with the private Python environment (``.venv``) created by ``install.py``, so
-that users never have to "activate" anything.
+    py check_connection.py                       # server, certificate, token
+    py check_connection.py ABC                   # + detailed check of project ABC (several keys allowed)
+    py check_connection.py --file projects.txt   # + quick check of every project of the list, with a report
+
+Nothing is ever modified in Jira: this script only reads information.
+
+What is checked for a project, and why
+--------------------------------------
+Being "Jira Administrator" is NOT required. What matters are the permissions on each
+project, given by its permission scheme (for example through Crowd groups):
+
+* Browse Projects      -> REQUIRED: issues, comments, history, work logs, attachments.
+* Administer Projects  -> recommended: roles and schemes of the project.
+* Create Issues        -> recommended: list of the fields configured per issue type
+                          (used to include empty fields in the archive).
+
+The detailed check also *tries* the real reads done by the archive, which is the
+most reliable proof whatever the way the permissions are given.
 """
 
 from __future__ import annotations
 
-import os
-import subprocess
+import argparse
+import csv
+import platform
 import sys
+from datetime import datetime
+from importlib import metadata
 from pathlib import Path
+from typing import Any
+from urllib.parse import quote
 
-# Set for the re-started process, so it never tries to re-start itself again.
-_SWITCHED_ENV = "JIRA_ARCHIVER_IN_VENV"
+from jira_archiver import __version__
+from jira_archiver.bootstrap import pause_if_double_clicked, started_by_double_click, use_project_venv
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+# Must run before the third-party libraries are imported (see bootstrap.py).
+use_project_venv(PROJECT_ROOT)
+
+# Standard library only: these imports work even when the libraries are missing.
+from jira_archiver.config import ConfigError, load_settings  # noqa: E402
+from jira_archiver.utils import SingleInstanceLock, is_valid_project_ref, read_project_list  # noqa: E402
+
+OK, FAIL, WARN, INFO = "[ OK ]", "[FAIL]", "[WARN]", "[INFO]"
+
+#: Project permissions checked, with what they are used for by the archive.
+REQUIRED_PERMISSION = "BROWSE_PROJECTS"
+RECOMMENDED_PERMISSIONS = {
+    "ADMINISTER_PROJECTS": "roles and schemes of the project will be missing from the archive",
+    "CREATE_ISSUES": "some EMPTY fields may be missing from the archive (fields with a value are all kept)",
+}
+PERMISSION_NAMES = {
+    "BROWSE_PROJECTS": "Browse Projects",
+    "ADMINISTER_PROJECTS": "Administer Projects",
+    "CREATE_ISSUES": "Create Issues",
+}
 
 
-def venv_python(project_root: Path) -> Path:
-    """Path of the Python program inside the project's ``.venv`` folder."""
-    if os.name == "nt":
-        return project_root / ".venv" / "Scripts" / "python.exe"
-    return project_root / ".venv" / "bin" / "python"
+def report(status: str, message: str, hint: str = "") -> None:
+    print(f"{status} {message}")
+    if hint:
+        print(f"       -> {hint}")
 
 
-def _running_in(venv_dir: Path) -> bool:
+def package_version(name: str) -> str | None:
     try:
-        return Path(sys.prefix).resolve() == venv_dir.resolve()
-    except OSError:
-        return False
+        return metadata.version(name)
+    except metadata.PackageNotFoundError:
+        return None
 
 
-def started_by_double_click() -> bool:
-    """Best-effort detection of a script opened by double-click in Windows Explorer.
-
-    In that case Windows opens a new console window that closes as soon as the
-    script ends, so the messages could not be read. A console opened by
-    double-click only holds the Python processes (at most 2: the ``py`` launcher
-    and Python), whereas a terminal also holds ``cmd.exe`` or ``powershell.exe``.
-    """
-    if os.name != "nt" or os.environ.get(_SWITCHED_ENV) or not sys.stdin or not sys.stdin.isatty():
-        return False
-    try:
-        import ctypes
-
-        process_list = (ctypes.c_uint * 16)()
-        count = ctypes.windll.kernel32.GetConsoleProcessList(process_list, 16)
-    except Exception:  # noqa: BLE001 - detection is optional, never fail because of it
-        return False
-    return 0 < count <= 2
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Check the connection to Jira and the permissions needed to archive projects.")
+    parser.add_argument("projects", nargs="*", metavar="PROJECT",
+                        help="Project key (e.g. ABC) or ID to check in detail. Several can be given.")
+    parser.add_argument("--file", type=Path,
+                        help="Text file with one project key per line: quick check of each, plus a CSV report.")
+    parser.add_argument("--version", action="version", version=f"automatic-jira-archiving {__version__}")
+    return parser.parse_args(argv)
 
 
-def pause_if_double_clicked(double_clicked: bool) -> None:
-    """Keep the console window open so the user can read the result."""
-    if double_clicked:
+# =============================================================== project checks
+class ProjectCheck:
+    """Checks one project. ``status`` ends as "OK", "WARNING" or "BLOCKED"."""
+
+    def __init__(self, client: Any, error_class: type[Exception], ref: str) -> None:
+        self.client = client
+        self.error_class = error_class  # JiraError, imported late (needs the "requests" library)
+        self.ref = ref
+        self.key = ref
+        self.name = ""
+        self.issue_count: int | None = None
+        self.permissions: dict[str, bool | None] = {}
+        self.status = "OK"
+        self.problems: list[str] = []
+        self._issue_types: list[dict[str, Any]] = []
+
+    def _warn(self, message: str) -> None:
+        if self.status == "OK":
+            self.status = "WARNING"
+        self.problems.append(message)
+
+    def _block(self, message: str) -> None:
+        self.status = "BLOCKED"
+        self.problems.append(message)
+
+    # ---------------------------------------------------- quick (3 requests)
+    def run_quick(self) -> None:
+        api = self.client.API
         try:
-            input("\nPress Enter to close this window...")
-        except (EOFError, KeyboardInterrupt):
-            pass
+            project = self.client.get_json(f"{api}/project/{quote(self.ref)}", {"expand": "issueTypes"})
+        except self.error_class as exc:
+            self._block(f"project cannot be read ({exc})")
+            return
+        self.key = project.get("key", self.ref)
+        self.name = project.get("name", "")
+        self._issue_types = project.get("issueTypes") or []
+
+        wanted = [REQUIRED_PERMISSION, *RECOMMENDED_PERMISSIONS]
+        try:
+            answer = self.client.get_json(f"{api}/mypermissions",
+                                          {"projectKey": self.key, "permissions": ",".join(wanted)})
+            granted = answer.get("permissions") or {}
+            for perm in wanted:
+                value = (granted.get(perm) or {}).get("havePermission")
+                self.permissions[perm] = None if value is None else bool(value)
+        except self.error_class as exc:
+            self._warn(f"permissions could not be read ({exc})")
+
+        if self.permissions.get(REQUIRED_PERMISSION) is False:
+            self._block(f"missing permission '{PERMISSION_NAMES[REQUIRED_PERMISSION]}': "
+                        "the issues cannot be read")
+            return
+        for perm, consequence in RECOMMENDED_PERMISSIONS.items():
+            if self.permissions.get(perm) is False:
+                self._warn(f"missing permission '{PERMISSION_NAMES[perm]}': {consequence}")
+
+        try:
+            result = self.client.search(f'project = "{self.key}"', 0, 0, ["key"])
+            self.issue_count = int(result.get("total", 0))
+        except self.error_class as exc:
+            self._block(f"issues cannot be searched ({exc})")
+
+    # ----------------------------------------- detailed (real reads, ~10 requests)
+    def run_detailed(self) -> None:
+        """Try the reads done by the archive. Only meaningful after :meth:`run_quick`."""
+        if self.status == "BLOCKED":
+            return
+        base = f"{self.client.API}/project/{quote(self.key)}"
+
+        # Roles: the list, then the detail of one role (members).
+        try:
+            roles = self.client.get_json(f"{base}/role") or {}
+            first_role = next((url for url in roles.values() if isinstance(url, str)), None)
+            if first_role:
+                self.client.get_json(first_role)
+            self._detail(OK, f"Project roles readable ({len(roles)} role(s))")
+        except self.error_class as exc:
+            self._detail_warn(f"Project roles not readable ({exc})")
+
+        for label, path in (("Permission scheme", "permissionscheme"),
+                            ("Notification scheme", "notificationscheme")):
+            try:
+                scheme = self.client.get_json(f"{base}/{path}") or {}
+                self._detail(OK, f"{label} readable: {scheme.get('name', '(no name)')}")
+            except self.error_class as exc:
+                self._detail_warn(f"{label} not readable ({exc})")
+
+        self._check_issue_security(base)
+        self._check_field_configuration()
+
+    def _check_issue_security(self, base: str) -> None:
+        try:
+            scheme = self.client.get_json(f"{base}/issuesecuritylevelscheme")
+        except self.error_class as exc:
+            if exc.status_code == 404:
+                self._detail(OK, "No issue security on this project: every issue is visible")
+            else:
+                self._detail_warn(f"Cannot tell whether the project uses issue security ({exc}). "
+                                  "If it does, issues at a security level you are not part of are invisible.")
+            return
+        if not scheme:
+            self._detail(OK, "No issue security on this project: every issue is visible")
+            return
+        levels = scheme.get("levels") or []
+        self._detail_warn(
+            f"The project uses issue security (scheme '{scheme.get('name', '?')}', {len(levels)} level(s)). "
+            "Issues at a level you are not part of are INVISIBLE, even to administrators, "
+            "and would not be archived. Check with the project owners that the account is in every level.")
+
+    def _check_field_configuration(self) -> None:
+        if not self._issue_types:
+            self._detail_warn("No issue type returned for this project")
+            return
+        empty: list[str] = []
+        for issue_type in self._issue_types:
+            path = (f"{self.client.API}/issue/createmeta/{quote(self.key)}"
+                    f"/issuetypes/{quote(str(issue_type.get('id')))}")
+            try:
+                values = self.client.paged_values(path, page_size=100)
+            except self.error_class:
+                values = []
+            if not values:
+                empty.append(str(issue_type.get("name")))
+        readable = len(self._issue_types) - len(empty)
+        if empty:
+            self._detail_warn(
+                f"Field configuration readable for {readable} of {len(self._issue_types)} issue type(s); "
+                f"not for: {', '.join(empty)}. Empty fields of these types may be missing "
+                "(fields with a value are all kept).")
+        else:
+            self._detail(OK, f"Field configuration readable for all {readable} issue type(s)")
+
+    # Detailed results are printed as they come, and also counted in the status.
+    def _detail(self, status: str, message: str) -> None:
+        report(status, f"  {message}")
+
+    def _detail_warn(self, message: str) -> None:
+        self._warn(message)
+        report(WARN, f"  {message}")
 
 
-def use_project_venv(project_root: Path) -> None:
-    """Re-run the current script with ``.venv`` Python if it exists and is not the one running.
-
-    Returns normally (and the script continues with the current Python) when there
-    is no ``.venv`` folder, when it is already the running Python, or when the
-    ``.venv`` Python cannot be started (e.g. blocked by a company policy). Otherwise
-    it never returns: it exits with the exit code of the re-started script.
-    """
-    venv_dir = project_root / ".venv"
-    python = venv_python(project_root)
-    if os.environ.get(_SWITCHED_ENV) or not python.is_file() or _running_in(venv_dir):
+def print_project(check: ProjectCheck) -> None:
+    """Print the result of the quick part of a check."""
+    if check.status == "BLOCKED" and not check.name:
+        report(FAIL, f"Project {check.ref}: {check.problems[0]}")
         return
+    count = "?" if check.issue_count is None else check.issue_count
+    report(INFO, f"Project {check.key} - {check.name}: {count} issue(s) visible")
+    for perm, name in PERMISSION_NAMES.items():
+        value = check.permissions.get(perm)
+        if value is True:
+            report(OK, f"  Permission '{name}'")
+        elif value is False:
+            consequence = ("REQUIRED: the issues cannot be read" if perm == REQUIRED_PERMISSION
+                           else RECOMMENDED_PERMISSIONS[perm])
+            report(FAIL if perm == REQUIRED_PERMISSION else WARN, f"  Permission '{name}' missing", consequence)
+        else:
+            report(WARN, f"  Permission '{name}': unknown")
+    for problem in check.problems:
+        if not problem.startswith("missing permission"):
+            report(FAIL if check.status == "BLOCKED" else WARN, f"  {problem}")
 
-    double_clicked = started_by_double_click()
-    script = str(Path(sys.argv[0]).resolve())
-    env = dict(os.environ, **{_SWITCHED_ENV: "1"})
-    sys.stdout.flush()
+
+# ======================================================================= main
+def check_global() -> tuple[Any, type[Exception]] | None:
+    """Steps 1 to 5. Return (client, JiraError class), or None when a blocking problem was found."""
+    # 1. Python and libraries ------------------------------------------------
+    report(OK, f"Python {platform.python_version()} on {platform.system()} {platform.release()}")
+    missing = []
+    for package in ("requests", "reportlab", "pillow", "pip-system-certs"):
+        version = package_version(package)
+        if version:
+            report(OK, f"Library {package} {version}")
+        else:
+            missing.append(package)
+            report(FAIL if package != "pip-system-certs" else WARN, f"Library {package} is not installed",
+                   "Run the installation again: py install.py   (see README.md, section 1)")
+    if any(p != "pip-system-certs" for p in missing):
+        return None
+
+    # 2. Configuration -------------------------------------------------------
     try:
-        # Fixed program (our own .venv Python) and our own script: no shell, no user-built command.
-        process = subprocess.Popen([str(python), script, *sys.argv[1:]], env=env)  # noqa: S603
+        settings = load_settings(PROJECT_ROOT)
+    except ConfigError as exc:
+        report(FAIL, "Configuration", str(exc))
+        return None
+    report(OK, f"Configuration loaded: JIRA_BASE_URL = {settings.base_url}")
+    report(OK, f"Token present ({len(settings.token)} characters, not displayed for security)")
+
+    from jira_archiver.jira_client import JiraClient, JiraError  # needs "requests", checked above
+
+    client = JiraClient(settings)
+
+    # 3. Server reachable + certificate --------------------------------------
+    try:
+        info = client.server_info()
+    except JiraError as exc:
+        hint = ("Check the URL in .env, that you are on the company network (or VPN), "
+                "and that 'pip_system_certs' is installed for the internal certificate.")
+        report(FAIL, f"Cannot reach the Jira server: {exc}", hint)
+        return None
+    security = "HTTPS certificate valid" if settings.base_url.startswith("https://") else "WARNING: not HTTPS"
+    report(OK, f"Server reachable ({security}): {info.get('serverTitle', 'Jira')} "
+               f"version {info.get('version')} ({info.get('deploymentType', 'unknown type')})")
+    if not str(info.get("version", "")).startswith("11."):
+        report(WARN, "This tool was written for Jira Data Center 11.x; other versions may differ.")
+
+    # 4. Token valid ------------------------------------------------------------
+    try:
+        me = client.myself()
+    except JiraError as exc:
+        report(FAIL, f"Authentication refused: {exc}",
+               "Create a new Personal Access Token in Jira (Profile > Personal Access Tokens) "
+               "and put it in .env (JIRA_PAT=...).")
+        return None
+    report(OK, f"Authenticated as {me.get('displayName')} ({me.get('name')})")
+
+    # 5. Global rights: information only, NOT required --------------------------
+    try:
+        perms = client.get_json(f"{client.API}/mypermissions", {"permissions": "ADMINISTER,SYSTEM_ADMIN"})
+        granted = perms.get("permissions") or {}
+
+        def yes_no(key: str) -> str:
+            return "yes" if (granted.get(key) or {}).get("havePermission") else "no"
+
+        report(INFO, f"Global rights: 'Jira Administrators' = {yes_no('ADMINISTER')}, "
+                     f"'Jira System Administrators' = {yes_no('SYSTEM_ADMIN')}",
+               "Not required: what matters are the permissions on each project (checked per project).")
+    except JiraError as exc:
+        report(INFO, f"Global rights could not be read ({exc})",
+               "Not required: what matters are the permissions on each project (checked per project).")
+    return client, JiraError
+
+
+def check_project_list(client: Any, error_class: type[Exception], projects: list[str], output_dir: Path) -> int:
+    """Quick check of many projects, with a CSV report. Return the number of BLOCKED projects."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = output_dir / f"project_check_{datetime.now():%Y%m%d_%H%M%S}.csv"
+    counts = {"OK": 0, "WARNING": 0, "BLOCKED": 0}
+    print("-" * 60)
+    print(f"Quick check of {len(projects)} project(s). Report: {csv_path}")
+    # utf-8-sig + ";" so that Excel (French/German settings too) opens the file correctly.
+    with csv_path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.writer(handle, delimiter=";")
+        writer.writerow(["project", "name", "issues", "status", *PERMISSION_NAMES.values(), "details"])
+        for number, ref in enumerate(projects, start=1):
+            check = ProjectCheck(client, error_class, ref)
+            check.run_quick()
+            counts[check.status] += 1
+            count = "?" if check.issue_count is None else check.issue_count
+            print(f"  {number:>5}/{len(projects)}  {check.key:<15} {check.status:<8} {count:>7} issue(s)"
+                  + (f"  - {check.problems[0]}" if check.problems else ""))
+            writer.writerow([
+                check.key, check.name, "" if check.issue_count is None else check.issue_count, check.status,
+                *[{True: "yes", False: "NO", None: "?"}[check.permissions.get(p)] for p in PERMISSION_NAMES],
+                " | ".join(check.problems),
+            ])
+            handle.flush()  # the report stays usable even if the check is stopped in the middle
+    print("-" * 60)
+    print(f"Projects: {counts['OK']} OK, {counts['WARNING']} with warnings, {counts['BLOCKED']} BLOCKED.")
+    print(f"Details in: {csv_path}")
+    print("For a project with warnings, run a detailed check: py check_connection.py <KEY>")
+    return counts["BLOCKED"]
+
+
+def main(argv: list[str]) -> int:
+    args = parse_args(argv)
+    print(f"Jira connection check (automatic-jira-archiving {__version__})")
+    print("-" * 60)
+
+    try:
+        projects_detailed = read_project_list(args.projects)
+        projects_quick = read_project_list([], args.file) if args.file else []
     except OSError as exc:
-        print(f"[WARN] Could not start the Python of the .venv folder ({exc}).")
-        print("       Continuing with the current Python. If this keeps happening, see")
-        print('       "Installation without .venv" in README.md.')
-        return
+        report(FAIL, f"Cannot read the project list file: {exc}")
+        return 1
+    invalid = [p for p in projects_detailed + projects_quick if not is_valid_project_ref(p)]
+    if invalid:
+        report(FAIL, f"Invalid project key(s): {', '.join(invalid)}")
+        return 1
 
-    while True:
+    result = check_global()
+    if result is None:
+        return 1
+    client, error_class = result
+    failed = False
+
+    # 6. Detailed check of the projects given on the command line ---------------
+    for ref in projects_detailed:
+        print("-" * 60)
+        check = ProjectCheck(client, error_class, ref)
+        check.run_quick()
+        print_project(check)
+        if check.status != "BLOCKED":
+            check.run_detailed()
+        report({"OK": OK, "WARNING": WARN, "BLOCKED": FAIL}[check.status],
+               f"Project {check.key}: {check.status}"
+               + (" - can be archived" if check.status == "OK" else "")
+               + (" - can be archived, but read the warnings above" if check.status == "WARNING" else "")
+               + (" - CANNOT be archived with this account" if check.status == "BLOCKED" else ""))
+        failed = failed or check.status == "BLOCKED"
+
+    # 7. Quick check of a project list ------------------------------------------
+    if projects_quick:
+        # Same rule as the archive: one run at a time, so that the load on Jira stays low.
+        lock = SingleInstanceLock(PROJECT_ROOT / ".archiver.lock")
+        if not lock.acquire():
+            report(FAIL, "An archive run is in progress on this installation: try again when it is finished.")
+            return 1
         try:
-            exit_code = process.wait()
-            break
-        except KeyboardInterrupt:
-            # Ctrl+C also reaches the re-started script, which stops cleanly by itself.
-            continue
-    pause_if_double_clicked(double_clicked)
-    sys.exit(exit_code)
+            output_dir = load_settings(PROJECT_ROOT).output_dir
+            failed = check_project_list(client, error_class, projects_quick, output_dir) > 0 or failed
+        finally:
+            lock.release()
+
+    print("-" * 60)
+    print(f"Load on Jira: {client.stats()}")
+    if not projects_detailed and not projects_quick:
+        print("Connection OK. To check the permissions on a project:  py check_connection.py <PROJECT KEY>")
+    elif failed:
+        print("Some projects CANNOT be archived with this account: see [FAIL] above.")
+        return 1
+    else:
+        print("All checks done. You can run: py archive_project.py <PROJECT KEY>")
+    return 0
+
+
+if __name__ == "__main__":
+    _double_clicked = started_by_double_click()
+    _exit_code = main(sys.argv[1:])
+    pause_if_double_clicked(_double_clicked)
+    sys.exit(_exit_code)
