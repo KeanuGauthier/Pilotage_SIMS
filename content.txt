@@ -1,291 +1,228 @@
-/* automatic-jira-archiving - offline viewer layout. Colors and spacing are close to Jira Data Center. */
+"""Assemble the final archive: ``project.json``, ``manifest.json``, ``README.txt`` and the ZIP file.
 
-:root {
-  --text: #172b4d;
-  --text-subtle: #5e6c84;
-  --link: #0052cc;
-  --border: #dfe1e6;
-  --border-strong: #c1c7d0;
-  --background: #ffffff;
-  --background-subtle: #f4f5f7;
-  --background-hover: #ebecf0;
-  --header: #0747a6;
-  --header-hover: #0052cc;
-  --selected: #deebff;
-  --font: "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, Roboto, "Helvetica Neue", Arial, sans-serif;
-  --mono: Consolas, "SFMono-Regular", Menlo, "Courier New", monospace;
-  color-scheme: light;
-}
+Final ZIP layout::
 
-* { box-sizing: border-box; }
-html, body { margin: 0; padding: 0; }
-body { font-family: var(--font); font-size: 14px; line-height: 1.43; color: var(--text); background: var(--background); }
-a { color: var(--link); text-decoration: none; }
-a:hover { text-decoration: underline; }
-a.external::after { content: " \2197"; font-size: 0.85em; color: var(--text-subtle); }
-h1, h2, h3 { font-weight: 500; }
-button, input, select { font: inherit; color: inherit; }
-:focus-visible { outline: 2px solid #4c9aff; outline-offset: 1px; }
-[hidden] { display: none !important; }
+    <KEY>_jira_archive_<YYYYMMDD>.zip
+    └── <KEY>_jira_archive_<YYYYMMDD>/
+        ├── OPEN_ARCHIVE.html   offline web viewer: double-click it (after extracting the ZIP)
+        ├── README.txt          plain-language description of the archive
+        ├── project.json        all project + issue data (see docs/ARCHIVE_FORMAT.md)
+        ├── manifest.json       inventory of every file with its SHA-256 fingerprint
+        ├── pdf/<KEY>-<n>.pdf   one PDF per issue
+        ├── attachments/<KEY>-<n>/<id>_<file name>
+        └── viewer/             program and data of the web viewer (see viewer.py)
 
-.muted { color: var(--text-subtle); }
-.small { font-size: 12px; }
-.nowrap { white-space: nowrap; }
-.num { text-align: right; white-space: nowrap; }
-.pre-wrap { white-space: pre-wrap; overflow-wrap: anywhere; }
-.break { overflow-wrap: anywhere; }
+A ``<zip name>.sha256`` file is written next to the ZIP to check it was not
+corrupted (e.g. after copying it to the archive storage).
+"""
 
-/* ---------------------------------------------------------------- top bar */
-.topbar { position: sticky; top: 0; z-index: 10; display: flex; align-items: center; gap: 8px; height: 48px;
-  padding: 0 16px; background: var(--header); color: #fff; }
-.brand { display: flex; align-items: center; gap: 8px; color: #fff; font-weight: 600; font-size: 15px; padding: 6px 8px;
-  border-radius: 3px; white-space: nowrap; }
-.brand:hover, .topnav-link:hover { background: var(--header-hover); text-decoration: none; }
-.brand-icon { width: 20px; height: 20px; display: block; }
-.topnav { display: flex; gap: 2px; }
-.topnav-link { color: #deebff; padding: 6px 10px; border-radius: 3px; }
-.topnav-link.active { color: #fff; background: rgba(255, 255, 255, 0.16); }
-.topbar-spacer { flex: 1; }
-.quick-search { width: 240px; max-width: 32vw; padding: 5px 10px; border-radius: 3px; border: 1px solid transparent;
-  background: rgba(255, 255, 255, 0.2); color: #fff; }
-.quick-search::placeholder { color: #deebff; }
-.quick-search:focus { background: #fff; color: var(--text); outline: none; }
-.readonly-badge { font-size: 11px; font-weight: 700; text-transform: uppercase; padding: 2px 6px; border-radius: 3px;
-  background: #ffab00; color: #172b4d; white-space: nowrap; }
+from __future__ import annotations
 
-/* ---------------------------------------------------------------- sidebar */
-.layout { display: flex; min-height: calc(100vh - 48px); }
-.sidebar { flex: 0 0 240px; background: var(--background-subtle); border-right: 1px solid var(--border); padding: 20px 12px;
-  display: flex; flex-direction: column; position: sticky; top: 48px; height: calc(100vh - 48px); overflow-y: auto; }
-.sidebar-project { display: flex; gap: 10px; align-items: center; padding: 0 8px 20px; }
-.sidebar-project-name { font-weight: 600; overflow-wrap: anywhere; }
-.sidenav { display: flex; flex-direction: column; gap: 2px; }
-.sidenav-link { color: var(--text); padding: 8px 12px; border-radius: 3px; }
-.sidenav-link:hover { background: var(--background-hover); text-decoration: none; }
-.sidenav-link.active { background: var(--selected); color: var(--link); font-weight: 600; }
-.sidebar-footer { margin-top: auto; padding: 16px 8px 0; }
+import json
+import os
+import textwrap
+import zipfile
+from collections.abc import Iterator
+from pathlib import Path
+from typing import Any
 
-.content { flex: 1; min-width: 0; padding: 24px 32px 48px; }
-.content:focus { outline: none; }
+from . import ARCHIVE_FORMAT_VERSION, __version__
+from .exporter import ExportResult
+from .logging_setup import get_logger
+from .utils import atomic_write_json, issue_sort_key, read_json, sha256_file, utc_now
+from .viewer import ENTRY_PAGE, build_viewer
 
-/* ---------------------------------------------------------------- common */
-.page-header { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; margin-bottom: 16px; }
-.page-header h1 { font-size: 24px; margin: 0; flex: 1; }
-.columns { display: flex; gap: 32px; align-items: flex-start; }
-.column-main { flex: 1; min-width: 0; }
-.column-side { flex: 0 0 340px; min-width: 0; }
-.module { margin-bottom: 24px; }
-.module-title { font-size: 16px; font-weight: 600; margin: 0 0 8px; padding-bottom: 6px; border-bottom: 1px solid var(--border);
-  display: flex; align-items: center; gap: 8px; }
-.count { display: inline-block; min-width: 20px; padding: 0 6px; border-radius: 10px; background: var(--background-hover);
-  color: var(--text); font-size: 12px; font-weight: 600; text-align: center; }
+log = get_logger("package")
 
-.button { display: inline-flex; align-items: center; gap: 4px; padding: 4px 10px; border-radius: 3px; border: none;
-  background: rgba(9, 30, 66, 0.06); color: var(--text); cursor: pointer; white-space: nowrap; font-size: 14px; }
-.button:hover { background: rgba(9, 30, 66, 0.12); text-decoration: none; }
-.button.selected { background: var(--text); color: #fff; }
-.button.disabled, .button:disabled { opacity: 0.45; pointer-events: none; }
-.button-subtle { background: transparent; color: var(--link); }
 
-.message { border-radius: 3px; padding: 10px 14px; margin: 8px 0 16px; }
-.message ul { margin: 6px 0 0; padding-left: 20px; }
-.message p { margin: 0; }
-.message-info { background: #deebff; }
-.message-warning { background: #fffae6; border-left: 4px solid #ffab00; }
-.message-error { background: #ffebe6; border-left: 4px solid #de350b; }
+def _dump(value: Any, indent_level: int) -> str:
+    """JSON-encode *value* and indent it so it can be embedded at *indent_level*."""
+    text = json.dumps(value, ensure_ascii=False, indent=2)
+    return text.replace("\n", "\n" + "  " * indent_level)
 
-.lozenge { display: inline-block; padding: 0 5px; border-radius: 3px; font-size: 11px; font-weight: 700; line-height: 18px;
-  text-transform: uppercase; white-space: nowrap; max-width: 220px; overflow: hidden; text-overflow: ellipsis; vertical-align: middle;
-  background: #dfe1e6; color: #42526e; }
-.lozenge-indeterminate { background: #deebff; color: #0747a6; }
-.lozenge-done { background: #e3fcef; color: #006644; }
 
-.icon { display: inline-flex; vertical-align: middle; flex: 0 0 auto; }
-.icon svg { width: 16px; height: 16px; display: block; }
-.with-icon { display: inline-flex; align-items: center; gap: 6px; }
-.avatar { display: inline-block; flex: 0 0 auto; width: 32px; height: 32px; line-height: 32px; border-radius: 50%; color: #fff;
-  font-size: 13px; font-weight: 600; text-align: center; vertical-align: middle; user-select: none; }
-.avatar-small { width: 24px; height: 24px; line-height: 24px; font-size: 10px; }
-.project-avatar { border-radius: 4px; }
-.user { display: inline-flex; align-items: center; gap: 6px; vertical-align: middle; }
-.value-list { display: inline-flex; flex-wrap: wrap; gap: 4px 10px; }
-.issue-link.done { text-decoration: line-through; }
-.external-issue { color: var(--text-subtle); }
-.labels { display: inline-flex; flex-wrap: wrap; gap: 4px; }
-.label { padding: 0 6px; border: 1px solid var(--border-strong); border-radius: 3px; font-size: 12px; }
+def _issue_files(result: ExportResult) -> Iterator[Path]:
+    keys = sorted((item["key"] for item in result.inventory), key=issue_sort_key)
+    for key in keys:
+        yield result.paths.issues / f"{key}.json"
 
-.info-table { border-collapse: collapse; width: 100%; }
-.info-table th { text-align: left; font-weight: 400; color: var(--text-subtle); padding: 5px 12px 5px 0; vertical-align: top;
-  width: 160px; }
-.column-side .info-table th { width: 40%; }
-.info-table td { padding: 5px 0; vertical-align: top; overflow-wrap: anywhere; }
-.info-table.roles th { width: 35%; }
-.actor { display: inline-block; margin: 0 8px 2px 0; }
 
-/* ---------------------------------------------------------------- summary page */
-.project-header { display: flex; align-items: center; gap: 16px; margin-bottom: 20px; }
-.project-header h1 { margin: 0; font-size: 26px; }
-.stats { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 24px; }
-.stat { flex: 1 1 140px; border: 1px solid var(--border); border-radius: 4px; padding: 12px 16px; color: var(--text); }
-a.stat:hover { border-color: var(--link); text-decoration: none; }
-.stat-value { font-size: 24px; font-weight: 600; }
-.stat-label { color: var(--text-subtle); }
-.bar-list { border-collapse: collapse; width: 100%; }
-.bar-list td { padding: 4px 8px 4px 0; }
-.bar-label { width: 40%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 260px; }
-.bar-cell { width: 50%; }
-.bar { display: block; height: 8px; border-radius: 4px; background: #4c9aff; }
-.bar-count { text-align: right; width: 10%; }
+def project_header(result: ExportResult, jira_info: dict[str, Any], generated_at: str) -> dict[str, Any]:
+    """Everything ``project.json`` contains, except the issues."""
+    metadata = result.metadata
+    used_fields: set[str] = set()
+    for path in _issue_files(result):
+        used_fields.update(read_json(path)["fields"].keys())
+    for issue_type in metadata["issue_types"]:
+        used_fields.update(f.get("fieldId") for f in issue_type.get("create_screen_fields") or [])
 
-/* ---------------------------------------------------------------- issue list */
-.filters { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 16px; }
-.filter-search { flex: 1 1 280px; padding: 6px 10px; border: 2px solid var(--border); border-radius: 3px; background: var(--background-subtle); }
-.filter-search:focus { border-color: #4c9aff; background: #fff; outline: none; }
-.filter-select { max-width: 220px; padding: 5px 6px; border: 1px solid var(--border); border-radius: 3px; background: var(--background-subtle); cursor: pointer; }
-.filter-select.active { background: var(--selected); border-color: #4c9aff; color: var(--link); }
-.chip { display: inline-flex; align-items: center; gap: 4px; padding: 2px 4px 2px 8px; border-radius: 3px; background: var(--selected); color: var(--link); }
-.chip-remove { border: none; background: transparent; color: inherit; cursor: pointer; font-size: 16px; line-height: 1; padding: 0 4px; }
-.table-scroll { overflow-x: auto; }
-.issue-table, .data-table { border-collapse: collapse; width: 100%; }
-.issue-table th, .data-table th { text-align: left; font-size: 12px; color: var(--text-subtle); font-weight: 600; border-bottom: 2px solid var(--border);
-  padding: 6px 8px; white-space: nowrap; }
-.issue-table td, .data-table td { border-bottom: 1px solid var(--border); padding: 6px 8px; vertical-align: middle; }
-.data-table td { vertical-align: top; }
-.issue-table tbody tr:hover, .data-table tbody tr:hover { background: var(--background-subtle); }
-.issue-table th button { border: none; background: none; padding: 0; cursor: pointer; font-weight: 600; color: inherit; }
-.issue-table th.sorted { color: var(--text); }
-.issue-table .col-type, .issue-table .col-priority { width: 28px; text-align: center; }
-.issue-table .col-key { white-space: nowrap; }
-.issue-table .col-summary { min-width: 260px; }
-.issue-table .col-created, .issue-table .col-updated, .issue-table .col-assignee, .issue-table .col-reporter { white-space: nowrap; }
-.summary-link { color: var(--text); }
-.parent-ref { color: var(--text-subtle); }
-.pager { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; padding: 12px 0; }
-.view-switch { display: inline-flex; gap: 4px; }
+    return {
+        "archive": {
+            "format_version": ARCHIVE_FORMAT_VERSION,
+            "generated_at": generated_at,
+            "export_started_at": metadata["export_started_at"],
+            "tool": f"automatic-jira-archiving {__version__}",
+            "jira": jira_info,
+            "issue_count": len(result.inventory),
+            "warnings": metadata.get("warnings", []),
+        },
+        "project": metadata["project"],
+        "components": metadata["components"],
+        "versions": metadata["versions"],
+        "roles": metadata["roles"],
+        "schemes": {
+            "permission": metadata["permission_scheme"],
+            "notification": metadata["notification_scheme"],
+            "issue_security": metadata["issue_security_scheme"],
+        },
+        "statuses_by_issue_type": metadata["statuses_by_issue_type"],
+        "issue_types": metadata["issue_types"],
+        "fields": {fid: info for fid, info in sorted(metadata["field_catalog"].items()) if fid in used_fields},
+    }
 
-/* ---------------------------------------------------------------- board */
-.board-scroll { overflow-x: auto; padding-bottom: 8px; }
-.board { display: flex; gap: 8px; align-items: flex-start; }
-.board-column { flex: 0 0 270px; background: var(--background-subtle); border-radius: 4px; padding: 8px; }
-.board-column-title { display: flex; align-items: center; justify-content: space-between; margin: 2px 4px 10px; font-size: 14px; }
-.board-cards { display: flex; flex-direction: column; gap: 6px; }
-.card { display: block; background: #fff; border-radius: 3px; padding: 8px 10px; color: var(--text);
-  box-shadow: 0 1px 2px rgba(9, 30, 66, 0.25); }
-.card:hover { background: var(--background-subtle); text-decoration: none; }
-.card-summary { margin-bottom: 8px; overflow-wrap: anywhere; }
-.card-footer { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-subtle); }
-.card-key.done { text-decoration: line-through; }
-.board-more { display: block; padding: 6px; text-align: center; font-size: 12px; }
 
-/* ---------------------------------------------------------------- issue page */
-.breadcrumbs { color: var(--text-subtle); font-size: 13px; margin-bottom: 6px; }
-.breadcrumbs a { color: var(--text-subtle); }
-.issue-summary { display: flex; align-items: flex-start; gap: 10px; font-size: 24px; margin: 0 0 12px; overflow-wrap: anywhere; }
-.issue-summary .icon { margin-top: 8px; }
-.toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 20px; }
-.issue-nav { display: inline-flex; align-items: center; gap: 8px; }
-.details { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 2px 24px; margin: 0; }
-.detail { display: flex; gap: 8px; padding: 3px 0; min-width: 0; }
-.detail dt { flex: 0 0 140px; color: var(--text-subtle); overflow-wrap: anywhere; }
-.detail dd { margin: 0; flex: 1; min-width: 0; overflow-wrap: anywhere; }
+def write_project_json(result: ExportResult, header: dict[str, Any]) -> Path:
+    """Write ``project.json`` by streaming the issues one by one (works for very large projects)."""
+    target = result.paths.archive / "project.json"
+    tmp = target.with_name(target.name + ".part")
+    with tmp.open("w", encoding="utf-8", newline="\n") as handle:
+        handle.write("{\n")
+        for name, value in header.items():
+            handle.write(f"  {json.dumps(name)}: {_dump(value, 1)},\n")
+        handle.write('  "issues": [')
+        first = True
+        for path in _issue_files(result):
+            handle.write("\n    " if first else ",\n    ")
+            handle.write(_dump(read_json(path), 2))
+            first = False
+        handle.write("\n  ]\n}\n")
+    os.replace(tmp, target)
+    return target
 
-.attachments { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 10px; }
-.attachment { display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: 3px; overflow: hidden; color: var(--text); }
-a.attachment:hover { border-color: var(--link); text-decoration: none; }
-.attachment-preview { height: 110px; display: flex; align-items: center; justify-content: center; background: var(--background-subtle); }
-.attachment-preview img { max-width: 100%; max-height: 110px; object-fit: contain; }
-.file-ext { font-weight: 700; font-size: 18px; color: var(--text-subtle); }
-.attachment-meta { padding: 6px 8px; }
-.attachment-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.attachment.missing { opacity: 0.75; }
-.attachment-status { padding: 0 8px 6px; font-size: 12px; color: #bf2600; }
 
-.link-table { border-collapse: collapse; width: 100%; }
-.link-table th { text-align: left; font-weight: 400; color: var(--text-subtle); white-space: nowrap; padding: 4px 12px 4px 0; vertical-align: middle; width: 1%; }
-.link-table td { padding: 4px 8px 4px 0; border-bottom: 1px solid var(--border); vertical-align: middle; }
-.link-table .col-type, .link-table .col-priority, .link-table .col-number { width: 24px; }
-.link-table .col-key, .link-table .col-status { white-space: nowrap; width: 1%; }
-.web-links { margin: 0; padding-left: 20px; }
-.web-links li { margin-bottom: 6px; }
+def write_readme(result: ExportResult, generated_at: str, base_url: str) -> Path:
+    project = result.metadata["project"]
+    text = textwrap.dedent(f"""\
+        JIRA PROJECT ARCHIVE
+        ====================
 
-.time-tracking .tt-row { margin-bottom: 8px; }
-.tt-label { display: flex; justify-content: space-between; font-size: 13px; }
-.tt-track { display: flex; height: 6px; border-radius: 3px; background: var(--background-hover); overflow: hidden; margin-top: 2px; }
-.tt-bar { display: block; height: 100%; }
-.tt-estimate { background: #4c9aff; }
-.tt-spent { background: #36b37e; }
-.tt-remaining { background: #ffab00; }
+        Project      : {project.get('name')} ({project.get('key')})
+        Source       : {base_url}
+        Archived on  : {generated_at} (UTC)
+        Issues       : {len(result.inventory)}
+        Created with : automatic-jira-archiving {__version__}
 
-.tabs { display: flex; gap: 4px; border-bottom: 2px solid var(--border); margin-bottom: 12px; }
-.tab { border: none; background: none; padding: 6px 10px; margin-bottom: -2px; border-bottom: 2px solid transparent; cursor: pointer;
-  color: var(--text-subtle); display: inline-flex; gap: 6px; align-items: center; }
-.tab:hover { color: var(--text); }
-.tab.selected { color: var(--link); border-bottom-color: var(--link); }
-.action { border-bottom: 1px solid var(--border); padding: 10px 0; }
-.action-header { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; color: var(--text-subtle); }
-.action-header strong { color: var(--text); }
-.action-body { padding: 6px 0 0 30px; min-width: 0; }
-.restricted { padding: 0 6px; border-radius: 3px; background: #ffebe6; color: #bf2600; font-size: 12px; }
-.history-table { border-collapse: collapse; width: 100%; table-layout: fixed; }
-.history-table th { text-align: left; font-size: 12px; color: var(--text-subtle); font-weight: 600; padding: 2px 8px 2px 0; }
-.history-table th:first-child { width: 22%; }
-.history-table td { vertical-align: top; padding: 2px 8px 2px 0; }
-.history-field { font-weight: 600; overflow-wrap: anywhere; }
-.change-value { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 220px; overflow-y: auto; }
+        HOW TO OPEN THE ARCHIVE
+        -----------------------
+        1. Extract the ZIP file first: right-click it, choose "Extract All...",
+           then "Extract". (Opening the ZIP without extracting it does not work.)
+        2. In the extracted folder, double-click {ENTRY_PAGE}.
+           The project opens in your web browser: issues, search, board,
+           comments, history, attachments... Nothing to install, no Internet
+           needed, nothing is sent anywhere.
 
-/* ---------------------------------------------------------------- rich text (HTML written by Jira) */
-.rich { overflow-wrap: anywhere; min-width: 0; }
-.rich a:not([href]) { color: inherit; }
-.rich.plain { white-space: pre-wrap; }
-.rich > :first-child { margin-top: 0; }
-.rich > :last-child { margin-bottom: 0; }
-.rich p { margin: 0 0 10px; }
-.rich h1 { font-size: 22px; } .rich h2 { font-size: 19px; } .rich h3 { font-size: 17px; }
-.rich h4, .rich h5, .rich h6 { font-size: 15px; }
-.rich ul, .rich ol { padding-left: 24px; margin: 0 0 10px; }
-.rich blockquote { margin: 0 0 10px; padding-left: 12px; border-left: 2px solid var(--border-strong); color: var(--text-subtle); }
-.rich pre, .rich code, .rich tt { font-family: var(--mono); font-size: 12px; }
-.rich pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; }
-.rich .code, .rich .preformatted, .rich .panel { border: 1px solid var(--border); border-radius: 3px; margin: 0 0 10px; background: var(--background-subtle); }
-.rich .panel { background: transparent; }
-.rich .codeHeader, .rich .preformattedHeader, .rich .panelHeader { padding: 4px 10px; border-bottom: 1px solid var(--border); font-weight: 600; }
-.rich .codeContent, .rich .preformattedContent, .rich .panelContent { padding: 8px 10px; }
-.rich .code-keyword { color: #0052cc; } .rich .code-quote { color: #00875a; } .rich .code-comment { color: #6b778c; font-style: italic; }
-.rich .code-object { color: #6554c0; } .rich .code-tag { color: #de350b; }
-.rich .table-wrap { overflow-x: auto; margin: 0 0 10px; }
-.rich table { border-collapse: collapse; }
-.rich th, .rich td { border: 1px solid var(--border-strong); padding: 4px 8px; vertical-align: top; text-align: left; }
-.rich th { background: var(--background-subtle); font-weight: 600; }
-.rich hr { border: none; border-top: 1px solid var(--border); }
-.rich .aui-message, .rich .information-macro { padding: 8px 12px; border-radius: 3px; background: var(--selected); margin: 0 0 10px; }
-.rich .aui-message.warning, .rich .information-macro-warning { background: #fffae6; }
-.rich .aui-message.error, .rich .information-macro-note { background: #ffebe6; }
-.rich .aui-message.success, .rich .information-macro-tip { background: #e3fcef; }
-.rich .error { color: #bf2600; }
-.rich-image { max-width: 100%; height: auto; border: 1px solid var(--border); }
-.missing-image { display: inline-block; padding: 2px 6px; border: 1px dashed var(--border-strong); border-radius: 3px; color: var(--text-subtle); font-size: 12px; }
+        CONTENTS
+        --------
+        {ENTRY_PAGE}
+                       The archive viewer (see above).
+        project.json   All the data of the project and of every issue (fields,
+                       comments, work logs, history, links, attachments list...).
+                       Text format, readable with any text editor or JSON viewer.
+        pdf/           One PDF per issue, ready to read or print.
+        attachments/   The files attached to the issues, one folder per issue.
+        viewer/        The program and data used by {ENTRY_PAGE}.
+        manifest.json  The list of every file of this archive with its SHA-256
+                       fingerprint, to prove nothing was changed or corrupted.
 
-/* ---------------------------------------------------------------- small screens */
-@media (max-width: 1100px) {
-  .columns { flex-direction: column; }
-  .column-side { flex: 1 1 auto; width: 100%; }
-}
-@media (max-width: 800px) {
-  .layout { display: block; }
-  .sidebar { position: static; height: auto; flex-direction: row; flex-wrap: wrap; align-items: center; padding: 8px 16px; }
-  .sidebar-project { padding: 0 8px 0 0; }
-  .sidenav { flex-direction: row; flex-wrap: wrap; }
-  .sidebar-footer { display: none; }
-  .content { padding: 16px; }
-  .topnav, .readonly-badge { display: none; }
-  .quick-search { max-width: 45vw; }
-  .detail dt { flex-basis: 110px; }
-}
+        HOW TO CHECK THE ARCHIVE IS INTACT
+        ----------------------------------
+        Each file has a "sha256" value in manifest.json. On Windows, run in PowerShell:
+            Get-FileHash .\\pdf\\{project.get('key')}-1.pdf -Algorithm SHA256
+        The value displayed must be identical to the one in manifest.json
+        (upper case / lower case does not matter).
+        """)
+    target = result.paths.archive / "README.txt"
+    target.write_text(text.replace("\n", "\r\n"), encoding="utf-8")
+    return target
 
-/* ---------------------------------------------------------------- printing */
-@media print {
-  .topbar, .sidebar, .toolbar, .filters, .pager, .tabs { display: none !important; }
-  .content { padding: 0; }
-  .columns { display: block; }
-  a.external::after { content: ""; }
-}
+
+def write_manifest(result: ExportResult, jira_info: dict[str, Any], generated_at: str) -> Path:
+    archive_dir = result.paths.archive
+    files = []
+    attachment_count = 0
+    attachment_bytes = 0
+    for path in sorted(p for p in archive_dir.rglob("*") if p.is_file() and p.name != "manifest.json"):
+        relative = path.relative_to(archive_dir).as_posix()
+        size = path.stat().st_size
+        files.append({"path": relative, "size": size, "sha256": sha256_file(path)})
+        if relative.startswith("attachments/"):
+            attachment_count += 1
+            attachment_bytes += size
+
+    notes = {}
+    for issue_path in _issue_files(result):
+        record = read_json(issue_path)
+        if record.get("archive_notes"):
+            notes[record["key"]] = record["archive_notes"]
+
+    manifest = {
+        "format_version": ARCHIVE_FORMAT_VERSION,
+        "generated_at": generated_at,
+        "tool": f"automatic-jira-archiving {__version__}",
+        "jira": jira_info,
+        "project": {"id": result.metadata["project"].get("id"), "key": result.project_key,
+                    "name": result.metadata["project"].get("name")},
+        "counts": {
+            "issues": len(result.inventory),
+            "pdf_files": sum(1 for f in files if f["path"].startswith("pdf/")),
+            "attachments": attachment_count,
+            "attachment_bytes": attachment_bytes,
+        },
+        "warnings": result.metadata.get("warnings", []),
+        "issue_notes": notes,
+        "files": files,
+    }
+    target = archive_dir / "manifest.json"
+    atomic_write_json(target, manifest)
+    return target
+
+
+def build_zip(result: ExportResult, output_dir: Path, date_tag: str) -> Path:
+    """Zip the archive folder, verify the ZIP, and write its SHA-256 next to it."""
+    name = f"{result.project_key}_jira_archive_{date_tag}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    zip_path = output_dir / f"{name}.zip"
+    tmp = zip_path.with_name(zip_path.name + ".part")
+
+    archive_dir = result.paths.archive
+    with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as zf:
+        for path in sorted(archive_dir.rglob("*")):
+            if path.is_file() and not path.is_symlink() and not path.name.endswith(".part"):
+                zf.write(path, f"{name}/{path.relative_to(archive_dir).as_posix()}")
+
+    log.info("[%s] Verifying the ZIP file...", result.project_key)
+    with zipfile.ZipFile(tmp) as zf:
+        broken = zf.testzip()
+        if broken:
+            raise RuntimeError(f"ZIP verification failed on {broken}")
+    os.replace(tmp, zip_path)
+
+    digest = sha256_file(zip_path)
+    (output_dir / f"{zip_path.name}.sha256").write_text(f"{digest}  {zip_path.name}\n", encoding="utf-8")
+    return zip_path
+
+
+def package(result: ExportResult, jira_info: dict[str, Any], output_dir: Path, base_url: str) -> Path:
+    """Create every archive file and the final ZIP. Returns the ZIP path."""
+    now = utc_now()
+    generated_at = now.isoformat()
+    log.info("[%s] Writing project.json...", result.project_key)
+    header = project_header(result, jira_info, generated_at)
+    write_project_json(result, header)
+    log.info("[%s] Writing the archive viewer (%s)...", result.project_key, ENTRY_PAGE)
+    build_viewer(result.paths.archive, header, _issue_files(result))
+    write_readme(result, generated_at, base_url)
+    log.info("[%s] Writing manifest.json (computing fingerprints)...", result.project_key)
+    write_manifest(result, jira_info, generated_at)
+    log.info("[%s] Creating the ZIP file...", result.project_key)
+    return build_zip(result, output_dir, now.strftime("%Y%m%d"))
