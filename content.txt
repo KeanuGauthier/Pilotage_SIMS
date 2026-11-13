@@ -1,229 +1,155 @@
-"""Assemble the final archive: ``project.json``, ``manifest.json``, ``README.txt`` and the ZIP file.
-
-Final ZIP layout::
-
-    <KEY>_jira_archive_<YYYYMMDD>.zip
-    └── <KEY>_jira_archive_<YYYYMMDD>/
-        ├── OPEN_ARCHIVE.html   offline web viewer: double-click it (after extracting the ZIP)
-        ├── README.txt          plain-language description of the archive
-        ├── project.json        all project + issue data (see docs/ARCHIVE_FORMAT.md)
-        ├── manifest.json       inventory of every file with its SHA-256 fingerprint
-        ├── attachments/<KEY>-<n>/<id>_<file name>
-        └── viewer/             program and data of the web viewer (see viewer.py)
-
-A ``<zip name>.sha256`` file is written next to the ZIP to check it was not
-corrupted (e.g. after copying it to the archive storage).
-"""
+"""Small, dependency-free helpers (file names, hashing, atomic writes)."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
-import textwrap
-import zipfile
+import re
+import unicodedata
 from collections.abc import Iterator
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
-from . import ARCHIVE_FORMAT_VERSION, __version__
-from .exporter import ExportResult
-from .logging_setup import get_logger
-from .utils import atomic_write_json, issue_sort_key, read_json, sha256_file, utc_now
-from .viewer import ENTRY_PAGE, build_viewer
+T = TypeVar("T")
 
-log = get_logger("package")
+# Names Windows refuses to use as file names, whatever the extension.
+_WINDOWS_RESERVED = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+_FORBIDDEN_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
-
-def _dump(value: Any, indent_level: int) -> str:
-    """JSON-encode *value* and indent it so it can be embedded at *indent_level*."""
-    text = json.dumps(value, ensure_ascii=False, indent=2)
-    return text.replace("\n", "\n" + "  " * indent_level)
-
-
-def _issue_files(result: ExportResult) -> Iterator[Path]:
-    keys = sorted((item["key"] for item in result.inventory), key=issue_sort_key)
-    for key in keys:
-        yield result.paths.issues / f"{key}.json"
+#: Jira project keys: a letter followed by letters, digits or underscores.
+PROJECT_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]{0,254}$")
 
 
-def project_header(result: ExportResult, jira_info: dict[str, Any], generated_at: str) -> dict[str, Any]:
-    """Everything ``project.json`` contains, except the issues."""
-    metadata = result.metadata
-    used_fields: set[str] = set()
-    for path in _issue_files(result):
-        used_fields.update(read_json(path)["fields"].keys())
-    for issue_type in metadata["issue_types"]:
-        used_fields.update(f.get("fieldId") for f in issue_type.get("create_screen_fields") or [])
+def safe_filename(name: str, max_length: int = 100) -> str:
+    """Return a file name that is safe on Windows, macOS and Linux.
 
-    return {
-        "archive": {
-            "format_version": ARCHIVE_FORMAT_VERSION,
-            "generated_at": generated_at,
-            "export_started_at": metadata["export_started_at"],
-            "tool": f"automatic-jira-archiving {__version__}",
-            "jira": jira_info,
-            "issue_count": len(result.inventory),
-            "warnings": metadata.get("warnings", []),
-        },
-        "project": metadata["project"],
-        "components": metadata["components"],
-        "versions": metadata["versions"],
-        "roles": metadata["roles"],
-        "schemes": {
-            "permission": metadata["permission_scheme"],
-            "notification": metadata["notification_scheme"],
-            "issue_security": metadata["issue_security_scheme"],
-        },
-        "statuses_by_issue_type": metadata["statuses_by_issue_type"],
-        "issue_types": metadata["issue_types"],
-        "fields": {fid: info for fid, info in sorted(metadata["field_catalog"].items()) if fid in used_fields},
-        "zephyr": metadata.get("zephyr") or {"installed": False},
-    }
+    Removes path separators (prevents writing outside the target folder),
+    forbidden characters, reserved Windows names, and limits the length while
+    keeping the extension.
+    """
+    name = unicodedata.normalize("NFC", name or "")
+    name = _FORBIDDEN_CHARS.sub("_", name).strip().strip(".")
+    if not name:
+        name = "file"
+    stem, dot, ext = name.rpartition(".")
+    if not dot:
+        stem, ext = name, ""
+    if stem.upper() in _WINDOWS_RESERVED:
+        stem = f"_{stem}"
+    ext = ext[:15]
+    room = max_length - (len(ext) + 1 if ext else 0)
+    stem = stem[: max(room, 1)].rstrip(" .") or "file"
+    return f"{stem}.{ext}" if ext else stem
 
 
-def write_project_json(result: ExportResult, header: dict[str, Any]) -> Path:
-    """Write ``project.json`` by streaming the issues one by one (works for very large projects)."""
-    target = result.paths.archive / "project.json"
-    tmp = target.with_name(target.name + ".part")
-    with tmp.open("w", encoding="utf-8", newline="\n") as handle:
-        handle.write("{\n")
-        for name, value in header.items():
-            handle.write(f"  {json.dumps(name)}: {_dump(value, 1)},\n")
-        handle.write('  "issues": [')
-        first = True
-        for path in _issue_files(result):
-            handle.write("\n    " if first else ",\n    ")
-            handle.write(_dump(read_json(path), 2))
-            first = False
-        handle.write("\n  ]\n}\n")
-    os.replace(tmp, target)
-    return target
+def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    """Compute the SHA-256 fingerprint of a file without loading it in memory."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
-def write_readme(result: ExportResult, generated_at: str, base_url: str) -> Path:
-    project = result.metadata["project"]
-    text = textwrap.dedent(f"""\
-        JIRA PROJECT ARCHIVE
-        ====================
-
-        Project      : {project.get('name')} ({project.get('key')})
-        Source       : {base_url}
-        Archived on  : {generated_at} (UTC)
-        Issues       : {len(result.inventory)}
-        Created with : automatic-jira-archiving {__version__}
-
-        HOW TO OPEN THE ARCHIVE
-        -----------------------
-        1. Extract the ZIP file first: right-click it, choose "Extract All...",
-           then "Extract". (Opening the ZIP without extracting it does not work.)
-        2. In the extracted folder, double-click {ENTRY_PAGE}.
-           The project opens in your web browser: issues, search, board,
-           comments, history, attachments... Nothing to install, no Internet
-           needed, nothing is sent anywhere.
-        3. To get a PDF of an issue: open the issue, click "Print / Save as PDF",
-           then choose "Save as PDF" (or "Microsoft Print to PDF") as printer.
-
-        CONTENTS
-        --------
-        {ENTRY_PAGE}
-                       The archive viewer (see above).
-        project.json   All the data of the project and of every issue (fields,
-                       comments, work logs, history, links, attachments list...).
-                       Text format, readable with any text editor or JSON viewer.
-        attachments/   The files attached to the issues, one folder per issue
-                       (and the files of Zephyr test steps and executions).
-        viewer/        The program and data used by {ENTRY_PAGE}.
-        manifest.json  The list of every file of this archive with its SHA-256
-                       fingerprint, to prove nothing was changed or corrupted.
-
-        HOW TO CHECK THE ARCHIVE IS INTACT
-        ----------------------------------
-        Each file has a "sha256" value in manifest.json. On Windows, run in PowerShell:
-            Get-FileHash .\\project.json -Algorithm SHA256
-        The value displayed must be identical to the one in manifest.json
-        (upper case / lower case does not matter).
-        """)
-    target = result.paths.archive / "README.txt"
-    target.write_text(text.replace("\n", "\r\n"), encoding="utf-8")
-    return target
+def atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Write a file atomically: a crash never leaves a half-written file behind."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".part")
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
 
 
-def write_manifest(result: ExportResult, jira_info: dict[str, Any], generated_at: str) -> Path:
-    archive_dir = result.paths.archive
-    files = []
-    attachment_count = 0
-    attachment_bytes = 0
-    for path in sorted(p for p in archive_dir.rglob("*") if p.is_file() and p.name != "manifest.json"):
-        relative = path.relative_to(archive_dir).as_posix()
-        size = path.stat().st_size
-        files.append({"path": relative, "size": size, "sha256": sha256_file(path)})
-        if relative.startswith("attachments/"):
-            attachment_count += 1
-            attachment_bytes += size
-
-    notes = {}
-    for issue_path in _issue_files(result):
-        record = read_json(issue_path)
-        if record.get("archive_notes"):
-            notes[record["key"]] = record["archive_notes"]
-
-    manifest = {
-        "format_version": ARCHIVE_FORMAT_VERSION,
-        "generated_at": generated_at,
-        "tool": f"automatic-jira-archiving {__version__}",
-        "jira": jira_info,
-        "project": {"id": result.metadata["project"].get("id"), "key": result.project_key,
-                    "name": result.metadata["project"].get("name")},
-        "counts": {
-            "issues": len(result.inventory),
-            "attachments": attachment_count,
-            "attachment_bytes": attachment_bytes,
-        },
-        "warnings": result.metadata.get("warnings", []),
-        "issue_notes": notes,
-        "files": files,
-    }
-    target = archive_dir / "manifest.json"
-    atomic_write_json(target, manifest)
-    return target
+def atomic_write_json(path: Path, data: Any) -> None:
+    """Write *data* as pretty UTF-8 JSON, atomically."""
+    atomic_write_bytes(path, json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"))
 
 
-def build_zip(result: ExportResult, output_dir: Path, date_tag: str) -> Path:
-    """Zip the archive folder, verify the ZIP, and write its SHA-256 next to it."""
-    name = f"{result.project_key}_jira_archive_{date_tag}"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    zip_path = output_dir / f"{name}.zip"
-    tmp = zip_path.with_name(zip_path.name + ".part")
-
-    archive_dir = result.paths.archive
-    with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as zf:
-        for path in sorted(archive_dir.rglob("*")):
-            if path.is_file() and not path.is_symlink() and not path.name.endswith(".part"):
-                zf.write(path, f"{name}/{path.relative_to(archive_dir).as_posix()}")
-
-    log.info("[%s] Verifying the ZIP file...", result.project_key)
-    with zipfile.ZipFile(tmp) as zf:
-        broken = zf.testzip()
-        if broken:
-            raise RuntimeError(f"ZIP verification failed on {broken}")
-    os.replace(tmp, zip_path)
-
-    digest = sha256_file(zip_path)
-    (output_dir / f"{zip_path.name}.sha256").write_text(f"{digest}  {zip_path.name}\n", encoding="utf-8")
-    return zip_path
+def read_json(path: Path) -> Any:
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
-def package(result: ExportResult, jira_info: dict[str, Any], output_dir: Path, base_url: str) -> Path:
-    """Create every archive file and the final ZIP. Returns the ZIP path."""
-    now = utc_now()
-    generated_at = now.isoformat()
-    log.info("[%s] Writing project.json...", result.project_key)
-    header = project_header(result, jira_info, generated_at)
-    write_project_json(result, header)
-    log.info("[%s] Writing the archive viewer (%s)...", result.project_key, ENTRY_PAGE)
-    build_viewer(result.paths.archive, header, _issue_files(result))
-    write_readme(result, generated_at, base_url)
-    log.info("[%s] Writing manifest.json (computing fingerprints)...", result.project_key)
-    write_manifest(result, jira_info, generated_at)
-    log.info("[%s] Creating the ZIP file...", result.project_key)
-    return build_zip(result, output_dir, now.strftime("%Y%m%d"))
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc).replace(microsecond=0)
+
+
+def chunks(items: list[T], size: int) -> Iterator[list[T]]:
+    for start in range(0, len(items), size):
+        yield items[start:start + size]
+
+
+def issue_sort_key(key: str) -> tuple[str, int]:
+    """Sort ``PROJ-2`` before ``PROJ-10``."""
+    prefix, _, number = key.rpartition("-")
+    return (prefix, int(number)) if number.isdigit() else (key, 0)
+
+
+def is_empty(value: Any) -> bool:
+    """True for values Jira uses to say "nothing here"."""
+    if value is None:
+        return True
+    if isinstance(value, (str, list, dict, tuple)) and len(value) == 0:
+        return True
+    if isinstance(value, str) and not value.strip():
+        return True
+    return False
+
+
+def read_project_list(projects: list[str], list_file: Path | None = None) -> list[str]:
+    """Project keys given on the command line and/or in a text file, without duplicates.
+
+    The file holds one key per line; ``#`` starts a comment (whole line or end of line).
+    """
+    keys = list(projects)
+    if list_file:
+        for line in list_file.read_text(encoding="utf-8-sig").splitlines():
+            line = line.split("#", 1)[0].strip()
+            if line:
+                keys.append(line)
+    return list(dict.fromkeys(keys))
+
+
+def is_valid_project_ref(ref: str) -> bool:
+    """A project key (``ABC``) or a numeric project ID (``10000``)."""
+    return ref.isdigit() or bool(PROJECT_KEY_RE.match(ref))
+
+
+class SingleInstanceLock:
+    """Prevents two archive runs from working at the same time on the same machine/output folder.
+
+    Uses an operating-system file lock: it is released automatically if the
+    process stops, even after a crash, so it can never stay "stuck".
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._handle: Any = None
+
+    def acquire(self) -> bool:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        handle = self._path.open("a+")
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            handle.close()
+            return False
+        self._handle = handle
+        return True
+
+    def release(self) -> None:
+        if self._handle is not None:
+            self._handle.close()  # closing the file releases the lock
+            self._handle = None
