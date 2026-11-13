@@ -1,144 +1,26 @@
-# Archive format (version 1.0)
+Notes — Étape 8 (chart Helm XWiki) — où on en est
 
-This document describes the content of an archive produced by automatic-jira-archiving. Its goal is that anyone can understand and reuse an archive in the future, even without Jira and without this tool.
+Ce qu'on a fait
+Lylia avait écrit le chart Helm de XWiki et l'avait poussé sur main. De mon côté, j'ai récupéré son travail et déroulé l'étape 8 sur mon Mac pour le tester : j'ai construit l'image XWiki interne, installé le chart dans le cluster kind, et vérifié que le durcissement fonctionne.
 
-## Files
+Pourquoi
+Le chart déploie XWiki dans son propre namespace, avec des protections inspirées du CIS Kubernetes Benchmark. Ce XWiki sera notre « production factice » pour les étapes de sauvegarde, de CI et de déploiement qui suivent. Je voulais vérifier que ce que Lylia avait écrit marche aussi chez moi, et pas seulement chez elle.
 
-| Path in the ZIP | Content |
-|---|---|
-| `OPEN_ARCHIVE.html` | Offline viewer: open it in a web browser after extracting the ZIP (see "The viewer" below). |
-| `README.txt` | Short plain-text description of the archive. |
-| `project.json` | All data: project configuration and every issue. UTF-8 JSON. |
-| `manifest.json` | Every file of the archive with its size and SHA-256 fingerprint, plus counters and warnings. |
-| `pdf/<KEY>-<n>.pdf` | One PDF per issue (human-readable version of the data). |
-| `attachments/<KEY>-<n>/<attachment id>_<file name>` | Attachment files. The id prefix keeps two files with the same name apart. |
-| `viewer/` | Program (`app.js`, `app.css`) and data (`data/`) of the viewer. |
+Comment
+- Récupéré le code (git pull) : le chart était déjà là, conforme au guide.
+- Construit l'image poc-local/xwiki:17.10.13 avec docker build, puis chargée dans kind (kind load docker-image).
+- Créé xwiki/chart/values-local.yaml avec le sous-réseau du réseau kind (172.18.0.0/16). Ce fichier est propre à ma machine et ignoré par Git.
+- Créé le namespace xwiki et le Secret xwiki-db (le mot de passe de la base vient de mon dossier de secrets, jamais du dépôt).
+- helm lint OK, puis helm install : le pod passe en 1/1 Running.
+- Vérifié le durcissement (8.7) : pas de jeton d'accès à l'API dans le pod, mot de passe absent de la définition du pod, aucune capacité Linux (CapEff à 0), un pod d'un autre namespace est bloqué par la NetworkPolicy (timeout), et l'accès normal par l'Ingress fonctionne.
 
-Next to the ZIP file, `<zip name>.sha256` contains the SHA-256 fingerprint of the ZIP itself, in the standard `sha256sum` format.
+Le problème rencontré (8.5)
+Le lendemain du lancement, xwiki.localhost renvoyait une erreur 503 : le pod restait en 0/1. Cause : XWiki lance l'assistant de configuration (Distribution Wizard) dès la première requête reçue, y compris celle de la sonde de démarrage de Kubernetes, avant même qu'on ouvre le navigateur. Si personne ne répond dans les 5 minutes environ, l'assistant se termine tout seul sans rien installer, et XWiki pense que c'est fini : la page d'accueil n'existe pas (404). Rien n'est cassé ni perdu, la base ne contenait que les tables système. C'est probablement ce qui a bloqué Lylia au 8.5.
 
-## General rules
+Solution : relancer le pod pour redémarrer l'assistant, puis ouvrir http://xwiki.localhost:8080 tout de suite et enchaîner sans s'arrêter.
+    kubectl rollout restart deploy/xwiki -n xwiki
 
-- **Raw Jira data.** Jira objects (users, statuses, versions, comments, history…) are kept **as returned by the Jira REST API v2**. Only these keys are removed everywhere: `self`, `avatarUrls` and `iconUrl`. They are links to the Jira server and become useless once Jira is gone.
-- **Dates.** They are kept exactly as Jira gives them, e.g. `2024-03-01T10:15:30.000+0100`, which is local time plus the offset from UTC. Archive timestamps (`generated_at`…) are in UTC.
-- **Empty values.** An empty field is written as `null` (or `[]`). This shows that the field existed for the issue and was empty, rather than forgotten by the export.
-
-## `project.json`
-
-```jsonc
-{
-  "archive": {
-    "format_version": "1.0",
-    "generated_at": "2026-11-05T13:13:59+00:00",   // when the archive was finished (UTC)
-    "export_started_at": "...",                     // when the export started (UTC)
-    "tool": "automatic-jira-archiving 1.0.0",
-    "jira": { "base_url": "...", "version": "11.3.7", "build_number": 0, "deployment_type": "Server" },
-    "issue_count": 25,
-    "warnings": []                                  // project-level problems: a scheme not readable,
-                                                    // fields of an issue type not returned by Jira, ...
-  },
-  "project":   { ... },        // GET /project/{key}: name, description, lead, issue types...
-  "components": [ ... ],
-  "versions":   [ ... ],
-  "roles":      { "Developers": { "actors": [ ... ] } },
-  "schemes": { "permission": {...}, "notification": {...}, "issue_security": null },
-  "statuses_by_issue_type": [ ... ],
-  "issue_types": [
-    {
-      "id": "1", "name": "Bug", "subtask": false, "description": "...",
-      "create_screen_fields": [          // fields configured for this issue type
-        { "fieldId": "summary", "name": "Summary", "required": true,
-          "schema": {...}, "allowedValues": [...], "hasDefaultValue": false, "operations": [...] }
-      ]
-    }
-  ],
-  "fields": {                            // catalog of every field used in this project
-    "customfield_10000": { "id": "...", "name": "Story Points", "custom": true, "schema": {...} }
-  },
-  "issues": [ <issue>, <issue>, ... ]    // sorted by key: ABC-1, ABC-2, ... ABC-10
-}
-```
-
-### An issue
-
-```jsonc
-{
-  "id": "10001",
-  "key": "ABC-1",
-  "issue_type": { "id": "1", "name": "Bug", "subtask": false },
-
-  "fields": {
-    // One entry per field: system fields first, then custom fields, sorted by name.
-    "summary":           { "name": "Summary", "value": "Login fails" },
-    "description":       { "name": "Description",
-                           "value": "Raw Jira *wiki* markup",
-                           "rendered_html": "<p>Raw Jira <b>wiki</b> markup</p>" },
-    "customfield_10000": { "name": "Story Points", "value": null }
-  },
-
-  "comments":     [ { "id", "author", "updateAuthor", "body", "renderedBody", "created", "updated", "visibility"? } ],
-  "worklogs":     [ { "id", "author", "started", "timeSpent", "timeSpentSeconds", "comment", ... } ],
-  "changelog":    [ { "id", "author", "created",
-                      "items": [ { "field", "fieldtype", "from", "fromString", "to", "toString" } ] } ],
-  "remote_links": [ { "id", "relationship", "object": { "url", "title" } } ],
-  "attachments":  [ { "id", "filename", "author", "created", "size", "mimeType",
-                      "archive": { "status": "ok", "path": "attachments/ABC-1/10200_x.png",
-                                   "size": 1234, "sha256": "..." } } ],
-  "pdf":           { "path": "pdf/ABC-1.pdf", "sha256": "..." },
-  "archive_notes": [ "Attachment x.pdf (id 10201) could not be downloaded: HTTP 404 ..." ]
-}
-```
-
-### Which fields are included for an issue
-
-The fields of an issue are the union of:
-
-1. the fields configured for its issue type (`create_screen_fields`), even when empty;
-2. the main system fields (summary, status, priority, assignee, dates, versions, links…), even when empty;
-3. every other field that has a value.
-
-Fields of the Jira instance that do not belong to the project are not included. The field `lastViewed` is also left out: it describes the account that ran the export, not the issue. Comments, work logs and attachments are moved to their own sections (`comments`, `worklogs`, `attachments`).
-
-### `rendered_html`
-
-For text fields, Jira stores *wiki markup* (e.g. `*bold*`). The archive also keeps the HTML version produced by Jira at export time. It is the most faithful view of the formatting, and it is what the PDFs show. Links to images inside it (`/secure/attachment/...`) point to the Jira server. The matching files are in `attachments/`, and the attachment id is the number in the link.
-
-### Attachment `archive.status`
-
-| Value | Meaning |
-|---|---|
-| `ok` | The file is in the archive at `archive.path`. |
-| `missing on server (HTTP 404)` | Jira lists the file but no longer has it. |
-| `skipped` | The export was run with `--no-attachments`. |
-
-## The viewer (`OPEN_ARCHIVE.html` and `viewer/`)
-
-A static web page that shows the project like Jira did (summary, issue list with filters and search, board, issue pages). It needs no server, no installation and no network: it is opened from the disk (`file://`). It is plain JavaScript without any external library.
-
-Because a page opened from the disk may load scripts but may not read JSON files, the viewer data is written as JavaScript files. Each one contains a single call `jaLoad("<kind>", <JSON>);`, with ASCII-only JSON (non-ASCII characters escaped as `\uXXXX`).
-
-| File | Content |
-|---|---|
-| `viewer/data/project.js` | `jaLoad("project", {...})`: the content of `project.json` without the issues. `issue_types[].create_screen_fields` is left out and `schemes` only keeps the scheme names. |
-| `viewer/data/index.js` | `jaLoad("index", {"columns": [...], "rows": [[...], ...], "searchFiles": N})`: one row per issue with the values listed in `columns` (key, summary, type, status, status category, priority, resolution, assignee, reporter, dates, components, versions, labels, parent key, counts). Used by the list, the filters and the board. |
-| `viewer/data/issues/<KEY>.js` | `jaLoad("issue", {...})`: the issue, exactly as in `project.json`. |
-| `viewer/data/search/<n>.js` | `jaLoad("search", n, {"<KEY>": "<text>"})`: the text of 500 issues (all fields, comments, work log comments, file names, web links), in lower case without accents, for the full-text search. |
-
-These files are a second copy of the data, in a form the browser can read. `project.json` remains the reference.
-
-## `manifest.json`
-
-```jsonc
-{
-  "format_version": "1.0",
-  "generated_at": "...",
-  "tool": "automatic-jira-archiving 1.0.0",
-  "jira": { ... },
-  "project": { "id": "10000", "key": "ABC", "name": "..." },
-  "counts": { "issues": 25, "pdf_files": 25, "attachments": 3, "attachment_bytes": 46028 },
-  "warnings": [ ... ],                          // project-level warnings
-  "issue_notes": { "ABC-4": [ "PDF rendered in simplified mode (complex layout)." ] },
-  "files": [ { "path": "pdf/ABC-1.pdf", "size": 34567, "sha256": "..." } ]
-}
-```
-
-`manifest.json` does not list itself.
+Ce qu'il reste à faire
+- 8.5 : passer l'assistant (créer l'Admin, choisir XWiki Standard Flavor, attendre l'installation des extensions).
+- 8.6 : créer le contenu factice (espace Projet PoC avec les pages Architecture, Journal, Contacts, une pièce jointe, l'utilisateur alice, une recherche « Architecture »), puis vérifier que la sonde REST répond 200 et que le compteur d'erreurs de migration est à 0.
+- Idée : ajouter au guide une note qui dit d'ouvrir le navigateur juste après le helm install.
