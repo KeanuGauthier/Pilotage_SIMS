@@ -1,231 +1,287 @@
-"""Assemble the final archive: ``project.json``, ``manifest.json``, ``README.txt`` and the ZIP file.
+"""Offline web viewer packed into every archive (``OPEN_ARCHIVE.html``).
 
-Final ZIP layout::
+The viewer is a static web page: after the ZIP file has been extracted, a
+double-click on ``OPEN_ARCHIVE.html`` shows the whole project in the web browser
+(project summary, issue list with filters and search, board, issue pages with
+comments, history, attachments...). It needs no Python, no server, no
+installation and no network access, so anyone can open an archive.
 
-    <KEY>_jira_archive_<YYYYMMDD>.zip
-    └── <KEY>_jira_archive_<YYYYMMDD>/
-        ├── OPEN_ARCHIVE.html   offline web viewer: double-click it (after extracting the ZIP)
-        ├── README.txt          plain-language description of the archive
-        ├── project.json        all project + issue data (see docs/ARCHIVE_FORMAT.md)
-        ├── manifest.json       inventory of every file with its SHA-256 fingerprint
-        ├── attachments/<KEY>-<n>/<id>_<file name>
-        └── viewer/             program and data of the web viewer (see viewer.py)
+Why the data is written as ``.js`` files instead of ``.json`` files: a page opened
+from the disk (``file://``) is not allowed to read local JSON files, but it may
+load local scripts. Each data file is therefore one single call
+``jaLoad("<kind>", <JSON data>);`` that hands the data to the viewer. The JSON is
+ASCII-only (``\\u00e9`` instead of ``é``), so the files read correctly whatever the
+browser and its encoding settings.
 
-A ``<zip name>.sha256`` file is written next to the ZIP to check it was not
-corrupted (e.g. after copying it to the archive storage).
+Files written in the archive folder::
+
+    OPEN_ARCHIVE.html             the page to double-click (copied from viewer_assets/)
+    viewer/app.js, viewer/app.css the viewer program and its layout (copied from viewer_assets/)
+    viewer/data/project.js        project configuration (components, versions, roles, ...)
+    viewer/data/index.js          one short line per issue: what the list, filters and board need
+    viewer/data/issues/<KEY>.js   full data of one issue (same content as in project.json)
+    viewer/data/search/<n>.js     text of the issues for the full-text search (500 issues per file)
+    viewer/data/baselines/<n>.js  content of one R4J baseline (only when the project has baselines)
+
+``project.json`` stays the reference copy of the data. The viewer files are a
+second, browser-friendly copy of the same data.
 """
 
 from __future__ import annotations
 
+import html
 import json
-import os
-import textwrap
-import zipfile
-from collections.abc import Iterator
+import re
+import shutil
+import unicodedata
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
-from . import ARCHIVE_FORMAT_VERSION, __version__
-from .exporter import ExportResult
-from .logging_setup import get_logger
-from .utils import atomic_write_json, issue_sort_key, read_json, sha256_file, utc_now
-from .viewer import ENTRY_PAGE, build_viewer
+from .formatting import format_dev_summary, is_dev_summary
+from .utils import atomic_write_bytes, read_json
 
-log = get_logger("package")
+ASSETS_DIR = Path(__file__).resolve().parent / "viewer_assets"
+ENTRY_PAGE = "OPEN_ARCHIVE.html"
+VIEWER_DIR = "viewer"
+SEARCH_CHUNK_SIZE = 500
+
+#: Columns of ``index.js`` (one array per issue, in this order).
+INDEX_COLUMNS = [
+    "key", "id", "summary", "type", "subtask", "status", "statusCategory", "priority", "resolution",
+    "assignee", "reporter", "created", "updated", "resolved", "due", "components", "fixVersions",
+    "versions", "labels", "parent", "attachments", "comments", "notes", "epic", "parentLink", "sprints",
+]
+
+#: Jira Software / Advanced Roadmaps fields found by their type (their id differs on every Jira).
+#: ``index.js`` column -> end of the custom field type.
+LINK_FIELD_TYPES = {"epic": ":gh-epic-link", "parentLink": ":jpo-custom-field-parent", "sprints": ":gh-sprint"}
+_SPRINT_NAME = re.compile(r"[\[,]name=(.*?),(?:startDate|endDate|completeDate|goal|sequence|state|rapidViewId|"
+                          r"activatedDate|autoStartStop|synced|incompleteIssuesDestinationId)=")
+_TIME_IN_STATUS = re.compile(r"^\d+_\*:\*_\d+_\*:\*_\d+(?:_\*\|\*_\d+_\*:\*_\d+_\*:\*_\d+)*$")
+
+_COMBINING_MARKS = re.compile("[̀-ͯ]")
+# HTML tags inside a field value (some plugins store HTML): removed from the search text.
+_HTML_TAG = re.compile(r"</?(?:a|b|big|blockquote|br|center|code|dd|del|div|dl|dt|em|font|h[1-6]|hr|i|img|ins|li|ol|p|"
+                       r"pre|s|small|span|strike|strong|sub|sup|table|tbody|td|th|thead|tr|tt|u|ul)\b[^<>]*>", re.I)
 
 
-def _dump(value: Any, indent_level: int) -> str:
-    """JSON-encode *value* and indent it so it can be embedded at *indent_level*."""
-    text = json.dumps(value, ensure_ascii=False, indent=2)
-    return text.replace("\n", "\n" + "  " * indent_level)
+def fold(text: str) -> str:
+    """Lower case without accents, for the search (the viewer does exactly the same in JavaScript)."""
+    return _COMBINING_MARKS.sub("", unicodedata.normalize("NFKD", text).lower())
 
 
-def _issue_files(result: ExportResult) -> Iterator[Path]:
-    keys = sorted((item["key"] for item in result.inventory), key=issue_sort_key)
-    for key in keys:
-        yield result.paths.issues / f"{key}.json"
+def _js(kind: str, *payload: Any) -> bytes:
+    """Content of one data file: ``jaLoad("kind", ...);`` with ASCII-only JSON."""
+    args = ", ".join(json.dumps(item, ensure_ascii=True, separators=(",", ":")) for item in payload)
+    return f"jaLoad({json.dumps(kind)}, {args});\n".encode("ascii")
 
 
-def project_header(result: ExportResult, jira_info: dict[str, Any], generated_at: str) -> dict[str, Any]:
-    """Everything ``project.json`` contains, except the issues."""
-    metadata = result.metadata
-    used_fields: set[str] = set()
-    for path in _issue_files(result):
-        used_fields.update(read_json(path)["fields"].keys())
-    for issue_type in metadata["issue_types"]:
-        used_fields.update(f.get("fieldId") for f in issue_type.get("create_screen_fields") or [])
+def _value(issue: dict[str, Any], field_id: str) -> Any:
+    return (issue.get("fields", {}).get(field_id) or {}).get("value")
 
+
+def _name(value: Any) -> str:
+    """Display name of a Jira object (user, status, version, option...)."""
+    if isinstance(value, dict):
+        for key in ("displayName", "name", "value", "key"):
+            if isinstance(value.get(key), str) and value[key]:
+                return value[key]
+        return ""
+    return value if isinstance(value, str) else ""
+
+
+def _names(values: Any) -> list[str]:
+    return [name for name in (_name(v) for v in values or []) if name] if isinstance(values, list) else []
+
+
+def link_fields(fields: dict[str, Any] | None) -> dict[str, str]:
+    """Ids of the "Epic Link", "Parent Link" and "Sprint" fields of this Jira: ``{"epic": "customfield_10100"}``."""
+    found: dict[str, str] = {}
+    for field_id, info in (fields or {}).items():
+        custom = str(((info or {}).get("schema") or {}).get("custom") or "")
+        for column, suffix in LINK_FIELD_TYPES.items():
+            if custom.endswith(suffix):
+                found.setdefault(column, field_id)
+    return found
+
+
+def _issue_key(value: Any) -> str:
+    """Key of the issue a link field points to (a plain key, or an object on some Jira versions)."""
+    if isinstance(value, dict):
+        data = value.get("data") if isinstance(value.get("data"), dict) else value
+        value = data.get("key")
+    return value if isinstance(value, str) else ""
+
+
+def _sprint_names(value: Any) -> list[str]:
+    names = []
+    for sprint in value if isinstance(value, list) else [value]:
+        if isinstance(sprint, dict):
+            name = sprint.get("name")
+        else:
+            match = _SPRINT_NAME.search(sprint) if isinstance(sprint, str) else None
+            name = match.group(1) if match else None
+        if isinstance(name, str) and name and name not in names:
+            names.append(name)
+    return names
+
+
+def index_row(issue: dict[str, Any], special: dict[str, str] | None = None) -> list[Any]:
+    """The line of ``index.js`` describing *issue* (see :data:`INDEX_COLUMNS`).
+
+    *special* is the result of :func:`link_fields`.
+    """
+    special = special or {}
+    status = _value(issue, "status") or {}
+    category = (status.get("statusCategory") or {}).get("key", "") if isinstance(status, dict) else ""
+    parent = _value(issue, "parent")
+    labels = _value(issue, "labels")
+    row = {
+        "key": issue["key"],
+        "id": issue.get("id"),
+        "summary": _value(issue, "summary") or "",
+        "type": (issue.get("issue_type") or {}).get("name") or _name(_value(issue, "issuetype")),
+        "subtask": bool((issue.get("issue_type") or {}).get("subtask")),
+        "status": _name(status),
+        "statusCategory": category,
+        "priority": _name(_value(issue, "priority")),
+        "resolution": _name(_value(issue, "resolution")),
+        "assignee": _name(_value(issue, "assignee")),
+        "reporter": _name(_value(issue, "reporter")),
+        "created": _value(issue, "created") or "",
+        "updated": _value(issue, "updated") or "",
+        "resolved": _value(issue, "resolutiondate") or "",
+        "due": _value(issue, "duedate") or "",
+        "components": _names(_value(issue, "components")),
+        "fixVersions": _names(_value(issue, "fixVersions")),
+        "versions": _names(_value(issue, "versions")),
+        "labels": [str(label) for label in labels] if isinstance(labels, list) else [],
+        "parent": parent.get("key", "") if isinstance(parent, dict) else "",
+        "attachments": len(issue.get("attachments") or []),
+        "comments": len(issue.get("comments") or []),
+        "epic": _issue_key(_value(issue, special["epic"])) if "epic" in special else "",
+        "parentLink": _issue_key(_value(issue, special["parentLink"])) if "parentLink" in special else "",
+        "sprints": _sprint_names(_value(issue, special["sprints"])) if "sprints" in special else [],
+        "notes": len(issue.get("archive_notes") or []),
+    }
+    return [row[column] for column in INDEX_COLUMNS]
+
+
+def _texts(value: Any) -> Iterable[str]:
+    """Every piece of text of a field value (strings, and names of users/options/versions)."""
+    if is_dev_summary(value):  # Java text dump: only its readable summary is searchable
+        yield format_dev_summary(value)
+    elif isinstance(value, str) and (_TIME_IN_STATUS.match(value) or value.startswith("com.atlassian.greenhopper.")):
+        yield from _sprint_names(value)  # internal text of Jira Software: only a sprint name is worth searching
+    elif isinstance(value, str):
+        yield html.unescape(_HTML_TAG.sub(" ", value)) if _HTML_TAG.search(value) else value
+    elif isinstance(value, list):
+        for item in value:
+            yield from _texts(item)
+    elif isinstance(value, dict):
+        for key in ("displayName", "name", "value"):
+            if isinstance(value.get(key), str):
+                yield value[key]
+        if isinstance(value.get("child"), dict):
+            yield from _texts(value["child"])
+
+
+def search_text(issue: dict[str, Any]) -> str:
+    """Searchable text of an issue: every field, comments, work log comments, file names, web links."""
+    parts: list[str] = []
+    for field_id, entry in (issue.get("fields") or {}).items():
+        if field_id in ("issuelinks", "subtasks", "parent", "project", "watches", "votes"):
+            continue
+        parts.extend(_texts((entry or {}).get("value")))
+    for comment in issue.get("comments") or []:
+        parts.append(str(comment.get("body") or ""))
+    for worklog in issue.get("worklogs") or []:
+        parts.append(str(worklog.get("comment") or ""))
+    for attachment in issue.get("attachments") or []:
+        parts.append(str(attachment.get("filename") or ""))
+    for link in issue.get("remote_links") or []:
+        obj = link.get("object") or {}
+        parts.extend(str(obj.get(k) or "") for k in ("title", "url"))
+    zephyr = issue.get("zephyr") or {}
+    for step in zephyr.get("steps") or []:
+        parts.extend(str(step.get(k) or "") for k in ("step", "data", "result"))
+    for execution in zephyr.get("executions") or []:
+        parts.extend(str(execution.get(k) or "") for k in ("cycleName", "folderName", "versionName", "comment"))
+        parts.extend(str(result.get("comment") or "") for result in execution.get("step_results") or [])
+    return fold(" ".join(p for p in parts if p))
+
+
+def _project_data(header: dict[str, Any]) -> dict[str, Any]:
+    """Project configuration for the viewer: ``project.json`` without the issues and the bulky parts."""
+    schemes = header.get("schemes") or {}
     return {
-        "archive": {
-            "format_version": ARCHIVE_FORMAT_VERSION,
-            "generated_at": generated_at,
-            "export_started_at": metadata["export_started_at"],
-            "tool": f"automatic-jira-archiving {__version__}",
-            "jira": jira_info,
-            "issue_count": len(result.inventory),
-            "warnings": metadata.get("warnings", []),
-        },
-        "project": metadata["project"],
-        "components": metadata["components"],
-        "versions": metadata["versions"],
-        "roles": metadata["roles"],
-        "schemes": {
-            "permission": metadata["permission_scheme"],
-            "notification": metadata["notification_scheme"],
-            "issue_security": metadata["issue_security_scheme"],
-        },
-        "statuses_by_issue_type": metadata["statuses_by_issue_type"],
-        "issue_types": metadata["issue_types"],
-        "fields": {fid: info for fid, info in sorted(metadata["field_catalog"].items()) if fid in used_fields},
-        "zephyr": metadata.get("zephyr") or {"installed": False},
-        "r4j": metadata.get("r4j") or {"installed": False},
+        "archive": header.get("archive"),
+        "project": header.get("project"),
+        "components": header.get("components"),
+        "versions": header.get("versions"),
+        "roles": header.get("roles"),
+        "schemes": {name: (scheme or {}).get("name") if isinstance(scheme, dict) else None
+                    for name, scheme in schemes.items()},
+        "statuses_by_issue_type": header.get("statuses_by_issue_type"),
+        "issue_types": [{k: v for k, v in it.items() if k != "create_screen_fields"}
+                        for it in header.get("issue_types") or []],
+        "fields": header.get("fields"),
+        "zephyr": header.get("zephyr"),
+        "r4j": _r4j_data(header.get("r4j")),
     }
 
 
-def write_project_json(result: ExportResult, header: dict[str, Any]) -> Path:
-    """Write ``project.json`` by streaming the issues one by one (works for very large projects)."""
-    target = result.paths.archive / "project.json"
-    tmp = target.with_name(target.name + ".part")
-    with tmp.open("w", encoding="utf-8", newline="\n") as handle:
-        handle.write("{\n")
-        for name, value in header.items():
-            handle.write(f"  {json.dumps(name)}: {_dump(value, 1)},\n")
-        handle.write('  "issues": [')
-        first = True
-        for path in _issue_files(result):
-            handle.write("\n    " if first else ",\n    ")
-            handle.write(_dump(read_json(path), 2))
-            first = False
-        handle.write("\n  ]\n}\n")
-    os.replace(tmp, target)
-    return target
+def _r4j_data(r4j: Any) -> dict[str, Any]:
+    """R4J tree and list of baselines. The content of each baseline goes to its own data file."""
+    if not isinstance(r4j, dict) or not r4j.get("installed"):
+        return {"installed": False}
+    baselines = [{**{k: v for k, v in b.items() if k != "issues"}, "issue_count": len(b.get("issues") or [])}
+                 for b in r4j.get("baselines") or []]
+    return {"installed": True, "tree": r4j.get("tree"), "baselines": baselines}
 
 
-def write_readme(result: ExportResult, generated_at: str, base_url: str) -> Path:
-    project = result.metadata["project"]
-    text = textwrap.dedent(f"""\
-        JIRA PROJECT ARCHIVE
-        ====================
+def build_viewer(archive_dir: Path, header: dict[str, Any], issue_files: Iterable[Path]) -> int:
+    """Write the viewer and its data into *archive_dir*. Returns the number of files written.
 
-        Project      : {project.get('name')} ({project.get('key')})
-        Source       : {base_url}
-        Archived on  : {generated_at} (UTC)
-        Issues       : {len(result.inventory)}
-        Created with : automatic-jira-archiving {__version__}
+    *header* is the content of ``project.json`` without the issues, *issue_files*
+    the JSON file of every issue, in key order.
+    """
+    viewer_dir = archive_dir / VIEWER_DIR
+    if viewer_dir.exists():
+        shutil.rmtree(viewer_dir)  # leftovers of an interrupted run
+    data_dir = viewer_dir / "data"
 
-        HOW TO OPEN THE ARCHIVE
-        -----------------------
-        1. Extract the ZIP file first: right-click it, choose "Extract All...",
-           then "Extract". (Opening the ZIP without extracting it does not work.)
-        2. In the extracted folder, double-click {ENTRY_PAGE}.
-           The project opens in your web browser: issues, search, board,
-           comments, history, attachments, requirements tree and baselines
-           (R4J plugin)... Nothing to install, no Internet needed, nothing
-           is sent anywhere.
-        3. To get a PDF of an issue: open the issue, click "Print / Save as PDF",
-           then choose "Save as PDF" (or "Microsoft Print to PDF") as printer.
+    shutil.copyfile(ASSETS_DIR / ENTRY_PAGE, archive_dir / ENTRY_PAGE)
+    viewer_dir.mkdir(parents=True)
+    for asset in ("app.js", "app.css"):
+        shutil.copyfile(ASSETS_DIR / asset, viewer_dir / asset)
+    written = 3
 
-        CONTENTS
-        --------
-        {ENTRY_PAGE}
-                       The archive viewer (see above).
-        project.json   All the data of the project and of every issue (fields,
-                       comments, work logs, history, links, attachments list...).
-                       Text format, readable with any text editor or JSON viewer.
-        attachments/   The files attached to the issues, one folder per issue
-                       (and the files of Zephyr test steps and executions).
-        viewer/        The program and data used by {ENTRY_PAGE}.
-        manifest.json  The list of every file of this archive with its SHA-256
-                       fingerprint, to prove nothing was changed or corrupted.
+    atomic_write_bytes(data_dir / "project.js", _js("project", _project_data(header)))
+    written += 1
 
-        HOW TO CHECK THE ARCHIVE IS INTACT
-        ----------------------------------
-        Each file has a "sha256" value in manifest.json. On Windows, run in PowerShell:
-            Get-FileHash .\\project.json -Algorithm SHA256
-        The value displayed must be identical to the one in manifest.json
-        (upper case / lower case does not matter).
-        """)
-    target = result.paths.archive / "README.txt"
-    target.write_text(text.replace("\n", "\r\n"), encoding="utf-8")
-    return target
+    for number, baseline in enumerate((header.get("r4j") or {}).get("baselines") or []):
+        atomic_write_bytes(data_dir / "baselines" / f"{number}.js", _js("baseline", number, baseline))
+        written += 1
 
+    special = link_fields(header.get("fields"))
+    rows: list[list[Any]] = []
+    chunk: dict[str, str] = {}
+    chunk_count = 0
+    for path in issue_files:
+        issue = read_json(path)
+        rows.append(index_row(issue, special))
+        chunk[issue["key"]] = search_text(issue)
+        atomic_write_bytes(data_dir / "issues" / f"{issue['key']}.js", _js("issue", issue))
+        written += 1
+        if len(chunk) >= SEARCH_CHUNK_SIZE:
+            atomic_write_bytes(data_dir / "search" / f"{chunk_count}.js", _js("search", chunk_count, chunk))
+            chunk_count, chunk, written = chunk_count + 1, {}, written + 1
+    if chunk:
+        atomic_write_bytes(data_dir / "search" / f"{chunk_count}.js", _js("search", chunk_count, chunk))
+        chunk_count, written = chunk_count + 1, written + 1
 
-def write_manifest(result: ExportResult, jira_info: dict[str, Any], generated_at: str) -> Path:
-    archive_dir = result.paths.archive
-    files = []
-    attachment_count = 0
-    attachment_bytes = 0
-    for path in sorted(p for p in archive_dir.rglob("*") if p.is_file() and p.name != "manifest.json"):
-        relative = path.relative_to(archive_dir).as_posix()
-        size = path.stat().st_size
-        files.append({"path": relative, "size": size, "sha256": sha256_file(path)})
-        if relative.startswith("attachments/"):
-            attachment_count += 1
-            attachment_bytes += size
-
-    notes = {}
-    for issue_path in _issue_files(result):
-        record = read_json(issue_path)
-        if record.get("archive_notes"):
-            notes[record["key"]] = record["archive_notes"]
-
-    manifest = {
-        "format_version": ARCHIVE_FORMAT_VERSION,
-        "generated_at": generated_at,
-        "tool": f"automatic-jira-archiving {__version__}",
-        "jira": jira_info,
-        "project": {"id": result.metadata["project"].get("id"), "key": result.project_key,
-                    "name": result.metadata["project"].get("name")},
-        "counts": {
-            "issues": len(result.inventory),
-            "attachments": attachment_count,
-            "attachment_bytes": attachment_bytes,
-        },
-        "warnings": result.metadata.get("warnings", []),
-        "issue_notes": notes,
-        "files": files,
-    }
-    target = archive_dir / "manifest.json"
-    atomic_write_json(target, manifest)
-    return target
-
-
-def build_zip(result: ExportResult, output_dir: Path, date_tag: str) -> Path:
-    """Zip the archive folder, verify the ZIP, and write its SHA-256 next to it."""
-    name = f"{result.project_key}_jira_archive_{date_tag}"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    zip_path = output_dir / f"{name}.zip"
-    tmp = zip_path.with_name(zip_path.name + ".part")
-
-    archive_dir = result.paths.archive
-    with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as zf:
-        for path in sorted(archive_dir.rglob("*")):
-            if path.is_file() and not path.is_symlink() and not path.name.endswith(".part"):
-                zf.write(path, f"{name}/{path.relative_to(archive_dir).as_posix()}")
-
-    log.info("[%s] Verifying the ZIP file...", result.project_key)
-    with zipfile.ZipFile(tmp) as zf:
-        broken = zf.testzip()
-        if broken:
-            raise RuntimeError(f"ZIP verification failed on {broken}")
-    os.replace(tmp, zip_path)
-
-    digest = sha256_file(zip_path)
-    (output_dir / f"{zip_path.name}.sha256").write_text(f"{digest}  {zip_path.name}\n", encoding="utf-8")
-    return zip_path
-
-
-def package(result: ExportResult, jira_info: dict[str, Any], output_dir: Path, base_url: str) -> Path:
-    """Create every archive file and the final ZIP. Returns the ZIP path."""
-    now = utc_now()
-    generated_at = now.isoformat()
-    log.info("[%s] Writing project.json...", result.project_key)
-    header = project_header(result, jira_info, generated_at)
-    write_project_json(result, header)
-    log.info("[%s] Writing the archive viewer (%s)...", result.project_key, ENTRY_PAGE)
-    build_viewer(result.paths.archive, header, _issue_files(result))
-    write_readme(result, generated_at, base_url)
-    log.info("[%s] Writing manifest.json (computing fingerprints)...", result.project_key)
-    write_manifest(result, jira_info, generated_at)
-    log.info("[%s] Creating the ZIP file...", result.project_key)
-    return build_zip(result, output_dir, now.strftime("%Y%m%d"))
+    index = {"columns": INDEX_COLUMNS, "rows": rows, "searchFiles": chunk_count}
+    atomic_write_bytes(data_dir / "index.js", _js("index", index))
+    return written + 1
