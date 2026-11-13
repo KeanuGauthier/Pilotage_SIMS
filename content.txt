@@ -1,316 +1,90 @@
-/* automatic-jira-archiving - offline viewer layout. Colors and spacing are close to Jira Data Center. */
+Archivage des projets Jira
+Objectifs, bonnes pratiques et outil retenu (automatic-jira-archiving) pour sortir les anciens projets de Jira Data Center sans perdre d'information.
 
-:root {
-  --text: #172b4d;
-  --text-subtle: #5e6c84;
-  --link: #0052cc;
-  --border: #dfe1e6;
-  --border-strong: #c1c7d0;
-  --background: #ffffff;
-  --background-subtle: #f4f5f7;
-  --background-hover: #ebecf0;
-  --header: #0747a6;
-  --header-hover: #0052cc;
-  --selected: #deebff;
-  --font: "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, Roboto, "Helvetica Neue", Arial, sans-serif;
-  --mono: Consolas, "SFMono-Regular", Menlo, "Courier New", monospace;
-  color-scheme: light;
-}
+Contexte
 
-* { box-sizing: border-box; }
-html, body { margin: 0; padding: 0; }
-body { font-family: var(--font); font-size: 14px; line-height: 1.43; color: var(--text); background: var(--background); }
-a { color: var(--link); text-decoration: none; }
-a:hover { text-decoration: underline; }
-a.external::after { content: " \2197"; font-size: 0.85em; color: var(--text-subtle); }
-h1, h2, h3 { font-weight: 500; }
-button, input, select { font: inherit; color: inherit; }
-:focus-visible { outline: 2px solid #4c9aff; outline-offset: 1px; }
-[hidden] { display: none !important; }
+L'instance Jira Data Center contient environ 2000 projets, dont une grande partie n'est plus utilisée. Ces projets restent indexés, sauvegardés et migrés à chaque montée de version. Ils alourdissent l'instance, ralentissent les recherches et compliquent l'administration.
 
-.muted { color: var(--text-subtle); }
-.small { font-size: 12px; }
-.nowrap { white-space: nowrap; }
-.num { text-align: right; white-space: nowrap; }
-.pre-wrap { white-space: pre-wrap; overflow-wrap: anywhere; }
-.break { overflow-wrap: anywhere; }
+L'archivage consiste à extraire tout le contenu d'un projet dans un fichier autonome, consultable sans Jira, avant de supprimer le projet de l'instance.
 
-/* ---------------------------------------------------------------- top bar */
-.topbar { position: sticky; top: 0; z-index: 10; display: flex; align-items: center; gap: 8px; height: 48px;
-  padding: 0 16px; background: var(--header); color: #fff; }
-.brand { display: flex; align-items: center; gap: 8px; color: #fff; font-weight: 600; font-size: 15px; padding: 6px 8px;
-  border-radius: 3px; white-space: nowrap; }
-.brand:hover, .topnav-link:hover { background: var(--header-hover); text-decoration: none; }
-.brand-icon { width: 20px; height: 20px; display: block; }
-.topnav { display: flex; gap: 2px; }
-.topnav-link { color: #deebff; padding: 6px 10px; border-radius: 3px; }
-.topnav-link.active { color: #fff; background: rgba(255, 255, 255, 0.16); }
-.topbar-spacer { flex: 1; }
-.quick-search { width: 240px; max-width: 32vw; padding: 5px 10px; border-radius: 3px; border: 1px solid transparent;
-  background: rgba(255, 255, 255, 0.2); color: #fff; }
-.quick-search::placeholder { color: #deebff; }
-.quick-search:focus { background: #fff; color: var(--text); outline: none; }
-.readonly-badge { font-size: 11px; font-weight: 700; text-transform: uppercase; padding: 2px 6px; border-radius: 3px;
-  background: #ffab00; color: #172b4d; white-space: nowrap; }
+Objectifs de l'archivage
 
-/* ---------------------------------------------------------------- sidebar */
-.layout { display: flex; min-height: calc(100vh - 48px); }
-.sidebar { flex: 0 0 240px; background: var(--background-subtle); border-right: 1px solid var(--border); padding: 20px 12px;
-  display: flex; flex-direction: column; position: sticky; top: 48px; height: calc(100vh - 48px); overflow-y: auto; }
-.sidebar-project { display: flex; gap: 10px; align-items: center; padding: 0 8px 20px; }
-.sidebar-project-name { font-weight: 600; overflow-wrap: anywhere; }
-.sidenav { display: flex; flex-direction: column; gap: 2px; }
-.sidenav-link { color: var(--text); padding: 8px 12px; border-radius: 3px; }
-.sidenav-link:hover { background: var(--background-hover); text-decoration: none; }
-.sidenav-link.active { background: var(--selected); color: var(--link); font-weight: 600; }
-.sidebar-footer { margin-top: auto; padding: 16px 8px 0; }
+Ne rien perdre : tickets, champs, descriptions, commentaires, pièces jointes, historique des modifications, liens et données de test.
+Rester consultable dans la durée, par n'importe qui, sans Jira, sans installation et sans compétence technique.
+Prouver l'intégrité : pouvoir démontrer des années plus tard qu'une archive n'a pas été modifiée ni corrompue.
+Assurer la traçabilité : savoir d'où vient une archive, quand et avec quel outil elle a été produite.
+Protéger les données : aucune fuite d'information pendant l'export, aucune modification de Jira.
+Ne pas perturber la production : l'export ne doit jamais dégrader Jira pour ses utilisateurs.
+Maîtriser les coûts : pas de licence supplémentaire, un volume de stockage raisonnable.
+Bonnes pratiques de l'archivage
 
-.content { flex: 1; min-width: 0; padding: 24px 32px 48px; }
-.content:focus { outline: none; }
+Les pratiques couramment recommandées pour l'archivage de données applicatives, et en particulier par Atlassian pour Jira, sont les suivantes :
 
-/* ---------------------------------------------------------------- common */
-.page-header { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; margin-bottom: 16px; }
-.page-header h1 { font-size: 24px; margin: 0; flex: 1; }
-.columns { display: flex; gap: 32px; align-items: flex-start; }
-.column-main { flex: 1; min-width: 0; }
-.column-side { flex: 0 0 340px; min-width: 0; }
-.module { margin-bottom: 24px; }
-.module-title { font-size: 16px; font-weight: 600; margin: 0 0 8px; padding-bottom: 6px; border-bottom: 1px solid var(--border);
-  display: flex; align-items: center; gap: 8px; }
-.count { display: inline-block; min-width: 20px; padding: 0 6px; border-radius: 10px; background: var(--background-hover);
-  color: var(--text); font-size: 12px; font-weight: 600; text-align: center; }
+Formats ouverts et documentés (JSON, HTML, fichiers d'origine) plutôt que formats propriétaires qui exigent le logiciel d'origine pour être relus.
+Archive autoportante : chaque archive contient tout ce qu'il faut pour être lue et comprise, y compris une description de son contenu.
+Exhaustivité : conserver l'historique des modifications et les pièces jointes, souvent exigés lors d'un audit.
+Contrôle d'intégrité par empreinte numérique (SHA-256) de chaque fichier.
+Lecture seule : une archive se consulte, elle ne se modifie pas.
+Vérifier avant de supprimer : contrôler que l'export est complet avant de retirer le projet de Jira.
+Stockage maîtrisé : ranger les archives dans un emplacement sauvegardé, à accès contrôlé (GED, partage dédié).
+Indépendance vis-à-vis d'un éditeur : pouvoir relire les archives même si l'outil ou l'éditeur disparaît.
+L'outil retenu
 
-.button { display: inline-flex; align-items: center; gap: 4px; padding: 4px 10px; border-radius: 3px; border: none;
-  background: rgba(9, 30, 66, 0.06); color: var(--text); cursor: pointer; white-space: nowrap; font-size: 14px; }
-.button:hover { background: rgba(9, 30, 66, 0.12); text-decoration: none; }
-.button.selected { background: var(--text); color: #fff; }
-.button.disabled, .button:disabled { opacity: 0.45; pointer-events: none; }
-.button-subtle { background: transparent; color: var(--link); }
+automatic-jira-archiving est un outil développé en interne en Python. Un administrateur le lance depuis son poste. L'outil lit le projet dans Jira par l'API officielle, en lecture seule, avec le jeton d'accès personnel (PAT) de l'administrateur, et produit un fichier ZIP par projet. Le code est versionné dans le dépôt Git automatic-jira-archiving, avec un guide d'utilisation détaillé (README.md) et la description du format d'archive (docs/ARCHIVE_FORMAT.md).
 
-.message { border-radius: 3px; padding: 10px 14px; margin: 8px 0 16px; }
-.message ul { margin: 6px 0 0; padding-left: 20px; }
-.message p { margin: 0; }
-.message-info { background: #deebff; }
-.message-warning { background: #fffae6; border-left: 4px solid #ffab00; }
-.message-error { background: #ffebe6; border-left: 4px solid #de350b; }
+Contenu d'une archive
+Élément	Rôle
+OPEN_ARCHIVE.html	Visionneuse : un double-clic ouvre le projet dans le navigateur, avec une présentation proche de Jira (résumé, liste des tickets avec filtres et recherche, tableau par statut, page de chaque ticket).
+project.json	Copie de référence de toutes les données du projet et de chaque ticket, dans un format texte ouvert et documenté.
+attachments/	Les pièces jointes d'origine, un dossier par ticket.
+manifest.json	Liste de tous les fichiers de l'archive avec leur empreinte SHA-256.
+README.txt	Explication en clair : origine de l'archive, date, contenu, mode d'ouverture et de vérification.
+viewer/	Programme et données utilisés par la visionneuse.
+Un fichier .sha256 accompagne chaque ZIP pour en vérifier l'intégrité après une copie.
 
-.lozenge { display: inline-block; padding: 0 5px; border-radius: 3px; font-size: 11px; font-weight: 700; line-height: 18px;
-  text-transform: uppercase; white-space: nowrap; max-width: 220px; overflow: hidden; text-overflow: ellipsis; vertical-align: middle;
-  background: #dfe1e6; color: #42526e; }
-.lozenge-indeterminate { background: #deebff; color: #0747a6; }
-.lozenge-done { background: #e3fcef; color: #006644; }
+Ce qui est archivé
+La configuration du projet : description, responsable, composants, versions, rôles et leurs membres, schémas, statuts par type de ticket, champs configurés pour chaque type de ticket.
+Pour chaque ticket : tous les champs du projet (y compris vides et personnalisés), description et textes riches avec leur mise en forme, commentaires (y compris restreints), journal de travail, historique complet des modifications, liens entre tickets, sous-tâches, liens web et pièces jointes.
+Les tests Zephyr Squad : étapes de test, exécutions (cycle, version, statut, exécutant, défauts) et résultat de chaque étape.
+Réponse aux exigences
 
-.icon { display: inline-flex; vertical-align: middle; flex: 0 0 auto; }
-.icon svg { width: 16px; height: 16px; display: block; }
-.with-icon { display: inline-flex; align-items: center; gap: 6px; }
-.avatar { display: inline-block; flex: 0 0 auto; width: 32px; height: 32px; line-height: 32px; border-radius: 50%; color: #fff;
-  font-size: 13px; font-weight: 600; text-align: center; vertical-align: middle; user-select: none; }
-.avatar-small { width: 24px; height: 24px; line-height: 24px; font-size: 10px; }
-.project-avatar { border-radius: 4px; }
-.user { display: inline-flex; align-items: center; gap: 6px; vertical-align: middle; }
-.value-list { display: inline-flex; flex-wrap: wrap; gap: 4px 10px; }
-.issue-link.done { text-decoration: line-through; }
-.external-issue { color: var(--text-subtle); }
-.labels { display: inline-flex; flex-wrap: wrap; gap: 4px; }
-.label { padding: 0 6px; border: 1px solid var(--border-strong); border-radius: 3px; font-size: 12px; }
+Exigence	Réponse de l'outil
+Exhaustivité	Tous les champs, commentaires, journaux de travail, historique, liens, pièces jointes et données Zephyr sont exportés. Les éléments impossibles à récupérer (fichier disparu du serveur, droits insuffisants) sont signalés dans des notes d'archive, jamais ignorés en silence. Un projet incomplet n'est pas empaqueté et peut être repris.
+Lisibilité dans la durée	Données en JSON documenté, pièces jointes dans leur format d'origine, visionneuse en HTML et JavaScript standard sans bibliothèque externe. L'archive reste lisible avec un simple navigateur ou un éditeur de texte.
+Accessibilité pour tous	Extraire le ZIP puis double-cliquer sur OPEN_ARCHIVE.html suffit. Aucune installation, aucun accès réseau, aucun compte. Un ticket peut être imprimé ou enregistré en PDF à la demande depuis la visionneuse.
+Intégrité	Empreinte SHA-256 de chaque fichier dans manifest.json et du ZIP complet dans le fichier .sha256. Le ZIP est vérifié à sa création. La vérification se fait avec un outil standard de Windows (Get-FileHash).
+Traçabilité	Chaque archive indique l'adresse et la version du Jira d'origine, la date d'export, la version de l'outil et du format, ainsi que les avertissements rencontrés. Un journal détaillé de chaque exécution est conservé.
+Lecture seule et sécurité	L'outil ne fait que lire Jira. Le jeton n'apparaît jamais dans les journaux, n'est envoyé qu'au serveur Jira configuré et n'est jamais versionné. Les certificats TLS sont toujours vérifiés. La visionneuse fonctionne hors ligne : elle ne peut contacter aucun serveur et neutralise tout contenu HTML dangereux.
+Préservation de la production	Une seule requête à la fois, au plus deux par seconde. L'outil ralentit automatiquement quand Jira répond lentement ou demande de ralentir. Un seul archivage peut tourner à la fois depuis une même installation.
+Robustesse	Un archivage interrompu (coupure réseau, redémarrage) reprend là où il s'était arrêté. Un ticket problématique n'arrête pas le reste du projet.
+Coût et volume	Aucune licence. Les données ne sont pas dupliquées : les pièces jointes ne sont stockées qu'une fois et aucun PDF n'est généré par défaut.
+Indépendance	Code interne, versionné et documenté. Le format d'archive est décrit précisément et ne dépend ni de Jira ni de l'outil pour être relu.
+Pourquoi cet outil plutôt qu'une autre solution
 
-.info-table { border-collapse: collapse; width: 100%; }
-.info-table th { text-align: left; font-weight: 400; color: var(--text-subtle); padding: 5px 12px 5px 0; vertical-align: top;
-  width: 160px; }
-.column-side .info-table th { width: 40%; }
-.info-table td { padding: 5px 0; vertical-align: top; overflow-wrap: anywhere; }
-.info-table.roles th { width: 35%; }
-.actor { display: inline-block; margin: 0 8px 2px 0; }
+Solution	Limite
+Archivage intégré à Jira Data Center	Le projet est masqué mais ses données et pièces jointes restent dans Jira. L'instance n'est pas allégée, et le projet reste dépendant de Jira pour être relu.
+Export CSV ou XML de Jira	Les pièces jointes ne sont pas incluses, l'historique des modifications n'est pas repris et le résultat est difficile à lire pour un non-spécialiste.
+Sauvegarde XML complète de Jira	Porte sur toute l'instance et ne se relit qu'en restaurant un Jira de version compatible.
+Applications du Marketplace	Licence annuelle, dépendance à un éditeur, et format de sortie variable selon l'application.
+Un PDF par ticket	Volume important (images dupliquées) pour un usage ponctuel. Remplacé par l'impression ou l'enregistrement en PDF à la demande depuis la visionneuse.
+L'outil retenu reprend l'approche « exporter puis supprimer » recommandée par Atlassian (format lisible, pièces jointes, commentaires et historique conservés). Il y ajoute la visionneuse hors ligne, le contrôle d'intégrité et la protection de la production, sans coût de licence.
 
-/* ---------------------------------------------------------------- summary page */
-.project-header { display: flex; align-items: center; gap: 16px; margin-bottom: 20px; }
-.project-header h1 { margin: 0; font-size: 26px; }
-.stats { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 24px; }
-.stat { flex: 1 1 140px; border: 1px solid var(--border); border-radius: 4px; padding: 12px 16px; color: var(--text); }
-a.stat:hover { border-color: var(--link); text-decoration: none; }
-.stat-value { font-size: 24px; font-weight: 600; }
-.stat-label { color: var(--text-subtle); }
-.bar-list { border-collapse: collapse; width: 100%; }
-.bar-list td { padding: 4px 8px 4px 0; }
-.bar-label { width: 40%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 260px; }
-.bar-cell { width: 50%; }
-.bar { display: block; height: 8px; border-radius: 4px; background: #4c9aff; }
-.bar-count { text-align: right; width: 10%; }
+Utilisation en bref
 
-/* ---------------------------------------------------------------- issue list */
-.filters { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 16px; }
-.filter-search { flex: 1 1 280px; padding: 6px 10px; border: 2px solid var(--border); border-radius: 3px; background: var(--background-subtle); }
-.filter-search:focus { border-color: #4c9aff; background: #fff; outline: none; }
-.filter-select { max-width: 220px; padding: 5px 6px; border: 1px solid var(--border); border-radius: 3px; background: var(--background-subtle); cursor: pointer; }
-.filter-select.active { background: var(--selected); border-color: #4c9aff; color: var(--link); }
-.chip { display: inline-flex; align-items: center; gap: 4px; padding: 2px 4px 2px 8px; border-radius: 3px; background: var(--selected); color: var(--link); }
-.chip-remove { border: none; background: transparent; color: inherit; cursor: pointer; font-size: 16px; line-height: 1; padding: 0 4px; }
-.table-scroll { overflow-x: auto; }
-.issue-table, .data-table { border-collapse: collapse; width: 100%; }
-.issue-table th, .data-table th { text-align: left; font-size: 12px; color: var(--text-subtle); font-weight: 600; border-bottom: 2px solid var(--border);
-  padding: 6px 8px; white-space: nowrap; }
-.issue-table td, .data-table td { border-bottom: 1px solid var(--border); padding: 6px 8px; vertical-align: middle; }
-.data-table td { vertical-align: top; }
-.issue-table tbody tr:hover, .data-table tbody tr:hover { background: var(--background-subtle); }
-.issue-table th button { border: none; background: none; padding: 0; cursor: pointer; font-weight: 600; color: inherit; }
-.issue-table th.sorted { color: var(--text); }
-.issue-table .col-type, .issue-table .col-priority { width: 28px; text-align: center; }
-.issue-table .col-key { white-space: nowrap; }
-.issue-table .col-summary { min-width: 260px; }
-.issue-table .col-created, .issue-table .col-updated, .issue-table .col-assignee, .issue-table .col-reporter { white-space: nowrap; }
-.summary-link { color: var(--text); }
-.parent-ref { color: var(--text-subtle); }
-.pager { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; padding: 12px 0; }
-.view-switch { display: inline-flex; gap: 4px; }
+Pour les administrateurs
+Récupérer le dépôt Git et lancer l'installation : py install.py.
+Renseigner l'adresse de Jira et son jeton d'accès personnel dans le fichier .env.
+Vérifier la connexion et les droits sur les projets : py check_connection.py.
+Archiver un ou plusieurs projets : py archive_project.py CLE_PROJET ou py archive_project.py --file projets.txt.
+Ranger le ZIP et son fichier .sha256 dans l'espace d'archivage, puis supprimer le projet de Jira.
+Pour consulter une archive
+Clic droit sur le ZIP, Extraire tout.
+Double-cliquer sur OPEN_ARCHIVE.html dans le dossier extrait.
+Pour obtenir un PDF d'un ticket : ouvrir le ticket, cliquer sur Print / Save as PDF, puis choisir « Enregistrer au format PDF » comme imprimante.
+Limites connues
 
-/* ---------------------------------------------------------------- board */
-.board-scroll { overflow-x: auto; padding-bottom: 8px; }
-.board { display: flex; gap: 8px; align-items: flex-start; }
-.board-column { flex: 0 0 270px; background: var(--background-subtle); border-radius: 4px; padding: 8px; }
-.board-column-title { display: flex; align-items: center; justify-content: space-between; margin: 2px 4px 10px; font-size: 14px; }
-.board-cards { display: flex; flex-direction: column; gap: 6px; }
-.card { display: block; background: #fff; border-radius: 3px; padding: 8px 10px; color: var(--text);
-  box-shadow: 0 1px 2px rgba(9, 30, 66, 0.25); }
-.card:hover { background: var(--background-subtle); text-decoration: none; }
-.card-summary { margin-bottom: 8px; overflow-wrap: anywhere; }
-.card-footer { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-subtle); }
-.card-key.done { text-decoration: line-through; }
-.board-more { display: block; padding: 6px; text-align: center; font-size: 12px; }
-
-/* ---------------------------------------------------------------- issue page */
-.breadcrumbs { color: var(--text-subtle); font-size: 13px; margin-bottom: 6px; }
-.breadcrumbs a { color: var(--text-subtle); }
-.issue-summary { display: flex; align-items: flex-start; gap: 10px; font-size: 24px; margin: 0 0 12px; overflow-wrap: anywhere; }
-.issue-summary .icon { margin-top: 8px; }
-.toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 20px; }
-.issue-nav { display: inline-flex; align-items: center; gap: 8px; }
-.details { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 2px 24px; margin: 0; }
-.detail { display: flex; gap: 8px; padding: 3px 0; min-width: 0; }
-.detail dt { flex: 0 0 140px; color: var(--text-subtle); overflow-wrap: anywhere; }
-.detail dd { margin: 0; flex: 1; min-width: 0; overflow-wrap: anywhere; }
-
-.attachments { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 10px; }
-.attachment { display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: 3px; overflow: hidden; color: var(--text); }
-a.attachment:hover { border-color: var(--link); text-decoration: none; }
-.attachment-preview { height: 110px; display: flex; align-items: center; justify-content: center; background: var(--background-subtle); }
-.attachment-preview img { max-width: 100%; max-height: 110px; object-fit: contain; }
-.file-ext { font-weight: 700; font-size: 18px; color: var(--text-subtle); }
-.attachment-meta { padding: 6px 8px; }
-.attachment-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.attachment.missing { opacity: 0.75; }
-.attachment-status { padding: 0 8px 6px; font-size: 12px; color: #bf2600; }
-
-.link-table { border-collapse: collapse; width: 100%; }
-.link-table th { text-align: left; font-weight: 400; color: var(--text-subtle); white-space: nowrap; padding: 4px 12px 4px 0; vertical-align: middle; width: 1%; }
-.link-table td { padding: 4px 8px 4px 0; border-bottom: 1px solid var(--border); vertical-align: middle; }
-.link-table .col-type, .link-table .col-priority, .link-table .col-number { width: 24px; }
-.link-table .col-key, .link-table .col-status { white-space: nowrap; width: 1%; }
-.web-links { margin: 0; padding-left: 20px; }
-.web-links li { margin-bottom: 6px; }
-
-.time-tracking .tt-row { margin-bottom: 8px; }
-.tt-label { display: flex; justify-content: space-between; font-size: 13px; }
-.tt-track { display: flex; height: 6px; border-radius: 3px; background: var(--background-hover); overflow: hidden; margin-top: 2px; }
-.tt-bar { display: block; height: 100%; }
-.tt-estimate { background: #4c9aff; }
-.tt-spent { background: #36b37e; }
-.tt-remaining { background: #ffab00; }
-
-.tabs { display: flex; gap: 4px; border-bottom: 2px solid var(--border); margin-bottom: 12px; }
-.tab { border: none; background: none; padding: 6px 10px; margin-bottom: -2px; border-bottom: 2px solid transparent; cursor: pointer;
-  color: var(--text-subtle); display: inline-flex; gap: 6px; align-items: center; }
-.tab:hover { color: var(--text); }
-.tab.selected { color: var(--link); border-bottom-color: var(--link); }
-.action { border-bottom: 1px solid var(--border); padding: 10px 0; }
-.action-header { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; color: var(--text-subtle); }
-.action-header strong { color: var(--text); }
-.action-body { padding: 6px 0 0 30px; min-width: 0; }
-.restricted { padding: 0 6px; border-radius: 3px; background: #ffebe6; color: #bf2600; font-size: 12px; }
-.history-table { border-collapse: collapse; width: 100%; table-layout: fixed; }
-.history-table th { text-align: left; font-size: 12px; color: var(--text-subtle); font-weight: 600; padding: 2px 8px 2px 0; }
-.history-table th:first-child { width: 22%; }
-.history-table td { vertical-align: top; padding: 2px 8px 2px 0; }
-.history-field { font-weight: 600; overflow-wrap: anywhere; }
-.change-value { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 220px; overflow-y: auto; }
-
-/* ---------------------------------------------------------------- rich text (HTML written by Jira) */
-.rich { overflow-wrap: anywhere; min-width: 0; }
-.rich a:not([href]) { color: inherit; }
-.rich.plain { white-space: pre-wrap; }
-.rich > :first-child { margin-top: 0; }
-.rich > :last-child { margin-bottom: 0; }
-.rich p { margin: 0 0 10px; }
-.rich h1 { font-size: 22px; } .rich h2 { font-size: 19px; } .rich h3 { font-size: 17px; }
-.rich h4, .rich h5, .rich h6 { font-size: 15px; }
-.rich ul, .rich ol { padding-left: 24px; margin: 0 0 10px; }
-.rich blockquote { margin: 0 0 10px; padding-left: 12px; border-left: 2px solid var(--border-strong); color: var(--text-subtle); }
-.rich pre, .rich code, .rich tt { font-family: var(--mono); font-size: 12px; }
-.rich pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; }
-.rich .code, .rich .preformatted, .rich .panel { border: 1px solid var(--border); border-radius: 3px; margin: 0 0 10px; background: var(--background-subtle); }
-.rich .panel { background: transparent; }
-.rich .codeHeader, .rich .preformattedHeader, .rich .panelHeader { padding: 4px 10px; border-bottom: 1px solid var(--border); font-weight: 600; }
-.rich .codeContent, .rich .preformattedContent, .rich .panelContent { padding: 8px 10px; }
-.rich .code-keyword { color: #0052cc; } .rich .code-quote { color: #00875a; } .rich .code-comment { color: #6b778c; font-style: italic; }
-.rich .code-object { color: #6554c0; } .rich .code-tag { color: #de350b; }
-.rich .table-wrap { overflow-x: auto; margin: 0 0 10px; }
-.rich table { border-collapse: collapse; }
-.rich th, .rich td { border: 1px solid var(--border-strong); padding: 4px 8px; vertical-align: top; text-align: left; }
-.rich th { background: var(--background-subtle); font-weight: 600; }
-.rich hr { border: none; border-top: 1px solid var(--border); }
-.rich .aui-message, .rich .information-macro { padding: 8px 12px; border-radius: 3px; background: var(--selected); margin: 0 0 10px; }
-.rich .aui-message.warning, .rich .information-macro-warning { background: #fffae6; }
-.rich .aui-message.error, .rich .information-macro-note { background: #ffebe6; }
-.rich .aui-message.success, .rich .information-macro-tip { background: #e3fcef; }
-.rich .error { color: #bf2600; }
-.rich-image { max-width: 100%; height: auto; border: 1px solid var(--border); }
-.missing-image { display: inline-block; padding: 2px 6px; border: 1px dashed var(--border-strong); border-radius: 3px; color: var(--text-subtle); font-size: 12px; }
-
-/* ---------------------------------------------------------------- small screens */
-@media (max-width: 1100px) {
-  .columns { flex-direction: column; }
-  .column-side { flex: 1 1 auto; width: 100%; }
-}
-@media (max-width: 800px) {
-  .layout { display: block; }
-  .sidebar { position: static; height: auto; flex-direction: row; flex-wrap: wrap; align-items: center; padding: 8px 16px; }
-  .sidebar-project { padding: 0 8px 0 0; }
-  .sidenav { flex-direction: row; flex-wrap: wrap; }
-  .sidebar-footer { display: none; }
-  .content { padding: 16px; }
-  .topnav, .readonly-badge { display: none; }
-  .quick-search { max-width: 45vw; }
-  .detail dt { flex-basis: 110px; }
-}
-
-/* ---------------------------------------------------------------- printing */
-/* Zephyr tests: test steps and executions */
-.zephyr-steps td, .zephyr-executions td { vertical-align: top; }
-.zephyr-steps .rich, .zephyr-details .rich { margin: 0; }
-.data-table .col-number { width: 24px; color: var(--text-subtle); }
-.zephyr-status { background: #dfe1e6; color: #42526e; }
-.zephyr-files { margin: 0; padding-left: 16px; }
-.zephyr-details { margin-top: 12px; }
-.zephyr-execution { border: 1px solid var(--border); border-radius: 3px; margin-bottom: 8px; padding: 6px 10px; }
-.zephyr-execution > summary { cursor: pointer; }
-.zephyr-execution[open] > summary { margin-bottom: 8px; }
-.zephyr-comment { margin-bottom: 8px; }
-
-/* Printing / "Save as PDF" (Print button of an issue, or Ctrl+P) */
-.print-only { display: none; }
-@media print {
-  @page { margin: 15mm; }
-  body { background: #fff; font-size: 12px; }
-  .topbar, .sidebar, .toolbar, .filters, .pager, .tabs, .issue-nav { display: none !important; }
-  .print-only { display: block; }
-  .zephyr-details > p.muted { display: none; }
-  .print-source { color: var(--text-subtle); font-size: 10px; border-bottom: 1px solid var(--border); padding-bottom: 4px; margin: 0 0 8px; }
-  .layout, .content, .main { display: block; padding: 0; margin: 0; max-width: none; }
-  .columns { display: block; }
-  .module-title { break-after: avoid; }
-  .action, .detail, tr, .zephyr-execution > summary, .attachment { break-inside: avoid; }
-  .rich pre { white-space: pre-wrap; overflow-wrap: anywhere; }
-  .rich, .rich table { overflow: visible !important; }
-  .lozenge, .zephyr-status, .avatar, .type-icon { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
-  a { color: inherit; text-decoration: none; }
-  a.external::after { content: ""; }
-}
+Les tickets et commentaires invisibles pour le compte utilisé (niveau de sécurité ou restriction à un groupe dont il ne fait pas partie) ne peuvent pas être archivés. L'outil de vérification de connexion signale avant l'archivage les projets qui utilisent des niveaux de sécurité.
+Les tableaux Jira Software (colonnes, sprints), les tableaux de bord, les filtres enregistrés et les schémas de workflow ne sont pas archivés. Le sprint de chaque ticket reste visible dans ses champs.
+Seul Zephyr Squad est pris en charge. Les cas de test Zephyr Scale ne sont pas des tickets Jira et ne sont pas archivés.
+Les noms et onglets des écrans Jira ne sont pas archivés. Les champs configurés pour chaque type de ticket le sont.
+Détail technique complet, dépannage et description du format : README.md et docs/ARCHIVE_FORMAT.md dans le dépôt automatic-jira-archiving.
