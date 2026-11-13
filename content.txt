@@ -1,219 +1,1741 @@
-"""Offline web viewer packed into every archive (``OPEN_ARCHIVE.html``).
+/*
+ * automatic-jira-archiving - offline viewer of a Jira project archive.
+ *
+ * How it works
+ * ------------
+ * OPEN_ARCHIVE.html loads this file and two data files (viewer/data/project.js and
+ * viewer/data/index.js). Each data file calls jaLoad() with its data. The full data of
+ * an issue (viewer/data/issues/<KEY>.js) and the text used by the search
+ * (viewer/data/search/<n>.js) are loaded only when needed.
+ * Data files are scripts and not JSON files because a page opened from the disk
+ * (file://) may load scripts, but may not read JSON files.
+ *
+ * The pages ("views") are selected by the end of the address (location.hash), e.g.
+ * #/issues?status=Done or #/issue/ABC-12, so the back/forward buttons and bookmarks work.
+ *
+ * Security
+ * --------
+ * Everything that comes from Jira is untrusted. It is inserted in the page as plain text
+ * (textContent), never as HTML, with one exception: rich text fields (description,
+ * comments...) are HTML produced by Jira. They go through sanitizeHtml(), which rebuilds
+ * them using an allow-list of harmless tags and attributes (no scripts, no event handlers,
+ * no external images, no forms). On top of that, the Content-Security-Policy of
+ * OPEN_ARCHIVE.html blocks any script that is not part of the viewer and any network access.
+ *
+ * Plain JavaScript, no library, no build step: the file can be read and changed as is.
+ */
+(function () {
+  "use strict";
 
-The viewer is a static web page: after the ZIP file has been extracted, a
-double-click on ``OPEN_ARCHIVE.html`` shows the whole project in the web browser
-(project summary, issue list with filters and search, board, issue pages with
-comments, history, attachments...). It needs no Python, no server, no
-installation and no network access, so anyone can open an archive.
+  var DATA_DIR = "viewer/data/";
+  var PAGE_SIZE = 50;
+  var BOARD_COLUMN_LIMIT = 100;
 
-Why the data is written as ``.js`` files instead of ``.json`` files: a page opened
-from the disk (``file://``) is not allowed to read local JSON files, but it may
-load local scripts. Each data file is therefore one single call
-``jaLoad("<kind>", <JSON data>);`` that hands the data to the viewer. The JSON is
-ASCII-only (``\\u00e9`` instead of ``é``), so the files read correctly whatever the
-browser and its encoding settings.
+  // ======================================================================= data
+  var store = {
+    project: null,          // viewer/data/project.js
+    index: null,            // viewer/data/index.js
+    issues: Object.create(null),      // full issues already loaded, by key
+    searchText: Object.create(null),  // text of the issues for the search, by key
+    searchFilesLoaded: 0
+  };
 
-Files written in the archive folder::
-
-    OPEN_ARCHIVE.html             the page to double-click (copied from viewer_assets/)
-    viewer/app.js, viewer/app.css the viewer program and its layout (copied from viewer_assets/)
-    viewer/data/project.js        project configuration (components, versions, roles, ...)
-    viewer/data/index.js          one short line per issue: what the list, filters and board need
-    viewer/data/issues/<KEY>.js   full data of one issue (same content as in project.json)
-    viewer/data/search/<n>.js     text of the issues for the full-text search (500 issues per file)
-
-``project.json`` stays the reference copy of the data. The viewer files are a
-second, browser-friendly copy of the same data.
-"""
-
-from __future__ import annotations
-
-import json
-import re
-import shutil
-import unicodedata
-from collections.abc import Iterable
-from pathlib import Path
-from typing import Any
-
-from .formatting import format_dev_summary, is_dev_summary
-from .utils import atomic_write_bytes, read_json
-
-ASSETS_DIR = Path(__file__).resolve().parent / "viewer_assets"
-ENTRY_PAGE = "OPEN_ARCHIVE.html"
-VIEWER_DIR = "viewer"
-SEARCH_CHUNK_SIZE = 500
-
-#: Columns of ``index.js`` (one array per issue, in this order).
-INDEX_COLUMNS = [
-    "key", "id", "summary", "type", "subtask", "status", "statusCategory", "priority", "resolution",
-    "assignee", "reporter", "created", "updated", "resolved", "due", "components", "fixVersions",
-    "versions", "labels", "parent", "attachments", "comments", "notes",
-]
-
-_COMBINING_MARKS = re.compile("[̀-ͯ]")
-
-
-def fold(text: str) -> str:
-    """Lower case without accents, for the search (the viewer does exactly the same in JavaScript)."""
-    return _COMBINING_MARKS.sub("", unicodedata.normalize("NFKD", text).lower())
-
-
-def _js(kind: str, *payload: Any) -> bytes:
-    """Content of one data file: ``jaLoad("kind", ...);`` with ASCII-only JSON."""
-    args = ", ".join(json.dumps(item, ensure_ascii=True, separators=(",", ":")) for item in payload)
-    return f"jaLoad({json.dumps(kind)}, {args});\n".encode("ascii")
-
-
-def _value(issue: dict[str, Any], field_id: str) -> Any:
-    return (issue.get("fields", {}).get(field_id) or {}).get("value")
-
-
-def _name(value: Any) -> str:
-    """Display name of a Jira object (user, status, version, option...)."""
-    if isinstance(value, dict):
-        for key in ("displayName", "name", "value", "key"):
-            if isinstance(value.get(key), str) and value[key]:
-                return value[key]
-        return ""
-    return value if isinstance(value, str) else ""
-
-
-def _names(values: Any) -> list[str]:
-    return [name for name in (_name(v) for v in values or []) if name] if isinstance(values, list) else []
-
-
-def index_row(issue: dict[str, Any]) -> list[Any]:
-    """The line of ``index.js`` describing *issue* (see :data:`INDEX_COLUMNS`)."""
-    status = _value(issue, "status") or {}
-    category = (status.get("statusCategory") or {}).get("key", "") if isinstance(status, dict) else ""
-    parent = _value(issue, "parent")
-    labels = _value(issue, "labels")
-    row = {
-        "key": issue["key"],
-        "id": issue.get("id"),
-        "summary": _value(issue, "summary") or "",
-        "type": (issue.get("issue_type") or {}).get("name") or _name(_value(issue, "issuetype")),
-        "subtask": bool((issue.get("issue_type") or {}).get("subtask")),
-        "status": _name(status),
-        "statusCategory": category,
-        "priority": _name(_value(issue, "priority")),
-        "resolution": _name(_value(issue, "resolution")),
-        "assignee": _name(_value(issue, "assignee")),
-        "reporter": _name(_value(issue, "reporter")),
-        "created": _value(issue, "created") or "",
-        "updated": _value(issue, "updated") or "",
-        "resolved": _value(issue, "resolutiondate") or "",
-        "due": _value(issue, "duedate") or "",
-        "components": _names(_value(issue, "components")),
-        "fixVersions": _names(_value(issue, "fixVersions")),
-        "versions": _names(_value(issue, "versions")),
-        "labels": [str(label) for label in labels] if isinstance(labels, list) else [],
-        "parent": parent.get("key", "") if isinstance(parent, dict) else "",
-        "attachments": len(issue.get("attachments") or []),
-        "comments": len(issue.get("comments") or []),
-        "notes": len(issue.get("archive_notes") or []),
+  // Called by every data file.
+  window.jaLoad = function (kind, first, second) {
+    if (kind === "project") { store.project = first; }
+    else if (kind === "index") { store.index = first; }
+    else if (kind === "issue" && first && typeof first.key === "string") { store.issues[first.key] = first; }
+    else if (kind === "search" && second && typeof second === "object") {
+      Object.keys(second).forEach(function (key) { store.searchText[key] = second[key]; });
+      store.searchFilesLoaded += 1;
     }
-    return [row[column] for column in INDEX_COLUMNS]
+  };
 
+  function loadScript(src) {
+    return new Promise(function (resolve, reject) {
+      var script = document.createElement("script");
+      script.src = src;
+      script.async = true;
+      script.onload = function () { script.remove(); resolve(); };
+      script.onerror = function () { script.remove(); reject(new Error("Missing file: " + src)); };
+      document.head.appendChild(script);
+    });
+  }
 
-def _texts(value: Any) -> Iterable[str]:
-    """Every piece of text of a field value (strings, and names of users/options/versions)."""
-    if is_dev_summary(value):  # Java text dump: only its readable summary is searchable
-        yield format_dev_summary(value)
-    elif isinstance(value, str):
-        yield value
-    elif isinstance(value, list):
-        for item in value:
-            yield from _texts(item)
-    elif isinstance(value, dict):
-        for key in ("displayName", "name", "value"):
-            if isinstance(value.get(key), str):
-                yield value[key]
-        if isinstance(value.get("child"), dict):
-            yield from _texts(value["child"])
+  var ISSUE_KEY_RE = /^[A-Za-z][A-Za-z0-9_]*-\d+$/;
 
+  function loadIssue(key) {
+    if (store.issues[key]) { return Promise.resolve(store.issues[key]); }
+    if (!ISSUE_KEY_RE.test(key)) { return Promise.reject(new Error("Invalid issue key")); }
+    return loadScript(DATA_DIR + "issues/" + encodeURIComponent(key) + ".js").then(function () {
+      if (!store.issues[key]) { throw new Error("The data file of " + key + " is empty or damaged."); }
+      return store.issues[key];
+    });
+  }
 
-def search_text(issue: dict[str, Any]) -> str:
-    """Searchable text of an issue: every field, comments, work log comments, file names, web links."""
-    parts: list[str] = []
-    for field_id, entry in (issue.get("fields") or {}).items():
-        if field_id in ("issuelinks", "subtasks", "parent", "project", "watches", "votes"):
-            continue
-        parts.extend(_texts((entry or {}).get("value")))
-    for comment in issue.get("comments") or []:
-        parts.append(str(comment.get("body") or ""))
-    for worklog in issue.get("worklogs") or []:
-        parts.append(str(worklog.get("comment") or ""))
-    for attachment in issue.get("attachments") or []:
-        parts.append(str(attachment.get("filename") or ""))
-    for link in issue.get("remote_links") or []:
-        obj = link.get("object") or {}
-        parts.extend(str(obj.get(k) or "") for k in ("title", "url"))
-    zephyr = issue.get("zephyr") or {}
-    for step in zephyr.get("steps") or []:
-        parts.extend(str(step.get(k) or "") for k in ("step", "data", "result"))
-    for execution in zephyr.get("executions") or []:
-        parts.extend(str(execution.get(k) or "") for k in ("cycleName", "folderName", "versionName", "comment"))
-        parts.extend(str(result.get("comment") or "") for result in execution.get("step_results") or [])
-    return fold(" ".join(p for p in parts if p))
+  var searchLoading = null;
+  function loadSearchText(onProgress) {
+    if (!searchLoading) {
+      var total = store.index.searchFiles || 0;
+      var chain = Promise.resolve();
+      for (var n = 0; n < total; n++) {
+        chain = chain.then(loadScript.bind(null, DATA_DIR + "search/" + n + ".js")).then(function () {
+          if (onProgress) { onProgress(store.searchFilesLoaded, total); }
+        });
+      }
+      searchLoading = chain;
+    }
+    return searchLoading;
+  }
+  function searchReady() { return store.searchFilesLoaded >= (store.index.searchFiles || 0); }
 
+  // Index: one object per issue, plus lookup by key.
+  var issues = [];
+  var byKey = Object.create(null);
 
-def _project_data(header: dict[str, Any]) -> dict[str, Any]:
-    """Project configuration for the viewer: ``project.json`` without the issues and the bulky parts."""
-    schemes = header.get("schemes") or {}
-    return {
-        "archive": header.get("archive"),
-        "project": header.get("project"),
-        "components": header.get("components"),
-        "versions": header.get("versions"),
-        "roles": header.get("roles"),
-        "schemes": {name: (scheme or {}).get("name") if isinstance(scheme, dict) else None
-                    for name, scheme in schemes.items()},
-        "statuses_by_issue_type": header.get("statuses_by_issue_type"),
-        "issue_types": [{k: v for k, v in it.items() if k != "create_screen_fields"}
-                        for it in header.get("issue_types") or []],
-        "fields": header.get("fields"),
-        "zephyr": header.get("zephyr"),
+  function prepareIndex() {
+    var cols = store.index.columns;
+    issues = store.index.rows.map(function (row) {
+      var issue = {};
+      cols.forEach(function (col, i) { issue[col] = row[i]; });
+      issue.keyNumber = keyNumber(issue.key);
+      issue.folded = fold(issue.key + " " + (issue.summary || ""));
+      return issue;
+    });
+    issues.forEach(function (issue) { byKey[issue.key] = issue; });
+  }
+
+  // ==================================================================== helpers
+  function h(tag, attrs) {
+    var el = document.createElement(tag);
+    if (attrs) {
+      Object.keys(attrs).forEach(function (name) {
+        var value = attrs[name];
+        if (value === null || value === undefined || value === false) { return; }
+        if (name === "class") { el.className = value; }
+        else if (name === "text") { el.textContent = value; }
+        else if (name.slice(0, 2) === "on") { el.addEventListener(name.slice(2), value); }
+        else { el.setAttribute(name, value === true ? "" : String(value)); }
+      });
+    }
+    appendAll(el, Array.prototype.slice.call(arguments, 2));
+    return el;
+  }
+
+  function appendAll(el, children) {
+    children.forEach(function (child) {
+      if (Array.isArray(child)) { appendAll(el, child); return; }
+      if (child === null || child === undefined || child === false || child === "") { return; }
+      el.appendChild(child instanceof Node ? child : document.createTextNode(String(child)));
+    });
+    return el;
+  }
+
+  function clear(el) { while (el.firstChild) { el.removeChild(el.firstChild); } return el; }
+
+  function fold(text) {
+    return String(text || "").normalize("NFKD").toLowerCase().replace(/[̀-ͯ]/g, "");
+  }
+
+  function keyNumber(key) {
+    var match = /-(\d+)$/.exec(key || "");
+    return match ? parseInt(match[1], 10) : 0;
+  }
+
+  function isEmpty(value) {
+    if (value === null || value === undefined || value === "") { return true; }
+    if (Array.isArray(value)) { return value.length === 0; }
+    if (typeof value === "object") { return Object.keys(value).length === 0; }
+    return false;
+  }
+
+  function plural(count, word) { return count + " " + word + (count === 1 ? "" : "s"); }
+
+  function encodePath(path) { return String(path).split("/").map(encodeURIComponent).join("/"); }
+
+  function hash(path, params) {
+    var query = "";
+    if (params) {
+      var clean = new URLSearchParams();
+      params.forEach(function (value, name) { if (value !== "" && value !== null) { clean.append(name, value); } });
+      query = clean.toString();
+    }
+    return "#/" + path + (query ? "?" + query : "");
+  }
+
+  function paramsOf(obj) {
+    var params = new URLSearchParams();
+    Object.keys(obj).forEach(function (name) { params.set(name, obj[name]); });
+    return params;
+  }
+
+  var collator = new Intl.Collator(undefined, { sensitivity: "base", numeric: true });
+
+  // Dates are kept as Jira wrote them: "2024-03-01T10:15:30.000+0100" (local time + offset).
+  var DATE_RE = /^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):(\d{2})(?::\d{2}(?:\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?)?/;
+
+  function fmtDate(value) {
+    var m = DATE_RE.exec(value || "");
+    return m ? m[1] + "-" + m[2] + "-" + m[3] : (value || "");
+  }
+
+  function fmtDateTime(value) {
+    var m = DATE_RE.exec(value || "");
+    if (!m) { return value || ""; }
+    var out = m[1] + "-" + m[2] + "-" + m[3];
+    if (m[4]) {
+      out += " " + m[4] + ":" + m[5];
+      if (m[6] && m[6] !== "Z") {
+        var offset = m[6].replace(":", "");
+        out += " (UTC" + offset.slice(0, 3) + ":" + offset.slice(3) + ")";
+      } else if (m[6] === "Z") {
+        out += " (UTC)";
+      }
+    }
+    return out;
+  }
+
+  function dateNode(value, withTime) {
+    if (!value) { return h("span", { class: "muted" }, "None"); }
+    return h("time", { title: value }, withTime === false ? fmtDate(value) : fmtDateTime(value));
+  }
+
+  // 93600 -> "26h". Plain hours: converting to days depends on the Jira "hours per day" setting.
+  function fmtSeconds(seconds) {
+    var total = parseInt(seconds, 10);
+    if (isNaN(total)) { return ""; }
+    var hours = Math.floor(total / 3600);
+    var minutes = Math.floor((total % 3600) / 60);
+    if (hours && minutes) { return hours + "h " + minutes + "m"; }
+    return hours ? hours + "h" : minutes + "m";
+  }
+
+  function fmtSize(bytes) {
+    var size = Number(bytes);
+    if (!isFinite(size) || size < 0) { return ""; }
+    var units = ["bytes", "KB", "MB", "GB", "TB"];
+    var unit = 0;
+    while (size >= 1024 && unit < units.length - 1) { size /= 1024; unit += 1; }
+    return (unit === 0 ? size : size.toFixed(1)) + " " + units[unit];
+  }
+
+  var SPRINT_RE = /^com\.atlassian\.greenhopper\.service\.sprint\.Sprint@\w+\[([\s\S]*)\]$/;
+
+  function fmtSprint(text) {
+    var m = SPRINT_RE.exec(text);
+    if (!m) { return text; }
+    var parts = {};
+    m[1].split(",").forEach(function (item) {
+      var at = item.indexOf("=");
+      if (at > 0) { parts[item.slice(0, at)] = item.slice(at + 1); }
+    });
+    var name = parts.name || text;
+    var state = parts.state;
+    return state && state !== "<null>" ? name + " (" + state.toLowerCase() + ")" : name;
+  }
+
+  // "Development" field (branches, commits, pull requests... from Bitbucket, GitLab...).
+  // Jira Data Center returns it as the text dump of an internal Java object:
+  // "{summaryBean=com.atlassian...SummaryBean@1a2b[...], devSummaryJson={...}}". The readable
+  // counters are taken from the embedded JSON. Same rules as formatting.py (search).
+  var DEV_SECTIONS = [["branch", "branch", "branches"], ["repository", "commit", "commits"],
+    ["pullrequest", "pull request", "pull requests"], ["review", "review", "reviews"], ["build", "build", "builds"],
+    ["deployment-environment", "deployment environment", "deployment environments"]];
+
+  function isDevSummary(value) {
+    if (typeof value === "string") { return value.indexOf("{summaryBean=") === 0 || value.indexOf("devSummaryJson=") >= 0; }
+    if (value && typeof value === "object" && !Array.isArray(value)) {
+      return "cachedValue" in value || (!!value.summary && typeof value.summary === "object" && "pullrequest" in value.summary);
+    }
+    return false;
+  }
+
+  // Reads the JSON object that starts at text[start] (the text may continue after it).
+  function readJsonObject(text, start) {
+    var depth = 0, inString = false;
+    for (var i = start; i < text.length; i++) {
+      var c = text[i];
+      if (inString) {
+        if (c === "\\") { i += 1; } else if (c === "\"") { inString = false; }
+      } else if (c === "\"") { inString = true; }
+      else if (c === "{") { depth += 1; }
+      else if (c === "}") {
+        depth -= 1;
+        if (depth === 0) { return JSON.parse(text.slice(start, i + 1)); }
+      }
+    }
+    throw new Error("Incomplete JSON");
+  }
+
+  function devSummaryData(value) {
+    var data = value;
+    if (typeof value === "string") {
+      var at = value.indexOf("devSummaryJson=");
+      if (at < 0 || value[at + 15] !== "{") { return null; }
+      try { data = readJsonObject(value, at + 15); } catch (error) { return null; }
+    }
+    if (data && typeof data.cachedValue === "object" && data.cachedValue) { data = data.cachedValue; }
+    return data && data.summary && typeof data.summary === "object" ? data.summary : null;
+  }
+
+  // Fallback when there is no embedded JSON: read the counters in the Java text dump.
+  function devCountsFromText(text) {
+    var re = /\b(branch|repository|pullrequest|review|build|deployment-environment)=com\.atlassian/g;
+    var found = [], match, sections = {};
+    while ((match = re.exec(text)) !== null) { found.push([match[1], match.index, re.lastIndex]); }
+    found.forEach(function (item, n) {
+      var part = text.slice(item[2], n + 1 < found.length ? found[n + 1][1] : text.length);
+      var count = /\bcount=(\d+)/.exec(part);
+      var state = /\bstate='?([A-Za-z]+)/.exec(part);
+      sections[item[0]] = { overall: { count: count ? parseInt(count[1], 10) : 0, state: state ? state[1] : null } };
+    });
+    return sections;
+  }
+
+  function devDetails(section, overall) {
+    var details = overall.details && typeof overall.details === "object" ? overall.details : {};
+    function counts(source, pairs) {
+      return pairs.filter(function (p) { return source[p[0]]; }).map(function (p) { return source[p[0]] + " " + p[1]; }).join(", ");
+    }
+    if (section === "pullrequest") {
+      return counts(details, [["openCount", "open"], ["mergedCount", "merged"], ["declinedCount", "declined"]]) ||
+        String(overall.state || "").toLowerCase();
+    }
+    if (section === "build") {
+      return counts(overall, [["successfulBuildCount", "successful"], ["failedBuildCount", "failed"], ["unknownBuildCount", "unknown"]]);
+    }
+    if (section === "deployment-environment") {
+      return (overall.topEnvironments || []).map(function (env) { return env && (env.title || env.name); }).filter(Boolean).join(", ");
+    }
+    return "";
+  }
+
+  // "1 branch, 3 commits, 1 pull request (merged) - Bitbucket Server", or "" when there is nothing.
+  function fmtDevSummary(value) {
+    var summary = devSummaryData(value) || (typeof value === "string" ? devCountsFromText(value) : {});
+    var parts = [], sources = [];
+    DEV_SECTIONS.forEach(function (section) {
+      var item = summary[section[0]] && typeof summary[section[0]] === "object" ? summary[section[0]] : {};
+      var overall = item.overall && typeof item.overall === "object" ? item.overall : {};
+      var count = parseInt(overall.count, 10) || 0;
+      if (count <= 0) { return; }
+      var text = count + " " + (count === 1 ? section[1] : section[2]);
+      var details = devDetails(section[0], overall);
+      parts.push(details ? text + " (" + details + ")" : text);
+      Object.keys(item.byInstanceType || {}).forEach(function (type) {
+        var name = (item.byInstanceType[type] || {}).name;
+        if (name && sources.indexOf(name) < 0) { sources.push(String(name)); }
+      });
+    });
+    if (!parts.length) { return ""; }
+    return parts.join(", ") + (sources.length ? " - " + sources.join(", ") : "");
+  }
+
+  // Any Jira value (user, option, version, list...) as short text.
+  function fmt(value) {
+    if (isEmpty(value)) { return ""; }
+    if (isDevSummary(value)) { return fmtDevSummary(value); }
+    if (typeof value === "boolean") { return value ? "Yes" : "No"; }
+    if (typeof value === "number") { return String(value); }
+    if (typeof value === "string") {
+      if (value.indexOf("com.atlassian.greenhopper.service.sprint.Sprint@") === 0) { return fmtSprint(value); }
+      if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(value)) { return fmtDateTime(value); }
+      return value;
+    }
+    if (Array.isArray(value)) { return value.map(fmt).filter(Boolean).join(", "); }
+    if (typeof value === "object") { return fmtObject(value); }
+    return String(value);
+  }
+
+  function fmtObject(value) {
+    if (value.child && typeof value.child === "object") { return (value.value || "") + " > " + fmt(value.child); }
+    if ("displayName" in value) {
+      var name = value.displayName || value.name || "";
+      return value.active === false ? name + " (inactive)" : name;
+    }
+    if ("votes" in value) { return String(value.votes || 0); }
+    if ("watchCount" in value) { return String(value.watchCount || 0); }
+    if ("percent" in value && "total" in value) {
+      return (value.percent || 0) + "% (" + fmtSeconds(value.progress) + " of " + fmtSeconds(value.total) + ")";
+    }
+    if ("originalEstimate" in value || "remainingEstimate" in value || "timeSpent" in value) {
+      return [["originalEstimate", "Original"], ["remainingEstimate", "Remaining"], ["timeSpent", "Logged"]]
+        .filter(function (p) { return value[p[0]]; })
+        .map(function (p) { return p[1] + ": " + value[p[0]]; }).join(", ");
+    }
+    if ("key" in value && "fields" in value) {
+      return (value.key + " " + ((value.fields || {}).summary || "")).trim();
+    }
+    var keys = ["name", "value", "key", "label", "title"];
+    for (var i = 0; i < keys.length; i++) {
+      if (!isEmpty(value[keys[i]])) { return String(value[keys[i]]); }
+    }
+    return JSON.stringify(value).slice(0, 500);
+  }
+
+  // ====================================================================== icons
+  var SVG_NS = "http://www.w3.org/2000/svg";
+
+  function svg(cls, shapes, title) {
+    var el = document.createElementNS(SVG_NS, "svg");
+    el.setAttribute("viewBox", "0 0 16 16");
+    el.setAttribute("class", cls);
+    el.setAttribute("aria-hidden", "true");
+    shapes.forEach(function (shape) {
+      var node = document.createElementNS(SVG_NS, shape[0]);
+      Object.keys(shape[1]).forEach(function (name) { node.setAttribute(name, shape[1][name]); });
+      el.appendChild(node);
+    });
+    var wrap = h("span", { class: "icon", title: title || null });
+    wrap.appendChild(el);
+    return wrap;
+  }
+
+  var WHITE = "#ffffff";
+  var STROKE = { fill: "none", stroke: WHITE, "stroke-width": "1.8", "stroke-linecap": "round", "stroke-linejoin": "round" };
+  function stroke(d) { return ["path", Object.assign({ d: d }, STROKE)]; }
+
+  var TYPE_ICONS = {
+    bug: ["#e5493a", [["circle", { cx: 8, cy: 8, r: 3.5, fill: WHITE }]]],
+    story: ["#63ba3c", [["path", { d: "M5 3.5h6v9l-3-2.2-3 2.2z", fill: WHITE }]]],
+    task: ["#4bade8", [stroke("M4.5 8.3l2.4 2.4 4.6-5")]],
+    epic: ["#904ee2", [["path", { d: "M9.5 2.5L4.5 9h3.2l-1.2 4.5L11.5 7H8.3z", fill: WHITE }]]],
+    subtask: ["#4bade8", [["rect", { x: 3.5, y: 3.5, width: 5.5, height: 5.5, rx: 1, fill: "none", stroke: WHITE, "stroke-width": 1.5 }],
+                          ["rect", { x: 7, y: 7, width: 5.5, height: 5.5, rx: 1, fill: WHITE }]]],
+    improvement: ["#63ba3c", [["path", { d: "M8 3.5l4 4.5H9.3v4.5H6.7V8H4z", fill: WHITE }]]],
+    feature: ["#63ba3c", [["path", { d: "M7 4h2v3h3v2H9v3H7V9H4V7h3z", fill: WHITE }]]],
+    test: ["#00a3bf", [stroke("M6.5 3.5h3M7 3.5v3.3l-2.6 4.6a.8.8 0 0 0 .7 1.1h5.8a.8.8 0 0 0 .7-1.1L9 6.8V3.5")]],
+    other: ["#8993a4", [["circle", { cx: 8, cy: 8, r: 3, fill: "none", stroke: WHITE, "stroke-width": 1.8 }]]]
+  };
+
+  // Issue type names can be in English, French or German.
+  function typeKind(name, subtask) {
+    var n = fold(name);
+    if (subtask || /sub-?task|sous-tache|unteraufgabe/.test(n)) { return "subtask"; }
+    if (/bug|defect|defaut|anomalie|fehler/.test(n)) { return "bug"; }
+    if (/epic|epopee/.test(n)) { return "epic"; }
+    if (/(^|[^a-z])test|cas de test|testfall/.test(n)) { return "test"; }   // Zephyr "Test" issues
+    if (/stor|recit/.test(n)) { return "story"; }
+    if (/improve|amelior|verbesser/.test(n)) { return "improvement"; }
+    if (/feature|fonctionnalit|funktion/.test(n)) { return "feature"; }
+    if (/task|tache|aufgabe/.test(n)) { return "task"; }
+    return "other";
+  }
+
+  function typeIcon(name, subtask) {
+    var icon = TYPE_ICONS[typeKind(name, subtask)];
+    return svg("type-icon", [["rect", { width: 16, height: 16, rx: 3, fill: icon[0] }]].concat(icon[1]), name);
+  }
+
+  var UP = "M3.5 10l4.5-4.5 4.5 4.5";
+  var DOWN = "M3.5 6l4.5 4.5 4.5-4.5";
+  function priorityShapes(color, paths) {
+    return paths.map(function (d) {
+      return ["path", { d: d, fill: "none", stroke: color, "stroke-width": "2", "stroke-linecap": "round", "stroke-linejoin": "round" }];
+    });
+  }
+
+  function priorityIcon(name) {
+    if (!name) { return null; }
+    var n = fold(name);
+    var shapes;
+    if (/highest|blocker|bloquant|critical|critique|kritisch|hochste|blocker/.test(n)) {
+      shapes = priorityShapes("#cd1317", ["M3.5 8l4.5-4.5 4.5 4.5", "M3.5 12.5l4.5-4.5 4.5 4.5"]);
+    } else if (/lowest|trivial|tres basse|niedrigste|unwesentlich/.test(n)) {
+      shapes = priorityShapes("#57a55a", ["M3.5 3.5l4.5 4.5 4.5-4.5", "M3.5 8l4.5 4.5 4.5-4.5"]);
+    } else if (/high|major|majeur|haute|elevee|hoch|wichtig/.test(n)) {
+      shapes = priorityShapes("#e9494a", [UP]);
+    } else if (/low|minor|mineur|basse|faible|niedrig|gering/.test(n)) {
+      shapes = priorityShapes("#2a8735", [DOWN]);
+    } else if (/medium|normal|moyenne|mittel/.test(n)) {
+      shapes = priorityShapes("#e97f33", ["M3.5 6h9", "M3.5 10h9"]);
+    } else {
+      shapes = [["circle", { cx: 8, cy: 8, r: 3, fill: "#8993a4" }]];
+    }
+    return svg("priority-icon", shapes, name);
+  }
+
+  var AVATAR_COLORS = ["#0052cc", "#00875a", "#6554c0", "#ff5630", "#ff991f", "#00a3bf", "#5243aa", "#de350b", "#36b37e", "#172b4d"];
+
+  function avatar(name, small) {
+    var text = String(name || "?");
+    var words = text.replace(/\(.*?\)/g, "").trim().split(/\s+/).filter(Boolean);
+    var initials = words.length > 1 ? words[0][0] + words[words.length - 1][0] : text.slice(0, 2);
+    var sum = 0;
+    for (var i = 0; i < text.length; i++) { sum = (sum * 31 + text.charCodeAt(i)) % 9973; }
+    var el = h("span", { class: "avatar" + (small ? " avatar-small" : ""), title: text, "aria-hidden": "true" },
+      initials.toUpperCase());
+    el.style.backgroundColor = AVATAR_COLORS[sum % AVATAR_COLORS.length];
+    return el;
+  }
+
+  function userNode(user, emptyText) {
+    if (!user || isEmpty(user)) { return h("span", { class: "muted" }, emptyText || "None"); }
+    var name = typeof user === "string" ? user : fmt(user);
+    return h("span", { class: "user" }, avatar(name, true), h("span", null, name));
+  }
+
+  var STATUS_CATEGORY_ORDER = { "new": 0, "indeterminate": 1, "done": 2 };
+
+  function lozenge(name, category) {
+    if (!name) { return h("span", { class: "muted" }, "None"); }
+    return h("span", { class: "lozenge lozenge-" + (category || "default") }, name);
+  }
+
+  function statusNode(status) {
+    if (!status) { return lozenge(""); }
+    return lozenge(status.name || fmt(status), (status.statusCategory || {}).key);
+  }
+
+  function issueLink(key, text) {
+    if (byKey[key]) {
+      return h("a", { href: hash("issue/" + key), class: byKey[key].statusCategory === "done" ? "issue-link done" : "issue-link" },
+        text || key);
+    }
+    return h("span", { class: "issue-link external-issue", title: "This issue is not part of this archive" }, text || key);
+  }
+
+  function emptyNote(text) { return h("p", { class: "muted" }, text); }
+
+  // ============================================================ HTML sanitizer
+  var ALLOWED_TAGS = new Set(("a abbr b big blockquote br caption center cite code col colgroup dd del dfn div dl dt em " +
+    "font h1 h2 h3 h4 h5 h6 hr i ins kbd li mark ol p pre q s samp small span strike strong sub sup table tbody td " +
+    "tfoot th thead tr tt u ul var").split(" "));
+  // Removed together with everything inside them.
+  var DROPPED_TAGS = new Set(("script style iframe frame frameset object embed applet noscript template svg math " +
+    "form input button textarea select option link meta base audio video canvas source track title head").split(" "));
+  var ALLOWED_ATTRIBUTES = new Set(("class title align valign width height colspan rowspan color start type dir lang " +
+    "border").split(" "));
+  var UNSAFE_CSS = /url\s*\(|expression|javascript:|behavior|-moz-binding|@import|position|z-index/i;
+
+  var EMOTICONS = {
+    smile: "\u{1F642}", sad: "\u{1F641}", tongue: "\u{1F61B}", biggrin: "\u{1F603}", wink: "\u{1F609}",
+    thumbs_up: "\u{1F44D}", thumbs_down: "\u{1F44E}", information: "ℹ️", check: "✅",
+    error: "❌", warning: "⚠️", add: "➕", forbidden: "⛔", help_16: "❓",
+    lightbulb_on: "\u{1F4A1}", lightbulb: "\u{1F4A1}", star_yellow: "⭐", star_red: "⭐",
+    star_green: "⭐", star_blue: "⭐", flag: "\u{1F6A9}", flag_grey: "\u{1F3F3}️"
+  };
+
+  // context: { attachments: { "<attachment id>": "attachments/KEY-1/..." } }
+  function sanitizeHtml(html, context) {
+    var doc = new DOMParser().parseFromString("<!DOCTYPE html><html><body>" + String(html), "text/html");
+    var out = document.createDocumentFragment();
+    copyChildren(doc.body, out, context || {});
+    return out;
+  }
+
+  function copyChildren(source, target, context) {
+    Array.prototype.forEach.call(source.childNodes, function (node) {
+      var clean = cleanNode(node, context);
+      if (clean) { target.appendChild(clean); }
+    });
+  }
+
+  function cleanNode(node, context) {
+    if (node.nodeType === Node.TEXT_NODE) { return document.createTextNode(node.nodeValue); }
+    if (node.nodeType !== Node.ELEMENT_NODE) { return null; }
+    var tag = node.tagName.toLowerCase();
+    if (DROPPED_TAGS.has(tag)) { return null; }
+    if (tag === "img") { return cleanImage(node, context); }
+    if (!ALLOWED_TAGS.has(tag)) {        // unknown tag: keep its content only
+      var fragment = document.createDocumentFragment();
+      copyChildren(node, fragment, context);
+      return fragment;
+    }
+    var el = document.createElement(tag);
+    Array.prototype.forEach.call(node.attributes, function (attr) {
+      var name = attr.name.toLowerCase();
+      if (name === "style") {
+        var css = cleanStyle(attr.value);
+        if (css) { el.setAttribute("style", css); }
+      } else if (ALLOWED_ATTRIBUTES.has(name)) {
+        el.setAttribute(name, attr.value);
+      }
+    });
+    if (tag === "a") { cleanLink(node.getAttribute("href"), el, context); }
+    copyChildren(node, el, context);
+    return el;
+  }
+
+  function cleanStyle(css) {
+    return String(css).split(";").filter(function (rule) {
+      return rule.trim() && !UNSAFE_CSS.test(rule);
+    }).join(";");
+  }
+
+  function attachmentPath(url, context) {
+    var m = /\/secure\/(?:attachment|thumbnail)\/(\d+)\//.exec(url || "");
+    return m && context.attachments ? context.attachments[m[1]] || null : null;
+  }
+
+  function cleanLink(href, el, context) {
+    href = String(href || "").trim();
+    var local = attachmentPath(href, context);
+    if (local) {
+      el.setAttribute("href", encodePath(local));
+      el.setAttribute("target", "_blank");
+      return;
+    }
+    var browse = /\/browse\/([A-Za-z][A-Za-z0-9_]*-\d+)\/?(?:[?#].*)?$/.exec(href);
+    if (browse && byKey[browse[1].toUpperCase()]) {
+      el.setAttribute("href", hash("issue/" + browse[1].toUpperCase()));
+      return;
+    }
+    if (isJiraServerUrl(href)) {
+      // Pages of the old Jira server (user profiles, other projects...): they will not exist any more.
+      el.setAttribute("title", "Link to the former Jira server: " + href);
+      return;
+    }
+    if (/^(https?:|mailto:)/i.test(href)) {
+      el.setAttribute("href", href);
+      el.setAttribute("target", "_blank");
+      el.setAttribute("rel", "noopener noreferrer");
+      el.classList.add("external");
+    }
+    // Any other link (e.g. a page of the old Jira server) is kept as plain text.
+  }
+
+  function isJiraServerUrl(url) {
+    var base = String(((store.project.archive || {}).jira || {}).base_url || "").replace(/\/+$/, "").toLowerCase();
+    var lower = url.toLowerCase();
+    return !!base && (lower === base || lower.indexOf(base + "/") === 0);
+  }
+
+  function cleanImage(node, context) {
+    var src = node.getAttribute("src") || "";
+    var alt = node.getAttribute("alt") || "";
+    if (/emoticon/.test(node.getAttribute("class") || "") || /\/images\/icons\//.test(src)) {
+      var name = (src.split("?")[0].split("/").pop() || "").replace(/\.\w+$/, "");
+      return document.createTextNode(EMOTICONS[name] || (alt || "(" + name + ")"));
+    }
+    var local = attachmentPath(src, context);
+    if (!local) {
+      return h("span", { class: "missing-image" }, "[Image not available in the archive" + (alt ? ": " + alt : "") + "]");
+    }
+    var img = h("img", { src: encodePath(local), alt: alt, loading: "lazy", class: "rich-image" });
+    ["width", "height"].forEach(function (name) {
+      var value = node.getAttribute(name);
+      if (value && /^\d+(\.\d+)?(px)?$/.test(value)) { img.setAttribute(name, value.replace("px", "")); }
+    });
+    return h("a", { href: encodePath(local), target: "_blank", title: "Open the image" }, img);
+  }
+
+  function richText(html, plain, context) {
+    if (html && String(html).trim()) {
+      return h("div", { class: "rich" }, sanitizeHtml(html, context));
+    }
+    var text = fmt(plain);
+    return text ? h("div", { class: "rich plain" }, text) : emptyNote("None");
+  }
+
+  // ===================================================================== layout
+  var app, main, navLinks = {}, quickSearch;
+  var lastListHash = "#/issues";
+  var lastResults = [];        // keys of the last issue list shown (for previous / next)
+  var activityTab = "comments";
+
+  function projectInfo() { return store.project.project || {}; }
+
+  function buildLayout() {
+    var project = projectInfo();
+    var archive = store.project.archive || {};
+    app = document.getElementById("app");
+
+    quickSearch = h("input", { type: "search", name: "q", class: "quick-search", placeholder: "Search issues",
+      "aria-label": "Search issues (key or text)" });
+    var form = h("form", { class: "quick-search-form", role: "search", onsubmit: function (event) {
+      event.preventDefault();
+      var text = quickSearch.value.trim();
+      if (byKey[text.toUpperCase()]) { location.hash = hash("issue/" + text.toUpperCase()); }
+      else { location.hash = hash("issues", paramsOf({ q: text })); }
+    } }, quickSearch);
+
+    function nav(id, label, target) {
+      navLinks[id] = h("a", { href: target, class: "topnav-link" }, label);
+      return navLinks[id];
     }
 
+    var header = h("header", { class: "topbar" },
+      h("a", { href: "#/", class: "brand", title: "Project summary" },
+        svg("brand-icon", [["rect", { x: 1.5, y: 3, width: 13, height: 10.5, rx: 1.5, fill: "none", stroke: WHITE, "stroke-width": 1.5 }],
+          ["path", { d: "M1.5 6.5h13M6 9h4", fill: "none", stroke: WHITE, "stroke-width": 1.5, "stroke-linecap": "round" }]]),
+        h("span", null, "Jira archive")),
+      h("nav", { class: "topnav" }, nav("issues", "Issues", "#/issues"), nav("board", "Board", "#/board")),
+      h("div", { class: "topbar-spacer" }),
+      form,
+      h("span", { class: "readonly-badge", title: "This is an archive: nothing can be changed" }, "Read-only archive"));
 
-def build_viewer(archive_dir: Path, header: dict[str, Any], issue_files: Iterable[Path]) -> int:
-    """Write the viewer and its data into *archive_dir*. Returns the number of files written.
+    function side(id, label, target) {
+      navLinks["side-" + id] = h("a", { href: target, class: "sidenav-link" }, label);
+      return navLinks["side-" + id];
+    }
 
-    *header* is the content of ``project.json`` without the issues, *issue_files*
-    the JSON file of every issue, in key order.
-    """
-    viewer_dir = archive_dir / VIEWER_DIR
-    if viewer_dir.exists():
-        shutil.rmtree(viewer_dir)  # leftovers of an interrupted run
-    data_dir = viewer_dir / "data"
+    var sidebar = h("aside", { class: "sidebar" },
+      h("div", { class: "sidebar-project" },
+        projectAvatar(project, 40),
+        h("div", null,
+          h("div", { class: "sidebar-project-name" }, project.name || project.key || "Project"),
+          h("div", { class: "muted small" }, (project.key || "") + (project.projectTypeKey ? " · " + project.projectTypeKey + " project" : "")))),
+      h("nav", { class: "sidenav" },
+        side("summary", "Summary", "#/"),
+        side("issues", "Issues", "#/issues"),
+        side("board", "Board", "#/board"),
+        side("components", "Components", "#/components"),
+        side("versions", "Versions", "#/versions")),
+      h("div", { class: "sidebar-footer muted small" },
+        "Archived on " + fmtDate(archive.generated_at),
+        h("br"), "Read-only copy, works offline."));
 
-    shutil.copyfile(ASSETS_DIR / ENTRY_PAGE, archive_dir / ENTRY_PAGE)
-    viewer_dir.mkdir(parents=True)
-    for asset in ("app.js", "app.css"):
-        shutil.copyfile(ASSETS_DIR / asset, viewer_dir / asset)
-    written = 3
+    main = h("main", { class: "content", id: "content", tabindex: "-1" });
+    appendAll(app, [header, h("div", { class: "layout" }, sidebar, main)]);
+  }
 
-    atomic_write_bytes(data_dir / "project.js", _js("project", _project_data(header)))
-    written += 1
+  function projectAvatar(project, size) {
+    var el = avatar(project.name || project.key || "?");
+    el.textContent = String(project.key || project.name || "?").slice(0, 1).toUpperCase();
+    el.classList.add("project-avatar");
+    el.style.width = el.style.height = size + "px";
+    el.style.lineHeight = size + "px";
+    el.style.fontSize = Math.round(size / 2) + "px";
+    return el;
+  }
 
-    rows: list[list[Any]] = []
-    chunk: dict[str, str] = {}
-    chunk_count = 0
-    for path in issue_files:
-        issue = read_json(path)
-        rows.append(index_row(issue))
-        chunk[issue["key"]] = search_text(issue)
-        atomic_write_bytes(data_dir / "issues" / f"{issue['key']}.js", _js("issue", issue))
-        written += 1
-        if len(chunk) >= SEARCH_CHUNK_SIZE:
-            atomic_write_bytes(data_dir / "search" / f"{chunk_count}.js", _js("search", chunk_count, chunk))
-            chunk_count, chunk, written = chunk_count + 1, {}, written + 1
-    if chunk:
-        atomic_write_bytes(data_dir / "search" / f"{chunk_count}.js", _js("search", chunk_count, chunk))
-        chunk_count, written = chunk_count + 1, written + 1
+  function setActiveNav(view) {
+    Object.keys(navLinks).forEach(function (id) {
+      var active = id === view || id === "side-" + view || (view === "issue" && (id === "issues" || id === "side-issues"));
+      navLinks[id].classList.toggle("active", active);
+    });
+  }
 
-    index = {"columns": INDEX_COLUMNS, "rows": rows, "searchFiles": chunk_count}
-    atomic_write_bytes(data_dir / "index.js", _js("index", index))
-    return written + 1
+  function setTitle(text) {
+    var project = projectInfo();
+    document.title = (text ? text + " - " : "") + (project.name || project.key || "Jira") + " (archive)";
+  }
+
+  function pageHeader(title, extra) {
+    return h("div", { class: "page-header" }, h("h1", null, title), extra || null);
+  }
+
+  function module(title, content, options) {
+    options = options || {};
+    return h("section", { class: "module" + (options.cls ? " " + options.cls : "") },
+      h("h2", { class: "module-title" }, title, options.count !== undefined ? h("span", { class: "count" }, String(options.count)) : null),
+      h("div", { class: "module-content" }, content));
+  }
+
+  // ================================================================ summary view
+  function countBy(getter) {
+    var counts = new Map();
+    issues.forEach(function (issue) {
+      var values = getter(issue);
+      (Array.isArray(values) ? values : [values]).forEach(function (value) {
+        counts.set(value, (counts.get(value) || 0) + 1);
+      });
+    });
+    return counts;
+  }
+
+  function barList(counts, filterId, limit, decorate) {
+    var entries = Array.from(counts.entries()).sort(function (a, b) { return b[1] - a[1] || collator.compare(a[0], b[0]); });
+    var max = entries.length ? entries[0][1] : 1;
+    var shown = limit ? entries.slice(0, limit) : entries;
+    var list = h("table", { class: "bar-list" });
+    shown.forEach(function (entry) {
+      var bar = h("span", { class: "bar" });
+      bar.style.width = Math.max(2, Math.round(100 * entry[1] / max)) + "%";
+      list.appendChild(h("tr", null,
+        h("td", { class: "bar-label" },
+          h("a", { href: hash("issues", paramsOf(filterValue(filterId, entry[0]))), class: "with-icon" },
+            decorate ? decorate(entry[0]) : entry[0])),
+        h("td", { class: "bar-cell" }, bar),
+        h("td", { class: "bar-count" }, String(entry[1]))));
+    });
+    if (!shown.length) { return emptyNote("No issues."); }
+    var wrap = h("div", null, list);
+    if (limit && entries.length > limit) { wrap.appendChild(h("p", { class: "muted small" }, "and " + (entries.length - limit) + " more")); }
+    return wrap;
+  }
+
+  function filterValue(filterId, value) { var obj = {}; obj[filterId] = value; return obj; }
+
+  function infoTable(rows) {
+    var table = h("table", { class: "info-table" });
+    rows.forEach(function (row) {
+      if (row[1] === null || row[1] === undefined || row[1] === "") { return; }
+      table.appendChild(h("tr", null, h("th", null, row[0]), h("td", null, row[1])));
+    });
+    return table;
+  }
+
+  function viewSummary() {
+    var data = store.project;
+    var project = projectInfo();
+    var archive = data.archive || {};
+    var jira = archive.jira || {};
+    setTitle("Summary");
+
+    var categories = countBy(function (i) { return i.statusCategory || "other"; });
+    var open = (categories.get("new") || 0) + (categories.get("indeterminate") || 0);
+    var done = categories.get("done") || 0;
+    var attachments = issues.reduce(function (sum, i) { return sum + (i.attachments || 0); }, 0);
+    var comments = issues.reduce(function (sum, i) { return sum + (i.comments || 0); }, 0);
+    var withNotes = issues.filter(function (i) { return i.notes; }).length;
+
+    function stat(label, value, target) {
+      var content = [h("div", { class: "stat-value" }, String(value)), h("div", { class: "stat-label" }, label)];
+      return target ? h("a", { class: "stat", href: target }, content) : h("div", { class: "stat" }, content);
+    }
+
+    var lead = project.lead ? userNode(project.lead) : null;
+    var header = h("div", { class: "project-header" },
+      projectAvatar(project, 64),
+      h("div", null,
+        h("h1", null, project.name || project.key),
+        h("div", { class: "muted" }, [project.key, project.projectTypeKey && project.projectTypeKey + " project",
+          (project.projectCategory || {}).name].filter(Boolean).join(" · "))));
+
+    var about = infoTable([
+      ["Key", project.key],
+      ["Lead", lead],
+      ["Category", (project.projectCategory || {}).name],
+      ["Project type", project.projectTypeKey],
+      ["URL", /^https?:/i.test(project.url || "") ? h("a", { href: project.url, target: "_blank", rel: "noopener noreferrer", class: "external" }, project.url) : project.url],
+      ["Components", (data.components || []).length ? h("a", { href: "#/components" }, String(data.components.length)) : "0"],
+      ["Versions", (data.versions || []).length ? h("a", { href: "#/versions" }, String(data.versions.length)) : "0"]
+    ]);
+
+    var types = countBy(function (i) { return i.type || "Unknown"; });
+    var subtaskTypes = new Set(issues.filter(function (i) { return i.subtask; }).map(function (i) { return i.type; }));
+
+    var warnings = archive.warnings || [];
+    var archiveRows = infoTable([
+      ["Archived on", fmtDateTime(archive.generated_at)],
+      ["Export started", fmtDateTime(archive.export_started_at)],
+      ["Source", (jira.base_url || "") + (jira.version ? " (Jira " + jira.version + ")" : "")],
+      ["Created with", archive.tool],
+      ["Archive format", archive.format_version],
+      ["Permission scheme", (data.schemes || {}).permission],
+      ["Notification scheme", (data.schemes || {}).notification],
+      ["Issue security scheme", (data.schemes || {}).issue_security || "None"],
+      ["Issues with archive notes", withNotes ? h("a", { href: hash("issues", paramsOf({ notes: "1" })) }, String(withNotes)) : "0"]
+    ]);
+
+    var left = [
+      module("About this project", [
+        project.description ? richText(/<[a-z]/i.test(project.description) ? project.description : null, project.description, {}) : null,
+        about]),
+      module("Issues by status", barList(countBy(function (i) { return i.status || "None"; }), "status", 0, function (name) {
+        var sample = issues.find(function (i) { return i.status === name; });
+        return lozenge(name, sample && sample.statusCategory);
+      })),
+      module("Issues by type", barList(types, "type", 0, function (name) { return [typeIcon(name, subtaskTypes.has(name)), name]; })),
+      module("Issues by priority", barList(countBy(function (i) { return i.priority || "None"; }), "priority", 0, function (name) {
+        return [priorityIcon(name), name];
+      })),
+      module("Issues by assignee", barList(countBy(function (i) { return i.assignee || "Unassigned"; }), "assignee", 15))
+    ];
+
+    var right = [
+      module("Roles", rolesTable(data.roles || {})),
+      module("Archive information", [archiveRows,
+        warnings.length ? h("div", { class: "message message-warning" },
+          h("strong", null, "Warnings recorded during the export"),
+          h("ul", null, warnings.map(function (w) { return h("li", null, w); }))) : null,
+        h("p", { class: "muted small" }, "The complete data is in project.json. Every file of the archive and its SHA-256 " +
+          "fingerprint are listed in manifest.json (see README.txt).")])
+    ];
+
+    clear(main);
+    appendAll(main, [
+      header,
+      h("div", { class: "stats" },
+        stat("Issues", issues.length, "#/issues"),
+        stat("Open", open, hash("issues", paramsOf({ category: "open" }))),
+        stat("Done", done, hash("issues", paramsOf({ category: "done" }))),
+        stat("Comments", comments),
+        stat("Attachments", attachments)),
+      h("div", { class: "columns" }, h("div", { class: "column-main" }, left), h("div", { class: "column-side" }, right))
+    ]);
+  }
+
+  function rolesTable(roles) {
+    var names = Object.keys(roles).sort(collator.compare);
+    var rows = names.map(function (name) {
+      var actors = (roles[name] || {}).actors || [];
+      return h("tr", null, h("th", null, name),
+        h("td", null, actors.length ? actors.map(function (actor) {
+          var label = actor.displayName || actor.name || "";
+          return h("span", { class: "actor" }, actor.type === "atlassian-group-role-actor" ? "Group: " + label : label);
+        }) : h("span", { class: "muted" }, "Nobody")));
+    });
+    return rows.length ? h("table", { class: "info-table roles" }, rows) : emptyNote("No roles recorded.");
+  }
+
+  // ================================================================= issue lists
+  function listValue(values, emptyLabel) { return values && values.length ? values : [emptyLabel]; }
+
+  var FILTERS = [
+    { id: "type", label: "Type", values: function (i) { return [i.type || "Unknown"]; } },
+    { id: "status", label: "Status", values: function (i) { return [i.status || "None"]; } },
+    { id: "priority", label: "Priority", values: function (i) { return [i.priority || "None"]; } },
+    { id: "resolution", label: "Resolution", values: function (i) { return [i.resolution || "Unresolved"]; } },
+    { id: "assignee", label: "Assignee", values: function (i) { return [i.assignee || "Unassigned"]; } },
+    { id: "reporter", label: "Reporter", values: function (i) { return [i.reporter || "None"]; } },
+    { id: "component", label: "Component", values: function (i) { return listValue(i.components, "No component"); } },
+    { id: "fixVersion", label: "Fix version", values: function (i) { return listValue(i.fixVersions, "No fix version"); } },
+    { id: "version", label: "Affects version", values: function (i) { return listValue(i.versions, "No affects version"); } },
+    { id: "label", label: "Label", values: function (i) { return listValue(i.labels, "No label"); } }
+  ];
+  var HIDDEN_FILTERS = {
+    category: { label: function (v) { return v === "open" ? "Open issues" : v === "done" ? "Done issues" : v; },
+      test: function (i, v) { return v === "open" ? i.statusCategory !== "done" : i.statusCategory === v; } },
+    notes: { label: function () { return "Issues with archive notes"; }, test: function (i) { return i.notes > 0; } },
+    parent: { label: function (v) { return "Sub-tasks of " + v; }, test: function (i, v) { return i.parent === v; } }
+  };
+  var filterOptionsCache = {};
+
+  function filterOptions(filter) {
+    if (!filterOptionsCache[filter.id]) {
+      var counts = new Map();
+      issues.forEach(function (issue) {
+        filter.values(issue).forEach(function (value) { counts.set(value, (counts.get(value) || 0) + 1); });
+      });
+      filterOptionsCache[filter.id] = Array.from(counts.entries()).sort(function (a, b) { return collator.compare(a[0], b[0]); });
+    }
+    return filterOptionsCache[filter.id];
+  }
+
+  function searchWords(params) { return fold(params.get("q") || "").split(/\s+/).filter(Boolean); }
+
+  function filterIssues(params) {
+    var words = searchWords(params);
+    var active = FILTERS.filter(function (f) { return params.get(f.id); });
+    var hidden = Object.keys(HIDDEN_FILTERS).filter(function (id) { return params.get(id); });
+    return issues.filter(function (issue) {
+      for (var a = 0; a < active.length; a++) {
+        if (active[a].values(issue).indexOf(params.get(active[a].id)) < 0) { return false; }
+      }
+      for (var b = 0; b < hidden.length; b++) {
+        if (!HIDDEN_FILTERS[hidden[b]].test(issue, params.get(hidden[b]))) { return false; }
+      }
+      if (words.length) {
+        var text = issue.folded + " " + (store.searchText[issue.key] || "");
+        for (var w = 0; w < words.length; w++) {
+          if (text.indexOf(words[w]) < 0) { return false; }
+        }
+      }
+      return true;
+    });
+  }
+
+  function cmpText(a, b) { return collator.compare(a || "￿", b || "￿"); }
+  function cmpDate(a, b) { return (a || "").slice(0, 19) < (b || "").slice(0, 19) ? -1 : (a || "").slice(0, 19) > (b || "").slice(0, 19) ? 1 : 0; }
+  function cmpKey(a, b) { return cmpText(a.key.replace(/-\d+$/, ""), b.key.replace(/-\d+$/, "")) || a.keyNumber - b.keyNumber; }
+
+  var COLUMNS = [
+    { id: "type", label: "T", title: "Type", sort: function (a, b) { return cmpText(a.type, b.type); },
+      cell: function (i) { return typeIcon(i.type, i.subtask); } },
+    { id: "key", label: "Key", sort: cmpKey, cell: function (i) { return issueLink(i.key); } },
+    { id: "summary", label: "Summary", sort: function (a, b) { return cmpText(a.summary, b.summary); },
+      cell: function (i) {
+        return [i.parent ? h("span", { class: "parent-ref" }, issueLink(i.parent), " / ") : null,
+          h("a", { href: hash("issue/" + i.key), class: "summary-link" }, i.summary || "(no summary)")];
+      } },
+    { id: "assignee", label: "Assignee", sort: function (a, b) { return cmpText(a.assignee, b.assignee); },
+      cell: function (i) { return i.assignee || h("span", { class: "muted" }, "Unassigned"); } },
+    { id: "reporter", label: "Reporter", sort: function (a, b) { return cmpText(a.reporter, b.reporter); },
+      cell: function (i) { return i.reporter || ""; } },
+    { id: "priority", label: "P", title: "Priority", sort: function (a, b) { return cmpText(a.priority, b.priority); },
+      cell: function (i) { return priorityIcon(i.priority); } },
+    { id: "status", label: "Status", sort: function (a, b) {
+        return (STATUS_CATEGORY_ORDER[a.statusCategory] || 1) - (STATUS_CATEGORY_ORDER[b.statusCategory] || 1) || cmpText(a.status, b.status);
+      }, cell: function (i) { return lozenge(i.status, i.statusCategory); } },
+    { id: "resolution", label: "Resolution", sort: function (a, b) { return cmpText(a.resolution, b.resolution); },
+      cell: function (i) { return i.resolution || h("span", { class: "muted" }, "Unresolved"); } },
+    { id: "created", label: "Created", sort: function (a, b) { return cmpDate(a.created, b.created); },
+      cell: function (i) { return h("time", { title: i.created }, fmtDate(i.created)); } },
+    { id: "updated", label: "Updated", sort: function (a, b) { return cmpDate(a.updated, b.updated); },
+      cell: function (i) { return h("time", { title: i.updated }, fmtDate(i.updated)); } }
+  ];
+
+  function sortIssues(list, params) {
+    var column = COLUMNS.find(function (c) { return c.id === params.get("sort"); }) || COLUMNS[1];
+    var direction = params.get("dir") === "asc" ? 1 : params.get("dir") === "desc" ? -1 : (column.id === "key" ? -1 : 1);
+    return list.slice().sort(function (a, b) { return direction * column.sort(a, b) || -cmpKey(a, b); });
+  }
+
+  // The issue list and the board share the same filters: "mode" is "issues" or "board".
+  function viewIssueList(params, mode) {
+    setTitle(mode === "board" ? "Board" : "Issues");
+    var results = h("div", { class: "results" });
+
+    function currentHash() { return hash(mode, params); }
+
+    function update(resetPage) {
+      if (resetPage) { params.delete("page"); }
+      history.replaceState(null, "", currentHash());
+      lastListHash = currentHash();
+      renderResults();
+    }
+
+    var searchBox = h("input", { type: "search", name: "q", class: "filter-search", placeholder: "Search text (summary, description, comments...)",
+      value: params.get("q") || "", "aria-label": "Search text" });
+    var typing = null;
+    searchBox.addEventListener("input", function () {
+      clearTimeout(typing);
+      typing = setTimeout(function () { params.set("q", searchBox.value); if (!searchBox.value) { params.delete("q"); } update(true); }, 250);
+    });
+
+    var selects = FILTERS.map(function (filter) {
+      var current = params.get(filter.id) || "";
+      var select = h("select", { name: filter.id, class: "filter-select" + (current ? " active" : ""), "aria-label": filter.label, title: filter.label },
+        h("option", { value: "" }, filter.label + ": All"));
+      var found = false;
+      filterOptions(filter).forEach(function (entry) {
+        var option = h("option", { value: entry[0] }, filter.label + ": " + entry[0] + " (" + entry[1] + ")");
+        if (entry[0] === current) { option.selected = true; found = true; }
+        select.appendChild(option);
+      });
+      if (current && !found) { select.appendChild(h("option", { value: current, selected: true }, filter.label + ": " + current + " (0)")); }
+      select.addEventListener("change", function () {
+        if (select.value) { params.set(filter.id, select.value); } else { params.delete(filter.id); }
+        select.classList.toggle("active", !!select.value);
+        update(true);
+      });
+      return select;
+    });
+
+    var hiddenChips = Object.keys(HIDDEN_FILTERS).filter(function (id) { return params.get(id); }).map(function (id) {
+      return h("span", { class: "chip" }, HIDDEN_FILTERS[id].label(params.get(id)),
+        h("button", { type: "button", class: "chip-remove", title: "Remove this filter", "aria-label": "Remove this filter",
+          onclick: function () { params.delete(id); location.hash = currentHash(); } }, "×"));
+    });
+
+    var reset = h("a", { href: "#/" + mode, class: "button button-subtle" }, "Clear filters");
+
+    var switcher = h("div", { class: "view-switch" },
+      h("a", { href: hash("issues", params), class: "button" + (mode === "issues" ? " selected" : "") }, "List"),
+      h("a", { href: hash("board", params), class: "button" + (mode === "board" ? " selected" : "") }, "Board"));
+
+    clear(main);
+    appendAll(main, [
+      pageHeader(mode === "board" ? "Board" : "Issues", switcher),
+      h("div", { class: "filters" }, searchBox, selects, hiddenChips, reset),
+      results
+    ]);
+    lastListHash = currentHash();
+
+    function renderResults() {
+      var words = searchWords(params);
+      var loadingText = words.length && !searchReady();
+      var found = sortIssues(filterIssues(params), params);
+      lastResults = found.map(function (i) { return i.key; });
+      clear(results);
+      if (loadingText) {
+        var progress = h("div", { class: "message message-info" }, "Searching in descriptions and comments…");
+        results.appendChild(progress);
+        loadSearchText(function (done, total) { progress.textContent = "Searching in descriptions and comments… (" + done + " / " + total + ")"; })
+          .then(function () { if (results.isConnected) { renderResults(); } })
+          .catch(function (error) { progress.className = "message message-error"; progress.textContent = "Full-text search is not available: " + error.message; });
+      }
+      if (mode === "board") { results.appendChild(renderBoard(found, params)); }
+      else { results.appendChild(renderTable(found, params, update)); }
+    }
+    renderResults();
+  }
+
+  function renderTable(found, params, update) {
+    var pages = Math.max(1, Math.ceil(found.length / PAGE_SIZE));
+    var page = Math.min(Math.max(parseInt(params.get("page"), 10) || 1, 1), pages);
+    var shown = found.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE);
+    var sortId = params.get("sort") || "key";
+    var dir = params.get("dir") || (sortId === "key" ? "desc" : "asc");
+
+    var head = h("tr", null, COLUMNS.map(function (column) {
+      var active = column.id === sortId;
+      var th = h("th", { class: "sortable col-" + column.id + (active ? " sorted" : ""), title: "Sort by " + (column.title || column.label),
+        "aria-sort": active ? (dir === "asc" ? "ascending" : "descending") : null, scope: "col" },
+        h("button", { type: "button", onclick: function () {
+          params.set("dir", active && dir === "asc" ? "desc" : "asc");
+          params.set("sort", column.id);
+          update(true);
+        } }, column.label, active ? h("span", { class: "sort-arrow" }, dir === "asc" ? " ↑" : " ↓") : null));
+      return th;
+    }));
+
+    var body = h("tbody", null, shown.map(function (issue) {
+      return h("tr", null, COLUMNS.map(function (column) { return h("td", { class: "col-" + column.id }, column.cell(issue)); }));
+    }));
+
+    function goTo(n) {
+      return function () { params.set("page", String(n)); update(false); main.scrollIntoView(); };
+    }
+
+    var pager = h("div", { class: "pager" },
+      h("span", { class: "muted" }, found.length ? ((page - 1) * PAGE_SIZE + 1) + "–" + ((page - 1) * PAGE_SIZE + shown.length) +
+        " of " + plural(found.length, "issue") : "No issues match these filters."),
+      pages > 1 ? h("span", { class: "pager-buttons" },
+        h("button", { type: "button", class: "button", disabled: page <= 1, onclick: goTo(page - 1) }, "‹ Previous"),
+        h("span", { class: "muted" }, " Page " + page + " of " + pages + " "),
+        h("button", { type: "button", class: "button", disabled: page >= pages, onclick: goTo(page + 1) }, "Next ›")) : null);
+
+    return h("div", null,
+      found.length ? h("div", { class: "table-scroll" }, h("table", { class: "issue-table" }, h("thead", null, head), body)) : null,
+      pager);
+  }
+
+  // ======================================================================== board
+  function boardColumns() {
+    var columns = [];
+    var seen = new Set();
+    function add(name, category) {
+      if (!name || seen.has(name)) { return; }
+      seen.add(name);
+      columns.push({ name: name, category: category || "" });
+    }
+    (store.project.statuses_by_issue_type || []).forEach(function (type) {
+      (type.statuses || []).forEach(function (status) { add(status.name, (status.statusCategory || {}).key); });
+    });
+    issues.forEach(function (issue) { add(issue.status, issue.statusCategory); });
+    var used = new Set(issues.map(function (i) { return i.status; }));
+    return columns.filter(function (c) { return used.has(c.name); }).map(function (c, position) {
+      c.position = position;
+      return c;
+    }).sort(function (a, b) {
+      var ca = STATUS_CATEGORY_ORDER[a.category], cb = STATUS_CATEGORY_ORDER[b.category];
+      return (ca === undefined ? 1 : ca) - (cb === undefined ? 1 : cb) || a.position - b.position;
+    });
+  }
+
+  function renderBoard(found, params) {
+    var groups = new Map();
+    found.forEach(function (issue) {
+      if (!groups.has(issue.status)) { groups.set(issue.status, []); }
+      groups.get(issue.status).push(issue);
+    });
+    var board = h("div", { class: "board" });
+    boardColumns().forEach(function (column) {
+      var cards = groups.get(column.name) || [];
+      var list = h("div", { class: "board-cards" }, cards.slice(0, BOARD_COLUMN_LIMIT).map(boardCard));
+      if (cards.length > BOARD_COLUMN_LIMIT) {
+        var more = new URLSearchParams(params);
+        more.set("status", column.name);
+        list.appendChild(h("a", { class: "board-more", href: hash("issues", more) },
+          "Show all " + cards.length + " issues in the list"));
+      }
+      board.appendChild(h("section", { class: "board-column" },
+        h("h2", { class: "board-column-title" }, lozenge(column.name, column.category), h("span", { class: "count" }, String(cards.length))),
+        list));
+    });
+    return h("div", null,
+      h("p", { class: "muted small" }, plural(found.length, "issue") + ". The board shows the issues by status, as they were when archived."),
+      h("div", { class: "board-scroll" }, board));
+  }
+
+  function boardCard(issue) {
+    return h("a", { class: "card", href: hash("issue/" + issue.key) },
+      h("div", { class: "card-summary" }, issue.summary || "(no summary)"),
+      h("div", { class: "card-footer" },
+        typeIcon(issue.type, issue.subtask), priorityIcon(issue.priority),
+        h("span", { class: "card-key" + (issue.statusCategory === "done" ? " done" : "") }, issue.key),
+        h("span", { class: "topbar-spacer" }),
+        issue.assignee ? avatar(issue.assignee, true) : null));
+  }
+
+  // ================================================================== issue view
+  var DETAIL_FIELDS = [["issuetype", "Type"], ["status", "Status"], ["priority", "Priority"], ["resolution", "Resolution"],
+    ["versions", "Affects Version/s"], ["fixVersions", "Fix Version/s"], ["components", "Component/s"], ["labels", "Labels"],
+    ["security", "Security Level"]];
+  var PEOPLE_FIELDS = [["assignee", "Assignee"], ["reporter", "Reporter"], ["creator", "Creator"]];
+  var DATE_FIELDS = [["created", "Created"], ["updated", "Updated"], ["resolutiondate", "Resolved"], ["duedate", "Due Date"]];
+  var HANDLED_FIELDS = new Set(DETAIL_FIELDS.concat(PEOPLE_FIELDS, DATE_FIELDS).map(function (f) { return f[0]; }).concat([
+    "summary", "description", "environment", "project", "issuelinks", "subtasks", "parent", "timetracking",
+    "timeoriginalestimate", "timeestimate", "timespent", "aggregatetimeoriginalestimate", "aggregatetimeestimate",
+    "aggregatetimespent", "progress", "aggregateprogress", "workratio", "lastViewed", "thumbnail", "votes", "watches"]));
+  var HIDDEN_CUSTOM_TYPES = ["gh-lexo-rank"];   // Jira Software "Rank": internal ordering string
+
+  function fieldValue(issue, fieldId) { return ((issue.fields || {})[fieldId] || {}).value; }
+
+  function listLinks(values, filterId) {
+    if (!values || !values.length) { return h("span", { class: "muted" }, "None"); }
+    return h("span", null, values.map(function (value, n) {
+      var name = typeof value === "string" ? value : fmt(value);
+      return [n ? ", " : null, h("a", { href: hash("issues", paramsOf(filterValue(filterId, name))) }, name)];
+    }));
+  }
+
+  function genericValue(value) {
+    if (typeof value === "string" && byKey[value]) { return issueLink(value, value + " " + byKey[value].summary); }
+    if (value && typeof value === "object" && !Array.isArray(value) && "displayName" in value) { return userNode(value); }
+    if (Array.isArray(value) && value.length && value.every(function (v) { return v && typeof v === "object" && "displayName" in v; })) {
+      return h("span", { class: "value-list" }, value.map(function (v) { return userNode(v); }));
+    }
+    var text = fmt(value);
+    return text ? h("span", { class: "pre-wrap" }, text) : h("span", { class: "muted" }, "None");
+  }
+
+  function detailValue(issue, fieldId) {
+    var value = fieldValue(issue, fieldId);
+    switch (fieldId) {
+      case "issuetype": return h("span", { class: "with-icon" }, typeIcon((value || {}).name, (value || {}).subtask), fmt(value));
+      case "status": return statusNode(value);
+      case "priority": return value ? h("span", { class: "with-icon" }, priorityIcon(fmt(value)), fmt(value)) : h("span", { class: "muted" }, "None");
+      case "resolution": return value ? fmt(value) : h("span", { class: "muted" }, "Unresolved");
+      case "versions": return listLinks(value, "version");
+      case "fixVersions": return listLinks(value, "fixVersion");
+      case "components": return listLinks(value, "component");
+      case "labels":
+        if (!value || !value.length) { return h("span", { class: "muted" }, "None"); }
+        return h("span", { class: "labels" }, value.map(function (label) {
+          return h("a", { class: "label", href: hash("issues", paramsOf({ label: label })) }, label);
+        }));
+      default: return genericValue(value);
+    }
+  }
+
+  function isHiddenField(fieldId) {
+    var schema = ((store.project.fields || {})[fieldId] || {}).schema || {};
+    return HIDDEN_CUSTOM_TYPES.some(function (t) { return String(schema.custom || "").indexOf(t) >= 0; });
+  }
+
+  // "Development" field: its custom field type ends with ":devsummarycf" (or ":devsummary").
+  function isDevSummaryField(fieldId) {
+    var schema = ((store.project.fields || {})[fieldId] || {}).schema || {};
+    return String(schema.custom || "").indexOf("devsummary") >= 0;
+  }
+
+  function viewIssue(key) {
+    key = String(key || "").toUpperCase();
+    setTitle(key);
+    if (!byKey[key]) {
+      clear(main);
+      appendAll(main, [pageHeader("Issue not found"), h("p", null, "The issue " + key + " is not part of this archive."),
+        h("p", null, h("a", { href: "#/issues" }, "Back to the issue list"))]);
+      return;
+    }
+    clear(main);
+    main.appendChild(h("p", { class: "muted" }, "Loading " + key + "…"));
+    loadIssue(key).then(function (issue) {
+      if (location.hash.replace(/^#\/?issue\//, "").toUpperCase() !== key) { return; }  // user went elsewhere
+      renderIssue(issue);
+    }).catch(function (error) {
+      clear(main);
+      appendAll(main, [pageHeader(key), h("div", { class: "message message-error" },
+        "The data of this issue could not be loaded (" + error.message + "). The archive may be incomplete. " +
+        "The same data is also in project.json.")]);
+    });
+  }
+
+  function renderIssue(issue) {
+    var key = issue.key;
+    var entry = byKey[key];
+    var project = projectInfo();
+    var context = { attachments: {} };
+    (issue.attachments || []).forEach(function (att) {
+      if ((att.archive || {}).path) { context.attachments[String(att.id)] = att.archive.path; }
+    });
+    var summary = fieldValue(issue, "summary") || "(no summary)";
+    var parent = fieldValue(issue, "parent");
+    setTitle("[" + key + "] " + summary);
+
+    // Header
+    var crumbs = h("nav", { class: "breadcrumbs", "aria-label": "Breadcrumbs" },
+      h("a", { href: "#/" }, project.name || project.key), " / ",
+      parent && parent.key ? [issueLink(parent.key), " / "] : null,
+      h("a", { href: hash("issue/" + key) }, key));
+
+    var position = lastResults.indexOf(key);
+    var navigation = position >= 0 ? h("span", { class: "issue-nav" },
+      h("a", { class: "button" + (position > 0 ? "" : " disabled"), href: position > 0 ? hash("issue/" + lastResults[position - 1]) : null,
+        title: "Previous issue of the list" }, "‹"),
+      h("span", { class: "muted small" }, (position + 1) + " of " + lastResults.length),
+      h("a", { class: "button" + (position < lastResults.length - 1 ? "" : " disabled"),
+        href: position < lastResults.length - 1 ? hash("issue/" + lastResults[position + 1]) : null, title: "Next issue of the list" }, "›")) : null;
+
+    var toolbar = h("div", { class: "toolbar" },
+      h("a", { class: "button", href: lastListHash }, "← Back to the list"),
+      h("button", { type: "button", class: "button", title: "Print this issue, or save it as a PDF file (choose \"Save as PDF\" as printer)",
+        onclick: function () { window.print(); } }, "Print / Save as PDF"),
+      h("span", { class: "topbar-spacer" }),
+      navigation);
+
+    // Main column
+    var mainColumn = [];
+    var detailRows = DETAIL_FIELDS.map(function (f) { return [f[1], detailValue(issue, f[0])]; });
+    if (parent && parent.key) { detailRows.push(["Parent", issueLink(parent.key, parent.key + " " + ((parent.fields || {}).summary || ""))]); }
+    var richFields = [];
+    var others = [];
+    Object.keys(issue.fields || {}).forEach(function (fieldId) {
+      var field = issue.fields[fieldId] || {};
+      if (HANDLED_FIELDS.has(fieldId) || isEmpty(field.value) || isHiddenField(fieldId)) { return; }
+      if (isDevSummaryField(fieldId) || isDevSummary(field.value)) {
+        var development = fmtDevSummary(field.value);
+        if (development) { others.push([field.name || fieldId, h("span", null, development)]); }
+        return;   // an empty "Development" summary is not shown
+      }
+      if (field.rendered_html && field.rendered_html.indexOf("<") >= 0) { richFields.push([field.name || fieldId, field]); }
+      else { others.push([field.name || fieldId, genericValue(field.value)]); }
+    });
+    others.sort(function (a, b) { return collator.compare(a[0], b[0]); });
+    mainColumn.push(module("Details", h("dl", { class: "details" }, detailRows.concat(others).map(function (row) {
+      return h("div", { class: "detail" }, h("dt", null, row[0] + ":"), h("dd", null, row[1]));
+    }))));
+
+    var description = (issue.fields || {}).description || {};
+    mainColumn.push(module("Description", richText(description.rendered_html, description.value, context)));
+    var environment = (issue.fields || {}).environment || {};
+    if (!isEmpty(environment.value)) { mainColumn.push(module("Environment", richText(environment.rendered_html, environment.value, context))); }
+    richFields.sort(function (a, b) { return collator.compare(a[0], b[0]); }).forEach(function (rich) {
+      mainColumn.push(module(rich[0], richText(rich[1].rendered_html, rich[1].value, context)));
+    });
+
+    if (issue.zephyr) { mainColumn = mainColumn.concat(renderZephyr(issue.zephyr, context)); }
+
+    var attachments = issue.attachments || [];
+    if (attachments.length) { mainColumn.push(module("Attachments", renderAttachments(attachments), { count: attachments.length })); }
+    var links = renderIssueLinks(fieldValue(issue, "issuelinks") || []);
+    if (links) { mainColumn.push(module("Issue Links", links)); }
+    var subtasks = fieldValue(issue, "subtasks") || [];
+    if (subtasks.length) { mainColumn.push(module("Sub-Tasks", renderSubtasks(subtasks, key), { count: subtasks.length })); }
+    var remote = issue.remote_links || [];
+    if (remote.length) { mainColumn.push(module("Web Links", renderRemoteLinks(remote), { count: remote.length })); }
+    var notes = issue.archive_notes || [];
+    if (notes.length) {
+      mainColumn.push(module("Archive Notes", h("div", { class: "message message-warning" },
+        h("p", null, "Problems noticed while this issue was archived:"),
+        h("ul", null, notes.map(function (note) { return h("li", null, note); })))));
+    }
+    var activity = renderActivity(issue, context);
+    mainColumn.push(module("Activity", activity));
+
+    // Side column
+    var sideColumn = [
+      module("People", infoTable(PEOPLE_FIELDS.map(function (f) {
+        return [f[1], userNode(fieldValue(issue, f[0]), f[0] === "assignee" ? "Unassigned" : "None")];
+      }).concat([["Votes", fmt(fieldValue(issue, "votes")) || "0"], ["Watchers", fmt(fieldValue(issue, "watches")) || "0"]]))),
+      module("Dates", infoTable(DATE_FIELDS.map(function (f) {
+        return [f[1], dateNode(fieldValue(issue, f[0]), f[0] !== "duedate")];
+      })))
+    ];
+    var tracking = renderTimeTracking(issue);
+    if (tracking) { sideColumn.push(module("Time Tracking", tracking)); }
+    sideColumn.push(module("Archive", infoTable([
+      ["Data", "project.json"],
+      ["Issue ID", issue.id]
+    ])));
+
+    var archive = store.project.archive || {};
+    var source = h("p", { class: "print-only print-source" }, "Archived Jira issue " + key + " - project " + (project.name || "") +
+      " (" + (project.key || "") + ") - archived from " + ((archive.jira || {}).base_url || "Jira") + " on " +
+      fmtDateTime(archive.generated_at) + ". Read-only copy, the complete data is in project.json.");
+
+    // Printing (button above, or Ctrl+P): show everything, including the closed parts.
+    printHooks = {
+      before: function () {
+        var state = { tab: activityTab, closed: [] };
+        Array.prototype.forEach.call(main.querySelectorAll("details:not([open])"), function (d) { d.open = true; state.closed.push(d); });
+        Array.prototype.forEach.call(main.querySelectorAll("img[loading]"), function (img) { img.removeAttribute("loading"); });
+        activity.showTab("all");
+        return state;
+      },
+      after: function (state) {
+        state.closed.forEach(function (d) { d.open = false; });
+        activity.showTab(state.tab);
+      }
+    };
+
+    clear(main);
+    appendAll(main, [
+      source,
+      h("div", { class: "issue-header" }, crumbs,
+        h("h1", { class: "issue-summary" }, typeIcon(entry.type, entry.subtask), h("span", null, summary))),
+      toolbar,
+      h("div", { class: "columns issue-columns" }, h("div", { class: "column-main" }, mainColumn), h("div", { class: "column-side" }, sideColumn))
+    ]);
+  }
+
+  // ============================================================ Zephyr tests
+  // Test steps and executions of a Zephyr Squad "Test" issue (see zephyr.py).
+  var COLOR_RE = /^#[0-9a-f]{3}([0-9a-f]{3})?$/i;
+
+  function zephyrStatus(status) {
+    status = status || {};
+    var name = status.name || "UNEXECUTED";
+    var node = h("span", { class: "lozenge zephyr-status", title: "Zephyr status" }, name);
+    if (COLOR_RE.test(status.color || "")) { node.style.backgroundColor = status.color; node.style.color = "#ffffff"; }
+    return node;
+  }
+
+  function zephyrDefects(defects) {
+    var keys = (Array.isArray(defects) ? defects : []).map(function (d) {
+      return d && typeof d === "object" ? d.key || d.defectKey : d;
+    }).filter(Boolean).map(String);
+    return keys.length ? h("span", { class: "value-list" }, keys.map(function (k) { return issueLink(k); })) : null;
+  }
+
+  function zephyrFiles(files) {
+    if (!files || !files.length) { return null; }
+    return h("ul", { class: "zephyr-files" }, files.map(function (file) {
+      var path = (file.archive || {}).path;
+      var name = file.filename || file.fileName || "file";
+      return h("li", null, path ? h("a", { href: encodePath(path), target: "_blank" }, name)
+        : h("span", { class: "muted", title: (file.archive || {}).status || "" }, name + " (not archived)"));
+    }));
+  }
+
+  function zephyrCycle(execution) {
+    return [execution.cycleName, execution.folderName].filter(Boolean).join(" / ");
+  }
+
+  function zephyrText(html, plain, context) {
+    if (isEmpty(plain) && isEmpty(html)) { return null; }
+    return richText(html, plain, context);
+  }
+
+  function renderZephyr(zephyr, context) {
+    var steps = zephyr.steps || [];
+    var executions = zephyr.executions || [];
+    var stepById = {};
+    steps.forEach(function (step, n) { stepById[String(step.id)] = { number: step.orderId || n + 1, step: step }; });
+
+    var stepTable = steps.length ? h("table", { class: "data-table zephyr-steps" },
+      h("thead", null, h("tr", null, ["#", "Test Step", "Test Data", "Expected Result", "Attachments"].map(function (t) {
+        return h("th", { scope: "col" }, t);
+      }))),
+      h("tbody", null, steps.map(function (step, n) {
+        return h("tr", null, h("td", { class: "col-number" }, String(step.orderId || n + 1)),
+          h("td", null, zephyrText(step.htmlStep, step.step, context)),
+          h("td", null, zephyrText(step.htmlData, step.data, context)),
+          h("td", null, zephyrText(step.htmlResult, step.result, context)),
+          h("td", null, zephyrFiles(step.attachments)));
+      }))) : emptyNote("This test has no test steps.");
+
+    var details = executions.filter(function (e) { return (e.step_results || []).length || (e.attachments || []).length; });
+    var executionTable = executions.length ? h("table", { class: "data-table zephyr-executions" },
+      h("thead", null, h("tr", null, ["Version", "Test Cycle", "Status", "Defects", "Executed By", "Executed On"].map(function (t) {
+        return h("th", { scope: "col" }, t);
+      }))),
+      h("tbody", null, executions.map(function (e) {
+        return h("tr", null, h("td", null, e.versionName || ""), h("td", null, zephyrCycle(e)),
+          h("td", null, zephyrStatus(e.archive_status)), h("td", null, zephyrDefects(e.defects)),
+          h("td", null, e.executedByDisplay || e.executedBy || ""), h("td", null, e.executedOn || ""));
+      }))) : emptyNote("This test was never added to a test cycle.");
+
+    var executionDetails = details.map(function (e) {
+      var results = e.step_results || [];
+      return h("details", { class: "zephyr-execution" },
+        h("summary", null, zephyrStatus(e.archive_status), " ", zephyrCycle(e) || "Test cycle", " - ", e.versionName || "",
+          e.executedOn ? h("span", { class: "muted" }, " - " + e.executedOn) : null),
+        e.comment ? h("div", { class: "zephyr-comment" }, h("strong", null, "Comment: "), richText(e.htmlComment, e.comment, context)) : null,
+        results.length ? h("table", { class: "data-table" },
+          h("thead", null, h("tr", null, ["#", "Test Step", "Status", "Comment", "Defects"].map(function (t) { return h("th", { scope: "col" }, t); }))),
+          h("tbody", null, results.map(function (r) {
+            var step = stepById[String(r.stepId)] || { number: "?", step: {} };
+            return h("tr", null, h("td", { class: "col-number" }, String(step.number)),
+              h("td", null, zephyrText(step.step.htmlStep, step.step.step, context)),
+              h("td", null, zephyrStatus(r.archive_status)),
+              h("td", null, zephyrText(r.htmlComment, r.comment, context)),
+              h("td", null, zephyrDefects(r.defects)));
+          }))) : null,
+        (e.attachments || []).length ? h("div", null, h("strong", null, "Attachments:"), zephyrFiles(e.attachments)) : null);
+    });
+
+    return [
+      module("Test Details", stepTable, { count: steps.length }),
+      module("Test Executions", [executionTable, executionDetails.length ?
+        h("div", { class: "zephyr-details" }, h("p", { class: "muted small" }, "Click an execution to see the result of each step:"),
+          executionDetails) : null], { count: executions.length })
+    ];
+  }
+
+  function renderAttachments(attachments) {
+    return h("div", { class: "attachments" }, attachments.map(function (att) {
+      var archive = att.archive || {};
+      var name = att.filename || "file";
+      var meta = h("div", { class: "attachment-meta" },
+        h("div", { class: "attachment-name", title: name }, name),
+        h("div", { class: "muted small" }, [fmtSize(att.size), fmtDate(att.created), fmt(att.author)].filter(Boolean).join(" · ")));
+      if (!archive.path) {
+        return h("div", { class: "attachment missing", title: "This file is not in the archive" },
+          h("div", { class: "attachment-preview" }, h("span", { class: "file-ext" }, "N/A")), meta,
+          h("div", { class: "attachment-status" }, "Not archived: " + (archive.status || "unknown reason")));
+      }
+      var path = encodePath(archive.path);
+      var isImage = /^image\/(png|jpe?g|gif|bmp|webp|svg\+xml)$/i.test(att.mimeType || "") ||
+        /\.(png|jpe?g|gif|bmp|webp)$/i.test(name);
+      var ext = (/\.([A-Za-z0-9]{1,5})$/.exec(name) || [null, "file"])[1].toUpperCase();
+      var preview = isImage ? h("img", { src: path, alt: name, loading: "lazy" }) : h("span", { class: "file-ext" }, ext);
+      return h("a", { class: "attachment", href: path, target: "_blank", title: "Open " + name },
+        h("div", { class: "attachment-preview" }, preview), meta);
+    }));
+  }
+
+  function renderIssueLinks(links) {
+    if (!links.length) { return null; }
+    var groups = new Map();
+    links.forEach(function (link) {
+      var type = link.type || {};
+      var outward = !!link.outwardIssue;
+      var relation = (outward ? type.outward : type.inward) || type.name || "relates to";
+      if (!groups.has(relation)) { groups.set(relation, []); }
+      groups.get(relation).push(outward ? link.outwardIssue : link.inwardIssue || {});
+    });
+    var table = h("table", { class: "link-table" });
+    groups.forEach(function (others, relation) {
+      others.forEach(function (other, n) {
+        var fields = other.fields || {};
+        table.appendChild(h("tr", null,
+          h("th", null, n === 0 ? relation : ""),
+          h("td", { class: "col-type" }, typeIcon(fmt(fields.issuetype), (fields.issuetype || {}).subtask)),
+          h("td", { class: "col-key" }, issueLink(other.key || "")),
+          h("td", null, fields.summary || ""),
+          h("td", { class: "col-priority" }, priorityIcon(fmt(fields.priority))),
+          h("td", { class: "col-status" }, statusNode(fields.status))));
+      });
+    });
+    return table;
+  }
+
+  function renderSubtasks(subtasks, parentKey) {
+    var table = h("table", { class: "link-table" }, subtasks.map(function (task, n) {
+      var fields = task.fields || {};
+      var indexed = byKey[task.key];
+      return h("tr", null,
+        h("td", { class: "col-number muted" }, (n + 1) + "."),
+        h("td", { class: "col-type" }, typeIcon(fmt(fields.issuetype), true)),
+        h("td", { class: "col-key" }, issueLink(task.key)),
+        h("td", null, fields.summary || ""),
+        h("td", null, indexed && indexed.assignee ? indexed.assignee : ""),
+        h("td", { class: "col-priority" }, priorityIcon(fmt(fields.priority))),
+        h("td", { class: "col-status" }, statusNode(fields.status)));
+    }));
+    return h("div", null, table,
+      h("p", { class: "small" }, h("a", { href: hash("issues", paramsOf({ parent: parentKey })) }, "Show the sub-tasks in the issue list")));
+  }
+
+  function renderRemoteLinks(remote) {
+    return h("ul", { class: "web-links" }, remote.map(function (link) {
+      var obj = link.object || {};
+      var url = String(obj.url || "");
+      var title = obj.title || url || "(no title)";
+      var target = /^(https?:|mailto:)/i.test(url)
+        ? h("a", { href: url, target: "_blank", rel: "noopener noreferrer", class: "external" }, title)
+        : h("span", null, title);
+      return h("li", null, link.relationship ? h("span", { class: "muted" }, link.relationship + ": ") : null, target,
+        url && url !== title ? h("div", { class: "muted small break" }, url) : null);
+    }));
+  }
+
+  function renderTimeTracking(issue) {
+    var tracking = fieldValue(issue, "timetracking") || {};
+    var estimate = tracking.originalEstimateSeconds || fieldValue(issue, "timeoriginalestimate") || 0;
+    var remaining = tracking.remainingEstimateSeconds || fieldValue(issue, "timeestimate") || 0;
+    var spent = tracking.timeSpentSeconds || fieldValue(issue, "timespent") || 0;
+    if (!estimate && !remaining && !spent) { return null; }
+    var max = Math.max(estimate, spent + remaining, 1);
+    function row(label, seconds, text, cls, width) {
+      var bar = h("span", { class: "tt-bar " + cls });
+      bar.style.width = Math.round(100 * width / max) + "%";
+      return h("div", { class: "tt-row" }, h("div", { class: "tt-label" }, h("span", null, label),
+        h("span", null, text || (seconds ? fmtSeconds(seconds) : "Not specified"))), h("div", { class: "tt-track" }, bar));
+    }
+    var logged = h("div", { class: "tt-track" });
+    var spentBar = h("span", { class: "tt-bar tt-spent" });
+    spentBar.style.width = Math.round(100 * spent / max) + "%";
+    var remainingBar = h("span", { class: "tt-bar tt-remaining" });
+    remainingBar.style.width = Math.round(100 * remaining / max) + "%";
+    appendAll(logged, [spentBar, remainingBar]);
+    return h("div", { class: "time-tracking" },
+      row("Estimated:", estimate, tracking.originalEstimate, "tt-estimate", estimate),
+      row("Remaining:", remaining, tracking.remainingEstimate, "tt-remaining", remaining),
+      h("div", { class: "tt-row" }, h("div", { class: "tt-label" }, h("span", null, "Logged:"),
+        h("span", null, tracking.timeSpent || (spent ? fmtSeconds(spent) : "Not specified"))), logged));
+  }
+
+  // ------------------------------------------------------------------- activity
+  function renderActivity(issue, context) {
+    var comments = issue.comments || [];
+    var worklogs = issue.worklogs || [];
+    var histories = (issue.changelog || []).filter(function (h0) { return (h0.items || []).length; });
+    var tabs = [["all", "All", null], ["comments", "Comments", comments.length], ["worklog", "Work Log", worklogs.length],
+      ["history", "History", histories.length]];
+    var panel = h("div", { class: "activity" });
+    var bar = h("div", { class: "tabs", role: "tablist" });
+
+    function show(id) {
+      activityTab = id;
+      Array.prototype.forEach.call(bar.children, function (button) {
+        var selected = button.getAttribute("data-tab") === id;
+        button.classList.toggle("selected", selected);
+        button.setAttribute("aria-selected", selected ? "true" : "false");
+      });
+      clear(panel);
+      var items = [];
+      if (id === "all" || id === "comments") { items = items.concat(comments.map(function (c) { return [c.created, commentItem(c, context)]; })); }
+      if (id === "all" || id === "worklog") { items = items.concat(worklogs.map(function (w) { return [w.started || w.created, worklogItem(w)]; })); }
+      if (id === "all" || id === "history") { items = items.concat(histories.map(function (x) { return [x.created, historyItem(x)]; })); }
+      if (id === "all") { items.sort(function (a, b) { return cmpDate(a[0], b[0]); }); }
+      if (!items.length) {
+        panel.appendChild(emptyNote({ comments: "There are no comments on this issue.", worklog: "No work has been logged on this issue.",
+          history: "No changes recorded.", all: "No activity." }[id]));
+      }
+      items.forEach(function (item) { panel.appendChild(item[1]); });
+    }
+
+    tabs.forEach(function (tab) {
+      bar.appendChild(h("button", { type: "button", role: "tab", class: "tab", "data-tab": tab[0], onclick: function () { show(tab[0]); } },
+        tab[1], tab[2] !== null ? h("span", { class: "count" }, String(tab[2])) : null));
+    });
+    show(activityTab);
+    var root = h("div", null, bar, panel);
+    root.showTab = show;
+    return root;
+  }
+
+  function actionHeader(user, verb, date, extra) {
+    var name = fmt(user) || "Unknown user";
+    return h("div", { class: "action-header" }, avatar(name, true), h("strong", null, name), " " + verb + " - ",
+      dateNode(date), extra || null);
+  }
+
+  function commentItem(comment, context) {
+    var extra = [];
+    if (comment.updated && comment.updated !== comment.created) {
+      var editor = fmt(comment.updateAuthor);
+      extra.push(h("span", { class: "muted", title: "Edited " + fmtDateTime(comment.updated) + (editor ? " by " + editor : "") }, " (edited)"));
+    }
+    var visibility = comment.visibility || {};
+    if (visibility.value) {
+      extra.push(h("span", { class: "restricted", title: "In Jira, only these users could see this comment" },
+        "\u{1F512} Restricted to " + (visibility.type ? visibility.type + " " : "") + visibility.value));
+    }
+    return h("div", { class: "action" }, actionHeader(comment.author, "added a comment", comment.created, extra),
+      h("div", { class: "action-body" }, richText(comment.renderedBody, comment.body, context)));
+  }
+
+  function worklogItem(worklog) {
+    return h("div", { class: "action" }, actionHeader(worklog.author, "logged work", worklog.started || worklog.created),
+      h("div", { class: "action-body" },
+        h("p", null, h("strong", null, "Time Spent: "), worklog.timeSpent || fmtSeconds(worklog.timeSpentSeconds)),
+        worklog.comment ? h("div", { class: "pre-wrap" }, worklog.comment) : null));
+  }
+
+  function historyItem(history) {
+    return h("div", { class: "action" }, actionHeader(history.author, "made changes", history.created),
+      h("div", { class: "action-body" }, h("table", { class: "history-table" },
+        h("thead", null, h("tr", null, h("th", null, "Field"), h("th", null, "Original Value"), h("th", null, "New Value"))),
+        h("tbody", null, (history.items || []).map(function (item) {
+          return h("tr", null, h("td", { class: "history-field" }, item.field || ""),
+            h("td", null, h("div", { class: "change-value" }, item.fromString || item.from || "")),
+            h("td", null, h("div", { class: "change-value" }, item.toString || item.to || "")));
+        })))));
+  }
+
+  // ============================================================ components etc.
+  function viewComponents() {
+    setTitle("Components");
+    var counts = countBy(function (i) { return i.components || []; });
+    var components = (store.project.components || []).slice().sort(function (a, b) { return collator.compare(a.name || "", b.name || ""); });
+    var table = h("table", { class: "data-table" },
+      h("thead", null, h("tr", null, ["Component", "Lead", "Description", "Issues"].map(function (t) { return h("th", { scope: "col" }, t); }))),
+      h("tbody", null, components.map(function (c) {
+        var count = counts.get(c.name) || 0;
+        return h("tr", null,
+          h("td", { class: "nowrap" }, h("strong", null, c.name)),
+          h("td", null, c.lead ? userNode(c.lead) : h("span", { class: "muted" }, "None")),
+          h("td", { class: "pre-wrap" }, c.description || ""),
+          h("td", { class: "num" }, count ? h("a", { href: hash("issues", paramsOf({ component: c.name })) }, String(count)) : "0"));
+      })));
+    clear(main);
+    appendAll(main, [pageHeader("Components"), components.length ? h("div", { class: "table-scroll" }, table) : emptyNote("This project has no components.")]);
+  }
+
+  function viewVersions() {
+    setTitle("Versions");
+    var fixCounts = countBy(function (i) { return i.fixVersions || []; });
+    var affectCounts = countBy(function (i) { return i.versions || []; });
+    var versions = (store.project.versions || []).slice().reverse();  // Jira lists the newest first
+    var table = h("table", { class: "data-table" },
+      h("thead", null, h("tr", null, ["Version", "Status", "Start date", "Release date", "Description", "Fixed issues", "Affected issues"]
+        .map(function (t) { return h("th", { scope: "col" }, t); }))),
+      h("tbody", null, versions.map(function (v) {
+        var status = v.archived ? lozenge("Archived", "default") : v.released ? lozenge("Released", "done") : lozenge("Unreleased", "new");
+        var fixed = fixCounts.get(v.name) || 0;
+        var affected = affectCounts.get(v.name) || 0;
+        return h("tr", null,
+          h("td", { class: "nowrap" }, h("strong", null, v.name)),
+          h("td", null, status),
+          h("td", { class: "nowrap" }, v.startDate || ""),
+          h("td", { class: "nowrap" }, v.releaseDate || ""),
+          h("td", { class: "pre-wrap" }, v.description || ""),
+          h("td", { class: "num" }, fixed ? h("a", { href: hash("issues", paramsOf({ fixVersion: v.name })) }, String(fixed)) : "0"),
+          h("td", { class: "num" }, affected ? h("a", { href: hash("issues", paramsOf({ version: v.name })) }, String(affected)) : "0"));
+      })));
+    clear(main);
+    appendAll(main, [pageHeader("Versions"), versions.length ? h("div", { class: "table-scroll" }, table) : emptyNote("This project has no versions.")]);
+  }
+
+  // ===================================================================== router
+  // Set by the issue page: prepares the page before printing and restores it afterwards.
+  var printHooks = null;
+  var printState = null;
+  window.addEventListener("beforeprint", function () { printState = printHooks ? printHooks.before() : null; });
+  window.addEventListener("afterprint", function () {
+    if (printHooks && printState) { printHooks.after(printState); }
+    printState = null;
+  });
+
+  function route() {
+    printHooks = null;
+    var raw = location.hash.replace(/^#\/?/, "");
+    var at = raw.indexOf("?");
+    var path = at >= 0 ? raw.slice(0, at) : raw;
+    var params = new URLSearchParams(at >= 0 ? raw.slice(at + 1) : "");
+    var parts = path.split("/");
+    var view = parts[0] || "summary";
+    try {
+      if (view === "summary") { viewSummary(); }
+      else if (view === "issues" || view === "board") { viewIssueList(params, view); }
+      else if (view === "issue") { viewIssue(decodeURIComponent(parts[1] || "")); }
+      else if (view === "components") { viewComponents(); }
+      else if (view === "versions") { viewVersions(); }
+      else { view = "summary"; viewSummary(); }
+    } catch (error) {
+      clear(main);
+      appendAll(main, [pageHeader("Something went wrong"), h("div", { class: "message message-error" },
+        "This page could not be displayed: " + error.message + ". The complete data is still available in project.json.")]);
+      if (window.console) { console.error(error); }
+    }
+    setActiveNav(view);
+    window.scrollTo(0, 0);
+  }
+
+  function showStartupError() {
+    var startup = document.getElementById("startup");
+    if (!startup) { return; }
+    var help = startup.querySelector(".startup-help");
+    if (help) { help.style.animation = "none"; help.style.opacity = "1"; }
+    var message = startup.querySelector("p");
+    if (message) { message.textContent = "The data of the archive could not be loaded (viewer/data folder missing or damaged)."; }
+  }
+
+  function start() {
+    if (!store.project || !store.index) { showStartupError(); return; }
+    prepareIndex();
+    buildLayout();
+    var startup = document.getElementById("startup");
+    if (startup) { startup.remove(); }
+    app.hidden = false;
+    document.addEventListener("keydown", function (event) {
+      var tag = (event.target.tagName || "").toLowerCase();
+      if (event.key === "/" && tag !== "input" && tag !== "select" && tag !== "textarea") {
+        event.preventDefault();
+        quickSearch.focus();
+      }
+    });
+    window.addEventListener("hashchange", route);
+    route();
+  }
+
+  document.addEventListener("DOMContentLoaded", start);
+}());
