@@ -1,90 +1,172 @@
-Archivage des projets Jira
-Objectifs, bonnes pratiques et outil retenu (automatic-jira-archiving) pour sortir les anciens projets de Jira Data Center sans perdre d'information.
+"""Requirements data of the R4J plugin ("R4J - Requirements Management for Jira").
 
-Contexte
+With R4J, a requirement is a normal Jira issue (archived like any other issue).
+What the plugin adds, and keeps in its own tables, is read here through its own
+REST API (``/rest/com.easesolutions.jira.plugins.requirements/1.0/...``),
+read-only:
 
-L'instance Jira Data Center contient environ 2000 projets, dont une grande partie n'est plus utilisée. Ces projets restent indexés, sauvegardés et migrés à chaque montée de version. Ils alourdissent l'instance, ralentissent les recherches et compliquent l'administration.
+* **The requirements tree** of the project: its folders, the issues placed in
+  each folder (in their order), and the child requirements of an issue.
+* **The baselines** of the project: the frozen copies ("snapshots") of the
+  requirements taken at a given date, with the field values they had then.
 
-L'archivage consiste à extraire tout le contenu d'un projet dans un fichier autonome, consultable sans Jira, avant de supprimer le projet de l'instance.
+Requests, once per project (all GET, throttled like every other request):
 
-Objectifs de l'archivage
+* 1 request for the tree,
+* 1 request for the list of baselines, then 1 request per baseline.
 
-Ne rien perdre : tickets, champs, descriptions, commentaires, pièces jointes, historique des modifications, liens et données de test.
-Rester consultable dans la durée, par n'importe qui, sans Jira, sans installation et sans compétence technique.
-Prouver l'intégrité : pouvoir démontrer des années plus tard qu'une archive n'a pas été modifiée ni corrompue.
-Assurer la traçabilité : savoir d'où vient une archive, quand et avec quel outil elle a été produite.
-Protéger les données : aucune fuite d'information pendant l'export, aucune modification de Jira.
-Ne pas perturber la production : l'export ne doit jamais dégrader Jira pour ses utilisateurs.
-Maîtriser les coûts : pas de licence supplémentaire, un volume de stockage raisonnable.
-Bonnes pratiques de l'archivage
+When R4J is not installed (HTTP 404), or the project is not managed with R4J,
+nothing more is asked and nothing changes in the archive.
 
-Les pratiques couramment recommandées pour l'archivage de données applicatives, et en particulier par Atlassian pour Jira, sont les suivantes :
+Not covered: coverage and traceability views (they are computed from the issue
+links, which are archived with every issue), and the R4J configuration.
+"""
 
-Formats ouverts et documentés (JSON, HTML, fichiers d'origine) plutôt que formats propriétaires qui exigent le logiciel d'origine pour être relus.
-Archive autoportante : chaque archive contient tout ce qu'il faut pour être lue et comprise, y compris une description de son contenu.
-Exhaustivité : conserver l'historique des modifications et les pièces jointes, souvent exigés lors d'un audit.
-Contrôle d'intégrité par empreinte numérique (SHA-256) de chaque fichier.
-Lecture seule : une archive se consulte, elle ne se modifie pas.
-Vérifier avant de supprimer : contrôler que l'export est complet avant de retirer le projet de Jira.
-Stockage maîtrisé : ranger les archives dans un emplacement sauvegardé, à accès contrôlé (GED, partage dédié).
-Indépendance vis-à-vis d'un éditeur : pouvoir relire les archives même si l'outil ou l'éditeur disparaît.
-L'outil retenu
+from __future__ import annotations
 
-automatic-jira-archiving est un outil développé en interne en Python. Un administrateur le lance depuis son poste. L'outil lit le projet dans Jira par l'API officielle, en lecture seule, avec le jeton d'accès personnel (PAT) de l'administrateur, et produit un fichier ZIP par projet. Le code est versionné dans le dépôt Git automatic-jira-archiving, avec un guide d'utilisation détaillé (README.md) et la description du format d'archive (docs/ARCHIVE_FORMAT.md).
+from typing import Any
+from urllib.parse import quote
 
-Contenu d'une archive
-Élément	Rôle
-OPEN_ARCHIVE.html	Visionneuse : un double-clic ouvre le projet dans le navigateur, avec une présentation proche de Jira (résumé, liste des tickets avec filtres et recherche, tableau par statut, page de chaque ticket).
-project.json	Copie de référence de toutes les données du projet et de chaque ticket, dans un format texte ouvert et documenté.
-attachments/	Les pièces jointes d'origine, un dossier par ticket.
-manifest.json	Liste de tous les fichiers de l'archive avec leur empreinte SHA-256.
-README.txt	Explication en clair : origine de l'archive, date, contenu, mode d'ouverture et de vérification.
-viewer/	Programme et données utilisés par la visionneuse.
-Un fichier .sha256 accompagne chaque ZIP pour en vérifier l'intégrité après une copie.
+from .jira_client import JiraClient, JiraError
+from .logging_setup import get_logger
 
-Ce qui est archivé
-La configuration du projet : description, responsable, composants, versions, rôles et leurs membres, schémas, statuts par type de ticket, champs configurés pour chaque type de ticket.
-Pour chaque ticket : tous les champs du projet (y compris vides et personnalisés), description et textes riches avec leur mise en forme, commentaires (y compris restreints), journal de travail, historique complet des modifications, liens entre tickets, sous-tâches, liens web et pièces jointes.
-Les tests Zephyr Squad : étapes de test, exécutions (cycle, version, statut, exécutant, défauts) et résultat de chaque étape.
-Réponse aux exigences
+log = get_logger("r4j")
 
-Exigence	Réponse de l'outil
-Exhaustivité	Tous les champs, commentaires, journaux de travail, historique, liens, pièces jointes et données Zephyr sont exportés. Les éléments impossibles à récupérer (fichier disparu du serveur, droits insuffisants) sont signalés dans des notes d'archive, jamais ignorés en silence. Un projet incomplet n'est pas empaqueté et peut être repris.
-Lisibilité dans la durée	Données en JSON documenté, pièces jointes dans leur format d'origine, visionneuse en HTML et JavaScript standard sans bibliothèque externe. L'archive reste lisible avec un simple navigateur ou un éditeur de texte.
-Accessibilité pour tous	Extraire le ZIP puis double-cliquer sur OPEN_ARCHIVE.html suffit. Aucune installation, aucun accès réseau, aucun compte. Un ticket peut être imprimé ou enregistré en PDF à la demande depuis la visionneuse.
-Intégrité	Empreinte SHA-256 de chaque fichier dans manifest.json et du ZIP complet dans le fichier .sha256. Le ZIP est vérifié à sa création. La vérification se fait avec un outil standard de Windows (Get-FileHash).
-Traçabilité	Chaque archive indique l'adresse et la version du Jira d'origine, la date d'export, la version de l'outil et du format, ainsi que les avertissements rencontrés. Un journal détaillé de chaque exécution est conservé.
-Lecture seule et sécurité	L'outil ne fait que lire Jira. Le jeton n'apparaît jamais dans les journaux, n'est envoyé qu'au serveur Jira configuré et n'est jamais versionné. Les certificats TLS sont toujours vérifiés. La visionneuse fonctionne hors ligne : elle ne peut contacter aucun serveur et neutralise tout contenu HTML dangereux.
-Préservation de la production	Une seule requête à la fois, au plus deux par seconde. L'outil ralentit automatiquement quand Jira répond lentement ou demande de ralentir. Un seul archivage peut tourner à la fois depuis une même installation.
-Robustesse	Un archivage interrompu (coupure réseau, redémarrage) reprend là où il s'était arrêté. Un ticket problématique n'arrête pas le reste du projet.
-Coût et volume	Aucune licence. Les données ne sont pas dupliquées : les pièces jointes ne sont stockées qu'une fois et aucun PDF n'est généré par défaut.
-Indépendance	Code interne, versionné et documenté. Le format d'archive est décrit précisément et ne dépend ni de Jira ni de l'outil pour être relu.
-Pourquoi cet outil plutôt qu'une autre solution
+R4J = "/rest/com.easesolutions.jira.plugins.requirements/1.0"
+MAX_DEPTH = 60  # safety net against a tree that would loop on itself
 
-Solution	Limite
-Archivage intégré à Jira Data Center	Le projet est masqué mais ses données et pièces jointes restent dans Jira. L'instance n'est pas allégée, et le projet reste dépendant de Jira pour être relu.
-Export CSV ou XML de Jira	Les pièces jointes ne sont pas incluses, l'historique des modifications n'est pas repris et le résultat est difficile à lire pour un non-spécialiste.
-Sauvegarde XML complète de Jira	Porte sur toute l'instance et ne se relit qu'en restaurant un Jira de version compatible.
-Applications du Marketplace	Licence annuelle, dépendance à un éditeur, et format de sortie variable selon l'application.
-Un PDF par ticket	Volume important (images dupliquées) pour un usage ponctuel. Remplacé par l'impression ou l'enregistrement en PDF à la demande depuis la visionneuse.
-L'outil retenu reprend l'approche « exporter puis supprimer » recommandée par Atlassian (format lisible, pièces jointes, commentaires et historique conservés). Il y ajoute la visionneuse hors ligne, le contrôle d'intégrité et la protection de la production, sans coût de licence.
+NOT_INSTALLED: dict[str, Any] = {"installed": False}
 
-Utilisation en bref
 
-Pour les administrateurs
-Récupérer le dépôt Git et lancer l'installation : py install.py.
-Renseigner l'adresse de Jira et son jeton d'accès personnel dans le fichier .env.
-Vérifier la connexion et les droits sur les projets : py check_connection.py.
-Archiver un ou plusieurs projets : py archive_project.py CLE_PROJET ou py archive_project.py --file projets.txt.
-Ranger le ZIP et son fichier .sha256 dans l'espace d'archivage, puis supprimer le projet de Jira.
-Pour consulter une archive
-Clic droit sur le ZIP, Extraire tout.
-Double-cliquer sur OPEN_ARCHIVE.html dans le dossier extrait.
-Pour obtenir un PDF d'un ticket : ouvrir le ticket, cliquer sur Print / Save as PDF, puis choisir « Enregistrer au format PDF » comme imprimante.
-Limites connues
+def _as_list(value: Any) -> list[Any]:
+    """R4J sometimes gives one object where a list is expected (``{"childReq": {...}}``)."""
+    if isinstance(value, list):
+        return value
+    return [value] if isinstance(value, dict) else []
 
-Les tickets et commentaires invisibles pour le compte utilisé (niveau de sécurité ou restriction à un groupe dont il ne fait pas partie) ne peuvent pas être archivés. L'outil de vérification de connexion signale avant l'archivage les projets qui utilisent des niveaux de sécurité.
-Les tableaux Jira Software (colonnes, sprints), les tableaux de bord, les filtres enregistrés et les schémas de workflow ne sont pas archivés. Le sprint de chaque ticket reste visible dans ses champs.
-Seul Zephyr Squad est pris en charge. Les cas de test Zephyr Scale ne sont pas des tickets Jira et ne sont pas archivés.
-Les noms et onglets des écrans Jira ne sont pas archivés. Les champs configurés pour chaque type de ticket le sont.
-Détail technique complet, dépannage et description du format : README.md et docs/ARCHIVE_FORMAT.md dans le dépôt automatic-jira-archiving.
+
+def _position(item: dict[str, Any]) -> float:
+    position = item.get("position")
+    return position if isinstance(position, (int, float)) and not isinstance(position, bool) else 0
+
+
+def _text(value: Any) -> str:
+    return value if isinstance(value, str) else ("" if value is None else str(value))
+
+
+def _issue(raw: dict[str, Any], depth: int) -> dict[str, Any]:
+    children: list[Any] = []
+    if depth < MAX_DEPTH:
+        nested = raw.get("childReqs")
+        if isinstance(nested, dict):
+            nested = nested.get("childReq")
+        children = _as_list(nested) + _as_list(raw.get("issues"))
+    issue_id = raw.get("issueId", raw.get("id"))
+    return {
+        "key": _text(raw.get("key")),
+        "id": None if issue_id is None else str(issue_id),
+        "summary": _text(raw.get("summary")),
+        "type": _text(raw.get("issueType")),
+        "children": [_issue(c, depth + 1) for c in sorted((c for c in children if isinstance(c, dict)), key=_position)
+                     if c.get("key")],
+    }
+
+
+def _folder(raw: dict[str, Any], depth: int) -> dict[str, Any]:
+    folders = _as_list(raw.get("folders")) if depth < MAX_DEPTH else []
+    issues = _as_list(raw.get("issues"))
+    folder_id = raw.get("id")
+    return {
+        "id": None if folder_id is None else str(folder_id),
+        "name": _text(raw.get("name_display") or raw.get("name")),
+        "description": _text(raw.get("description")),
+        "folders": [_folder(f, depth + 1) for f in sorted((f for f in folders if isinstance(f, dict)), key=_position)],
+        "issues": [_issue(i, 0) for i in sorted((i for i in issues if isinstance(i, dict)), key=_position)
+                   if i.get("key")],
+    }
+
+
+def normalize_tree(raw: Any) -> dict[str, Any] | None:
+    """The tree given by R4J, reduced to what is useful in an archive. ``None`` when it is empty."""
+    if not isinstance(raw, dict):
+        return None
+    root = _folder(raw, 0)
+    if not root["folders"] and not root["issues"]:
+        return None
+    return {"folders": root["folders"], "issues": root["issues"]}
+
+
+def count_tree(tree: dict[str, Any] | None) -> tuple[int, int]:
+    """(number of folders, number of issues placed in the tree, child requirements included)."""
+    if not tree:
+        return 0, 0
+
+    def issues(items: list[dict[str, Any]]) -> int:
+        return sum(1 + issues(i.get("children") or []) for i in items)
+
+    folders = issue_count = 0
+    stack = [tree]
+    while stack:
+        node = stack.pop()
+        issue_count += issues(node.get("issues") or [])
+        folders += len(node.get("folders") or [])
+        stack.extend(node.get("folders") or [])
+    return folders, issue_count
+
+
+def export_r4j(client: JiraClient, project_key: str, warnings: list[str]) -> dict[str, Any]:
+    """Tree and baselines of one project: ``{"installed", "tree", "baselines"}``."""
+    try:
+        raw_tree = client.get_json(f"{R4J}/tree/{quote(project_key)}")
+    except JiraError as exc:
+        if exc.status_code == 404:  # the plugin is not installed: nothing to say
+            return dict(NOT_INSTALLED)
+        if exc.status_code == 400:  # R4J is installed, but this project is not managed with it
+            log.info("[%s] R4J is installed but has no requirements tree for this project.", project_key)
+            return {"installed": True, "tree": None, "baselines": []}
+        warnings.append(f"R4J requirements: the R4J API did not answer ({exc}). The requirements tree and the "
+                        "baselines are NOT archived.")
+        log.warning("R4J API not available: %s", exc)
+        return dict(NOT_INSTALLED)
+    except ValueError:  # not JSON (e.g. an HTML page): treated as "not installed"
+        return dict(NOT_INSTALLED)
+
+    tree = normalize_tree(raw_tree)
+    baselines = _baselines(client, project_key, warnings)
+    folders, issues = count_tree(tree)
+    if tree or baselines:
+        log.info("[%s] R4J detected: %d folder(s), %d issue(s) in the requirements tree, %d baseline(s).",
+                 project_key, folders, issues, len(baselines))
+    return {"installed": True, "tree": tree, "baselines": baselines}
+
+
+def _baselines(client: JiraClient, project_key: str, warnings: list[str]) -> list[dict[str, Any]]:
+    try:
+        listed = client.get_json(f"{R4J}/baselines/project/{quote(project_key)}")
+    except JiraError as exc:
+        if exc.status_code not in (400, 404):
+            warnings.append(f"R4J baselines: the list could not be read ({exc}). Baselines are NOT archived.")
+            log.warning("R4J baselines not available: %s", exc)
+        return []
+    except ValueError:
+        return []
+    if isinstance(listed, dict):  # tolerated: {"baselines": [...]}
+        listed = listed.get("baselines") or listed.get("values") or []
+
+    result = []
+    for baseline in listed if isinstance(listed, list) else []:
+        if not isinstance(baseline, dict) or baseline.get("id") is None:
+            continue
+        item = dict(baseline)
+        item["issues"] = []
+        try:
+            detail = client.get_json(f"{R4J}/baseline/{quote(str(baseline['id']))}")
+            if isinstance(detail, dict):
+                item.update(detail)
+                item["issues"] = [i for i in _as_list(detail.get("issues")) if isinstance(i, dict)]
+        except (JiraError, ValueError) as exc:
+            warnings.append(f"R4J baseline \"{baseline.get('name')}\" (id {baseline['id']}): its content could not "
+                            f"be read ({exc}). Only its name and date are archived.")
+            log.warning("R4J baseline %s not readable: %s", baseline["id"], exc)
+        result.append(item)
+    return result
