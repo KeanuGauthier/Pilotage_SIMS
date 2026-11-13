@@ -1,239 +1,182 @@
-"""Test data of the Zephyr plugin ("Zephyr Squad", formerly "Zephyr for Jira").
+"""Archive one or more Jira projects into ZIP files.
 
-With Zephyr Squad, a test is a normal Jira issue of the type "Test", but its test
-data is NOT stored in Jira fields: the plugin keeps it in its own tables and
-gives it through its own REST API (ZAPI, ``/rest/zapi/latest/...``). The
-standard Jira export therefore misses it. This module reads it, read-only:
+Usage (in a terminal opened in the project folder):
 
-* **Test steps** of each test: step, test data, expected result, attachments.
-* **Test executions** of each test: test cycle, version, folder, status, who ran
-  it and when, comment, linked defects, attachments, and the result of every step.
+    py archive_project.py PROJKEY
+    py archive_project.py PROJ1 PROJ2 PROJ3
+    py archive_project.py --file projects.txt
+    py archive_project.py --file projects.txt --max-issues 1000
 
-What is read, per Test issue (all GET requests, throttled like every other request):
-
-* 1 request for the steps (more for tests with hundreds of steps),
-* 1 request for the executions (more for tests run hundreds of times),
-* for each execution that was actually run (status other than "UNEXECUTED"):
-  1 request for the step results and 1 request for its attachment list,
-* 1 download per attachment (skipped with ``--no-attachments``).
-
-Zephyr is detected once per project (``/util/zephyrTestIssueType``). When it is
-not installed, nothing more is asked and nothing changes in the archive.
-
-Not covered: "Zephyr Scale" (formerly TM4J), whose test cases are not Jira
-issues, and the attachments of individual step results.
+Without any argument (e.g. after a double-click), the script asks for a project key.
+Run ``py archive_project.py --help`` for every option. See README.md.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+import argparse
+import contextlib
+import shutil
+import sys
 from pathlib import Path
-from typing import Any
-from urllib.parse import quote
 
-from .jira_client import JiraClient, JiraError
-from .logging_setup import get_logger
-from .utils import safe_filename, sha256_file
+from jira_archiver import __version__
+from jira_archiver.bootstrap import pause_if_double_clicked, started_by_double_click, use_project_venv
 
-log = get_logger("zephyr")
+PROJECT_ROOT = Path(__file__).resolve().parent
 
-ZAPI = "/rest/zapi/latest"
-PAGE_SIZE = 100
-MAX_PAGES = 200  # safety net against a server that would ignore the paging parameters
-UNEXECUTED = "-1"  # Zephyr status id of an execution / step that was never run
-_NOISE_KEYS = {"avatarUrls", "self", "iconUrl", "fileIcon", "fileIconAltText"}
+# Must run before the third-party libraries are imported (see bootstrap.py).
+use_project_venv(PROJECT_ROOT)
 
+try:
+    from jira_archiver.config import ConfigError, Settings, load_settings
+    from jira_archiver.exporter import ProjectExporter, ProjectTooLargeError
+    from jira_archiver.jira_client import JiraClient, JiraError
+    from jira_archiver.logging_setup import get_logger, setup_logging
+    from jira_archiver.packager import package
+    from jira_archiver.utils import SingleInstanceLock, is_valid_project_ref, read_project_list
+except ImportError as _exc:
+    print(f"ERROR: a required library is missing ({_exc}).")
+    print("       Install the tool first: py install.py   (see README.md, section 1)")
+    pause_if_double_clicked(started_by_double_click())
+    sys.exit(2)
 
-def _clean(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {k: _clean(v) for k, v in value.items() if k not in _NOISE_KEYS}
-    if isinstance(value, list):
-        return [_clean(v) for v in value]
-    return value
-
-
-def _status_map(statuses: Any) -> dict[str, dict[str, Any]]:
-    """``[{"id": 1, "name": "PASS", "color": "#75B000"}, ...]`` -> ``{"1": {...}}``."""
-    if isinstance(statuses, dict):  # some versions answer {"1": {...}, "2": {...}}
-        statuses = [dict(v, id=v.get("id", k)) for k, v in statuses.items() if isinstance(v, dict)]
-    result = {}
-    for status in statuses if isinstance(statuses, list) else []:
-        if isinstance(status, dict) and status.get("id") is not None:
-            result[str(status["id"])] = {"id": str(status["id"]), "name": status.get("name") or str(status["id"]),
-                                         "color": status.get("color") or ""}
-    return result
+EXIT_OK, EXIT_SOME_FAILED, EXIT_CONFIG = 0, 1, 2
 
 
-def _named_status(status_id: Any, statuses: dict[str, dict[str, Any]]) -> dict[str, Any]:
-    key = "" if status_id is None else str(status_id)
-    return dict(statuses.get(key) or {"id": key, "name": "UNEXECUTED" if key == UNEXECUTED else key, "color": ""})
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Archive Jira projects (JSON + attachments + offline web viewer) into ZIP files.",
+    )
+    parser.add_argument("projects", nargs="*", metavar="PROJECT",
+                        help="Project key (e.g. ABC) or numeric project ID. Several can be given.")
+    parser.add_argument("--file", type=Path,
+                        help="Text file with one project key per line (lines starting with # are ignored).")
+    parser.add_argument("--output", type=Path,
+                        help="Output folder (default: ARCHIVE_OUTPUT_DIR from .env, or ./output).")
+    parser.add_argument("--max-issues", type=int, metavar="N",
+                        help="Skip projects that have more than N issues (useful to process small projects first).")
+    parser.add_argument("--no-attachments", action="store_true",
+                        help="Do not download attachment files (they stay listed in the JSON and in the viewer).")
+    parser.add_argument("--keep-work", action="store_true",
+                        help="Keep the temporary working folder after a successful archive.")
+    parser.add_argument("--verbose", action="store_true", help="Show detailed messages in the console.")
+    parser.add_argument("--version", action="version", version=f"automatic-jira-archiving {__version__}")
+    return parser.parse_args(argv)
 
 
-class ZephyrExporter:
-    """Reads the Zephyr test data of the Test issues of one project."""
+def ask_project_key() -> list[str]:
+    """Ask for a project key when the script is started without any argument."""
+    if not sys.stdin or not sys.stdin.isatty():
+        return []
+    try:
+        answer = input("Key of the project to archive (e.g. ABC): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return []
+    return answer.split()
 
-    def __init__(self, client: JiraClient, info: dict[str, Any], include_attachments: bool) -> None:
-        self.client = client
-        self.info = info
-        self.include_attachments = include_attachments
-        self._execution_statuses = _status_map(info.get("execution_statuses"))
-        self._step_statuses = _status_map(info.get("step_statuses"))
 
-    # ------------------------------------------------------------- detection
-    @staticmethod
-    def detect(client: JiraClient, warnings: list[str]) -> dict[str, Any]:
-        """Is Zephyr Squad installed, and which issue type is its "Test" type? (3 requests at most)."""
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if not argv:
+        argv = ask_project_key()
+    args = parse_args(argv)
+    try:
+        settings = load_settings(PROJECT_ROOT)
+    except ConfigError as exc:
+        print(f"CONFIGURATION ERROR: {exc}")
+        return EXIT_CONFIG
+
+    output_dir = (args.output or settings.output_dir).resolve()
+    log_file = setup_logging(output_dir / "logs", secret=settings.token, verbose=args.verbose)
+    log = get_logger()
+
+    try:
+        projects = read_project_list(args.projects, args.file)
+    except OSError as exc:
+        log.error("Cannot read the project list file: %s", exc)
+        return EXIT_CONFIG
+    invalid = [p for p in projects if not is_valid_project_ref(p)]
+    if invalid:
+        log.error("Invalid project key(s): %s", ", ".join(invalid))
+        return EXIT_CONFIG
+    if not projects:
+        log.error("No project given. Example: py archive_project.py ABC")
+        return EXIT_CONFIG
+
+    # Only one run at a time: several runs in parallel would multiply the load on Jira.
+    lock = SingleInstanceLock(PROJECT_ROOT / ".archiver.lock")
+    if not lock.acquire():
+        log.error("Another archive run is already in progress on this installation. "
+                  "Wait for it to finish: running several at once would overload Jira.")
+        return EXIT_CONFIG
+    try:
+        return run_projects(settings, args, projects, output_dir, log_file)
+    finally:
+        lock.release()
+
+
+def run_projects(settings: Settings, args: argparse.Namespace, projects: list[str],
+                 output_dir: Path, log_file: Path | None) -> int:
+    log = get_logger()
+    client = JiraClient(settings)
+    try:
+        server = client.server_info()
+        client.myself()
+    except JiraError as exc:
+        log.error("Cannot talk to Jira: %s", exc)
+        log.error("Run check_connection.py to diagnose the problem.")
+        return EXIT_CONFIG
+    jira_info = {"base_url": settings.base_url, "version": server.get("version"),
+                 "build_number": server.get("buildNumber"), "deployment_type": server.get("deploymentType")}
+    log.info("Connected to Jira %s at %s", server.get("version"), settings.base_url)
+    log.info("Log file: %s", log_file)
+    log.info("Server protection: one request at a time, at least %.1f s between requests "
+             "(longer when Jira answers slowly).", settings.request_delay)
+
+    summary: dict[str, str] = {}
+    for project in projects:
+        log.info("=" * 70)
+        log.info("Project %s", project)
+        exporter = ProjectExporter(client, project, output_dir / "work", page_size=settings.page_size,
+                                   max_issues=args.max_issues, include_attachments=not args.no_attachments)
         try:
-            answer = client.get_json(f"{ZAPI}/util/zephyrTestIssueType")
+            result = exporter.run()
+            if result.failures:
+                log.error("[%s] %d issue(s) failed. Run the same command again to retry them "
+                          "(already exported issues are skipped). Details: %s",
+                          result.project_key, len(result.failures),
+                          result.paths.state / "failures.json")
+                summary[project] = f"INCOMPLETE ({len(result.failures)} issue(s) failed, run again)"
+                continue
+            zip_path = package(result, jira_info, output_dir, settings.base_url)
+            if not args.keep_work:
+                shutil.rmtree(result.paths.root, ignore_errors=True)
+                with contextlib.suppress(OSError):
+                    (output_dir / "work").rmdir()  # only removed when empty
+            log.info("[%s] DONE -> %s", result.project_key, zip_path)
+            log.info("[%s] Load on Jira so far: %s", result.project_key, client.stats())
+            summary[project] = f"OK  {zip_path.name}"
+        except ProjectTooLargeError as exc:
+            log.warning("Skipped: %s", exc)
+            summary[project] = "SKIPPED (too many issues)"
         except JiraError as exc:
-            if exc.status_code != 404:  # 404 = the plugin is not installed: nothing to say
-                warnings.append(f"Zephyr test data: the Zephyr API did not answer ({exc}). Test steps and "
-                                "executions are NOT archived.")
-                log.warning("Zephyr API not available: %s", exc)
-            return {"installed": False}
-        except ValueError:  # not JSON (e.g. an HTML page): treated as "not installed"
-            return {"installed": False}
-        type_id = str((answer or {}).get("testcaseIssueTypeId") or "") if isinstance(answer, dict) else ""
-        if not type_id:
-            return {"installed": False}
-        info: dict[str, Any] = {"installed": True, "test_issue_type_id": type_id}
-        for name, path in (("execution_statuses", "testExecutionStatus"), ("step_statuses", "teststepExecutionStatus")):
-            try:
-                info[name] = _clean(client.get_json(f"{ZAPI}/util/{path}"))
-            except (JiraError, ValueError) as exc:
-                info[name] = []
-                log.debug("Zephyr %s not available: %s", path, exc)
-        log.info("Zephyr Squad detected: test steps and executions of the Test issues will be archived.")
-        return info
+            log.error("[%s] Jira error: %s", project, exc)
+            summary[project] = f"FAILED ({exc})"
+        except Exception as exc:  # unexpected bug: log it fully, continue with the next project
+            log.exception("[%s] Unexpected error: %r", project, exc)
+            summary[project] = f"FAILED (unexpected error, see log: {exc!r})"
 
-    def is_test(self, issue_type_id: Any) -> bool:
-        return bool(self.info.get("installed")) and str(issue_type_id) == self.info.get("test_issue_type_id")
+    log.info("=" * 70)
+    log.info("SUMMARY")
+    for project, status in summary.items():
+        log.info("  %-15s %s", project, status)
+    log.info("Load on Jira: %s", client.stats())
+    log.info("Archives are in: %s", output_dir)
+    return EXIT_OK if all(s.startswith(("OK", "SKIPPED")) for s in summary.values()) else EXIT_SOME_FAILED
 
-    # ---------------------------------------------------------------- export
-    def export(self, issue_id: str, key: str, archive_root: Path, notes: list[str]) -> dict[str, Any]:
-        """All the Zephyr data of one Test issue. Attachments are downloaded into *archive_root*."""
-        folder = f"attachments/{key}/zephyr"
-        download = self._downloader(archive_root, folder, key, notes)
 
-        steps = []
-        for step in self._optional(notes, "test steps", self._steps, issue_id) or []:
-            step = _clean(step)
-            files = step.pop("attachmentsMap", None) or []
-            step["attachments"] = [download(f) for f in files if isinstance(f, dict)]
-            steps.append(step)
-
-        executions = []
-        for execution in self._optional(notes, "test executions", self._executions, issue_id) or []:
-            execution = _clean(execution)
-            execution["archive_status"] = _named_status(execution.get("executionStatus"), self._execution_statuses)
-            execution["step_results"] = []
-            execution["attachments"] = []
-            if str(execution.get("executionStatus")) != UNEXECUTED and execution.get("id") is not None:
-                exec_id = str(execution["id"])
-                for result in self._optional(notes, f"step results of execution {exec_id}",
-                                             self._step_results, exec_id) or []:
-                    result = _clean(result)
-                    result["archive_status"] = _named_status(result.get("status"), self._step_statuses)
-                    execution["step_results"].append(result)
-                files = self._optional(notes, f"attachments of execution {exec_id}", self._execution_files, exec_id)
-                execution["attachments"] = [download(f) for f in files or [] if isinstance(f, dict)]
-            executions.append(execution)
-        # Creation order. ("executedOn" is a display text such as "12/Mar/24 10:15 AM": it does not sort by date.)
-        executions.sort(key=lambda e: int(e["id"]) if str(e.get("id", "")).isdigit() else 0)
-        return {"steps": steps, "executions": executions}
-
-    @staticmethod
-    def _optional(notes: list[str], label: str, fetch: Callable[[str], list[Any]], item_id: str) -> list[Any] | None:
-        """Missing data (403/404) becomes an archive note; other errors stop the issue (retried on the next run)."""
-        try:
-            return fetch(item_id)
-        except JiraError as exc:
-            if exc.status_code not in (403, 404):
-                raise
-            notes.append(f"Zephyr {label} could not be read: {exc}")
-            return None
-
-    # ------------------------------------------------------------- requests
-    def _steps(self, issue_id: str) -> list[Any]:
-        """Old Zephyr versions answer a plain list; newer ones a page ``{"stepBeanCollection": [...]}``."""
-        steps: list[Any] = []
-        seen: set[str] = set()
-        offset = 0
-        for _ in range(MAX_PAGES):
-            page = self.client.get_json(f"{ZAPI}/teststep/{quote(issue_id)}", {"offset": offset, "limit": PAGE_SIZE})
-            if isinstance(page, list):
-                steps = page
-                break
-            if not isinstance(page, dict):
-                break
-            batch = page.get("stepBeanCollection") or []
-            new = [s for s in batch if str(s.get("id")) not in seen]
-            seen.update(str(s.get("id")) for s in new)
-            steps += new
-            offset += len(batch)
-            if not new or page.get("isLastElementOnPage") is True or len(batch) < PAGE_SIZE:
-                break
-        return sorted((s for s in steps if isinstance(s, dict)), key=lambda s: (s.get("orderId") or 0))
-
-    def _executions(self, issue_id: str) -> list[Any]:
-        executions: list[Any] = []
-        seen: set[str] = set()
-        offset = 0
-        for _ in range(MAX_PAGES):
-            page = self.client.get_json(f"{ZAPI}/execution", {"issueId": issue_id, "offset": offset,
-                                                              "limit": PAGE_SIZE, "maxRecords": PAGE_SIZE})
-            if isinstance(page, dict) and isinstance(page.get("status"), dict) and not self._execution_statuses:
-                self._execution_statuses = _status_map(page["status"])
-            batch = (page.get("executions") or []) if isinstance(page, dict) else []
-            batch = [e for e in batch if isinstance(e, dict)]
-            new = [e for e in batch if str(e.get("id")) not in seen]
-            seen.update(str(e.get("id")) for e in new)
-            executions += new
-            offset += len(batch)
-            total = page.get("recordsCount") if isinstance(page, dict) else None
-            if not new or not isinstance(total, int) or len(executions) >= total:
-                break
-        return executions
-
-    def _step_results(self, execution_id: str) -> list[Any]:
-        answer = self.client.get_json(f"{ZAPI}/stepResult", {"executionId": execution_id})
-        if isinstance(answer, dict):
-            answer = answer.get("stepResults") or answer.get("data") or []
-        results = answer if isinstance(answer, list) else []
-        return sorted((r for r in results if isinstance(r, dict)), key=lambda r: (r.get("orderId") or 0))
-
-    def _execution_files(self, execution_id: str) -> list[Any]:
-        answer = self.client.get_json(f"{ZAPI}/attachment/attachmentsByEntity",
-                                      {"entityId": execution_id, "entityType": "EXECUTION"})
-        if isinstance(answer, dict):
-            answer = answer.get("data") or []
-        return answer if isinstance(answer, list) else []
-
-    def _downloader(self, archive_root: Path, folder: str, key: str,
-                    notes: list[str]) -> Callable[[dict[str, Any]], dict[str, Any]]:
-        """A function that downloads one Zephyr attachment and describes it (same shape as Jira attachments)."""
-
-        def download(file: dict[str, Any]) -> dict[str, Any]:
-            item = _clean(file)
-            file_id = str(file.get("fileId") or file.get("id") or "")
-            name = str(file.get("fileName") or file.get("name") or "file")
-            item["filename"] = name
-            archive: dict[str, Any] = {"path": None, "status": "skipped"}
-            if self.include_attachments and file_id:
-                relative = f"{folder}/{safe_filename(file_id)}_{safe_filename(name)}"
-                target = archive_root / relative
-                try:
-                    size = self.client.download(f"{ZAPI}/attachment/{quote(file_id)}/file", target)
-                    archive = {"path": relative, "status": "ok", "size": size, "sha256": sha256_file(target)}
-                except JiraError as exc:
-                    if exc.status_code not in (403, 404):
-                        raise  # temporary problem: the issue will be retried on the next run
-                    archive = {"path": None, "status": f"missing on server (HTTP {exc.status_code})"}
-                    notes.append(f"Zephyr attachment {name} (id {file_id}) could not be downloaded: {exc}")
-                    log.warning("[%s] Zephyr attachment %s not downloadable: %s", key, name, exc)
-            elif not file_id:
-                archive = {"path": None, "status": "no file id given by Zephyr"}
-            item["archive"] = archive
-            return item
-
-        return download
+if __name__ == "__main__":
+    _double_clicked = started_by_double_click()
+    _exit_code = main()
+    pause_if_double_clicked(_double_clicked)
+    sys.exit(_exit_code)
