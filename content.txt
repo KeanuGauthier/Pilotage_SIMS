@@ -1,26 +1,58 @@
-Notes — Étape 8 (chart Helm XWiki) — où on en est
+PoC COTS — notes de ce qu'on a fait en suivant le guide (étapes 1 à 8.5)
 
-Ce qu'on a fait
-Lylia avait écrit le chart Helm de XWiki et l'avait poussé sur main. De mon côté, j'ai récupéré son travail et déroulé l'étape 8 sur mon Mac pour le tester : j'ai construit l'image XWiki interne, installé le chart dans le cluster kind, et vérifié que le durcissement fonctionne.
+Le but
+Mettre en place, en local sur nos Mac, une chaîne pour mettre à jour XWiki sans risque : GitLab CI construit et teste chaque nouvelle version sur une copie de la sauvegarde de production, puis un humain déploie avec une seule commande (deploy.sh). On s'entraîne avec une « production factice » et des données bidon. Les étapes 1 à 8 posent tout le décor ; la sauvegarde, la CI et le déploiement viennent après (9 à 12).
 
-Pourquoi
-Le chart déploie XWiki dans son propre namespace, avec des protections inspirées du CIS Kubernetes Benchmark. Ce XWiki sera notre « production factice » pour les étapes de sauvegarde, de CI et de déploiement qui suivent. Je voulais vérifier que ce que Lylia avait écrit marche aussi chez moi, et pas seulement chez elle.
+Étape 1 — Préparer le Mac
+- Installé Homebrew puis, en une commande, tous les outils : colima (la VM qui fait tourner Docker), docker (+ buildx, compose), kind (Kubernetes dans Docker), kubectl, helm, gitlab-runner, gitleaks (détecte les secrets) et jq.
+- Branché le client Docker sur ses extensions et sur le trousseau macOS (fichier ~/.docker/config.json), pour ne pas laisser de mots de passe en clair. Docker Desktop est quitté pour ne pas faire doublon avec colima.
+- Choisi le dossier racine POC_ROOT (sur le SSD, en APFS) et créé le dossier poc-data (colima, kube, helm, backups, secrets...) qui reste hors de Git.
+- Ajouté un bloc dans ~/.zshrc pour que chaque Terminal charge l'environnement du projet.
+- Configuré l'identité Git et créé une clé SSH dédiée à GitLab, protégée par une phrase de passe.
+Pourquoi : que les deux Mac aient exactement les mêmes outils, et que tout ce qui est lourd ou secret vive à part du dépôt.
 
-Comment
-- Récupéré le code (git pull) : le chart était déjà là, conforme au guide.
-- Construit l'image poc-local/xwiki:17.10.13 avec docker build, puis chargée dans kind (kind load docker-image).
-- Créé xwiki/chart/values-local.yaml avec le sous-réseau du réseau kind (172.18.0.0/16). Ce fichier est propre à ma machine et ignoré par Git.
-- Créé le namespace xwiki et le Secret xwiki-db (le mot de passe de la base vient de mon dossier de secrets, jamais du dépôt).
-- helm lint OK, puis helm install : le pod passe en 1/1 Running.
-- Vérifié le durcissement (8.7) : pas de jeton d'accès à l'API dans le pod, mot de passe absent de la définition du pod, aucune capacité Linux (CapEff à 0), un pod d'un autre namespace est bloqué par la NetworkPolicy (timeout), et l'accès normal par l'Ingress fonctionne.
+Étape 2 — GitLab : projet, règles, garde-fous
+- Compte GitLab sécurisé (2FA + clé SSH), groupe privé créé, binôme invitée, projet privé poc-cots.
+- Règles du projet : plus personne ne peut pousser directement sur main (tout passe par une branche et une Merge Request relue par l'autre), les discussions doivent être résolues avant fusion, les runners partagés de GitLab sont désactivés, et un nettoyage automatique des vieilles images est prévu.
+- Squelette du dépôt : env/env.sh (chemins communs), .gitignore (secrets, values-local.yaml...), README, et un hook pre-commit gitleaks. Testé en essayant de commiter un faux jeton GitLab : le commit est bien refusé.
+Pourquoi : se protéger des erreurs classiques (pousser sur main, publier un mot de passe) dès le départ.
 
-Le problème rencontré (8.5)
-Le lendemain du lancement, xwiki.localhost renvoyait une erreur 503 : le pod restait en 0/1. Cause : XWiki lance l'assistant de configuration (Distribution Wizard) dès la première requête reçue, y compris celle de la sonde de démarrage de Kubernetes, avant même qu'on ouvre le navigateur. Si personne ne répond dans les 5 minutes environ, l'assistant se termine tout seul sans rien installer, et XWiki pense que c'est fini : la page d'accueil n'existe pas (404). Rien n'est cassé ni perdu, la base ne contenait que les tables système. C'est probablement ce qui a bloqué Lylia au 8.5.
+Étape 3 — La VM Docker, durcie et auditée
+- Démarré colima (4 cœurs, 8 Go, disque 100 Go) avec ses données sur le SSD.
+- Durci sa configuration : live-restore (les conteneurs survivent à un redémarrage du démon), rotation des journaux (3 fichiers de 10 Mo) et partage Mac vers VM réduit au seul dossier du projet, en lecture seule.
+- Passé l'audit CIS Docker (docker-bench-security, lancé dans la VM) et commité le rapport de chacun dans docs/audits/. Gardé une copie commentée de la config dans env/colima-reference.yaml, car colima efface les commentaires du vrai fichier.
+Pourquoi : savoir où en est la sécurité du moteur Docker, avec un rapport chiffré, plutôt que de supposer.
 
-Solution : relancer le pod pour redémarrer l'assistant, puis ouvrir http://xwiki.localhost:8080 tout de suite et enchaîner sans s'arrêter.
-    kubectl rollout restart deploy/xwiki -n xwiki
+Étape 4 — Le cluster Kubernetes
+- Créé un cluster kind d'un seul nœud (version de Kubernetes épinglée par son empreinte), accessible sur localhost:8080.
+- Installé avec Helm Traefik (le point d'entrée HTTP) et metrics-server (CPU et mémoire).
+- Fait trois travaux pratiques pour comprendre Kubernetes avant d'y mettre XWiki : un site nginx de bout en bout (pods, Deployment, Service, Ingress, mise à jour et retour arrière), le stockage persistant (les données survivent à la mort d'un pod, mais pas à la suppression du cluster) et l'autoscaling.
+- Écrit les scripts cluster-create.sh, start.sh et stop.sh pour tout lancer et arrêter dans le bon ordre.
 
-Ce qu'il reste à faire
-- 8.5 : passer l'assistant (créer l'Admin, choisir XWiki Standard Flavor, attendre l'installation des extensions).
-- 8.6 : créer le contenu factice (espace Projet PoC avec les pages Architecture, Journal, Contacts, une pièce jointe, l'utilisateur alice, une recherche « Architecture »), puis vérifier que la sonde REST répond 200 et que le compteur d'erreurs de migration est à 0.
-- Idée : ajouter au guide une note qui dit d'ouvrir le navigateur juste après le helm install.
+Étape 5 — Audit Kubernetes et tests de durcissement
+- Audit CIS Kubernetes avec kube-bench (résumé : 63 PASS, 12 FAIL, 56 WARN), rapport commité.
+- Testé un par un deux réglages Docker mis de côté à l'étape 3 : no-new-privileges et icc: false. Chaque test oblige à recréer le cluster et à rejouer un test de validation. no-new-privileges est gardé dans la config de référence.
+
+Étape 6 — PostgreSQL hors du cluster
+- Mot de passe généré et rangé dans poc-data/secrets (droits 600, jamais dans le dépôt).
+- Conteneur PostgreSQL 18.6 via docker compose, sur le réseau de kind pour que les pods le joignent par son nom, mais sans aucun port publié sur le Mac. Durci : no-new-privileges, 1 Go de mémoire max, 1 cœur, 200 processus.
+- Vérifié qu'un pod du cluster peut s'y connecter, et noté le sous-réseau IPv4 du réseau kind (172.18.0.0/16 chez moi), utile pour l'étape 8. start.sh et stop.sh gèrent désormais aussi la base.
+Pourquoi : imiter une vraie entreprise, où la base est sur une machine à part, et non dans Kubernetes.
+
+Étape 7 — L'image XWiki interne
+- Généré une autorité de certification « entreprise » factice (certificat public dans le dépôt, clé privée dans poc-data/secrets).
+- Écrit xwiki/VERSION (17.10.13, le fichier qu'on modifiera plus tard pour déclencher une mise à jour) et un Dockerfile : image officielle XWiki + le certificat + les options Java de l'entreprise (mémoire max 1 Go, arrêt net en cas de manque de mémoire).
+- Construit l'image poc-local/xwiki:17.10.13 et vérifié ses étiquettes, la présence du certificat et les options Java. Écart connu et documenté : l'image officielle tourne en root.
+
+Étape 8 — Le chart Helm et la production factice (jusqu'à 8.5)
+- Chart Helm écrit par Lylia (poussé sur main) : un namespace xwiki avec règles Pod Security, un compte de service sans jeton d'accès à l'API, un disque persistant que « helm uninstall » ne supprime jamais, un Deployment en mode Recreate (jamais deux XWiki en même temps), des sondes de santé, un Ingress et une NetworkPolicy (tout interdit par défaut, puis seulement Traefik en entrée ; DNS, PostgreSQL et HTTPS en sortie). Le mot de passe de la base est lu dans un fichier monté, pas dans une variable.
+- De mon côté : construit l'image, créé mon values-local.yaml (sous-réseau kind, propre à ma machine, ignoré par Git), créé le Secret xwiki-db, chargé l'image dans kind, lancé helm lint puis helm install. Le pod passe en 1/1 Running.
+- Vérifié le durcissement (8.7) : pas de jeton d'API dans le pod, mot de passe absent de la définition du pod, aucune capacité Linux (CapEff à 0), pod d'un autre namespace bloqué (timeout), accès normal par l'Ingress qui fonctionne.
+
+Où on s'est arrêtés : 8.5, l'assistant de configuration
+XWiki lance son assistant (Distribution Wizard) dès la première requête reçue, y compris celle des sondes de Kubernetes, avant même qu'on ouvre le navigateur. Si personne ne répond en 5 minutes environ, il se termine seul sans rien installer : XWiki croit l'installation faite, la page d'accueil n'existe pas (404), le pod reste en 0/1 et le site renvoie 503. Rien n'est cassé ni perdu. C'est probablement ce qui a bloqué Lylia.
+Solution : kubectl rollout restart deploy/xwiki -n xwiki, puis ouvrir http://xwiki.localhost:8080 tout de suite et enchaîner l'assistant sans s'arrêter.
+
+Reste à faire pour finir l'étape 8
+8.5 : créer l'administrateur Admin et installer le flavor XWiki Standard (5 à 15 minutes).
+8.6 : contenu factice (espace Projet PoC avec Architecture, Journal, Contacts, une pièce jointe, l'utilisateur alice, une recherche « Architecture »), puis vérifier que la sonde REST répond 200 et que le compteur d'erreurs de migration est à 0.
