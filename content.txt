@@ -1,172 +1,402 @@
-"""Requirements data of the R4J plugin ("R4J - Requirements Management for Jira").
+"""Extract all data of one Jira project into a local working folder.
 
-With R4J, a requirement is a normal Jira issue (archived like any other issue).
-What the plugin adds, and keeps in its own tables, is read here through its own
-REST API (``/rest/com.easesolutions.jira.plugins.requirements/1.0/...``),
-read-only:
+How it works
+------------
+1. **Project metadata**: project, components, versions, roles, statuses,
+   schemes, the field catalog and the fields configured per issue type
+   ("create screen" configuration).
+2. **Inventory**: the list of every issue (id + key) of the project.
+3. **Issues**: fetched in batches with all fields, rendered fields, changelog,
+   comments, work logs, remote links and attachments. For each issue, the
+   attachments are downloaded, then the issue JSON is written to
+   ``state/issues/<KEY>.json``.
+4. **Zephyr tests**: when the Zephyr Squad plugin is installed, the test steps
+   and test executions of every "Test" issue are added to its record (see
+   ``zephyr.py``).
+5. **R4J requirements**: when the R4J plugin is installed, the requirements tree
+   and the baselines of the project are read with the project metadata (see
+   ``r4j.py``).
 
-* **The requirements tree** of the project: its folders, the issues placed in
-  each folder (in their order), and the child requirements of an issue.
-* **The baselines** of the project: the frozen copies ("snapshots") of the
-  requirements taken at a given date, with the field values they had then.
-
-Requests, once per project (all GET, throttled like every other request):
-
-* 1 request for the tree,
-* 1 request for the list of baselines, then 1 request per baseline.
-
-When R4J is not installed (HTTP 404), or the project is not managed with R4J,
-nothing more is asked and nothing changes in the archive.
-
-Not covered: coverage and traceability views (they are computed from the issue
-links, which are archived with every issue), and the R4J configuration.
+Because steps 3-4 write the issue JSON *last*, an interrupted run can simply be
+restarted: issues that already have their JSON file are skipped (resume).
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
 from .jira_client import JiraClient, JiraError
 from .logging_setup import get_logger
+from .r4j import export_r4j
+from .utils import atomic_write_json, chunks, is_empty, read_json, safe_filename, sha256_file, utc_now
+from .zephyr import ZephyrExporter
 
-log = get_logger("r4j")
+log = get_logger("export")
 
-R4J = "/rest/com.easesolutions.jira.plugins.requirements/1.0"
-MAX_DEPTH = 60  # safety net against a tree that would loop on itself
+API = JiraClient.API
 
-NOT_INSTALLED: dict[str, Any] = {"installed": False}
+#: System fields always kept in the JSON, even when empty.
+CORE_FIELDS = {
+    "summary", "issuetype", "status", "priority", "resolution", "resolutiondate", "created", "updated",
+    "creator", "reporter", "assignee", "labels", "components", "versions", "fixVersions", "description",
+    "environment", "duedate", "issuelinks", "subtasks", "project", "security", "timetracking", "votes",
+    "watches",
+}
+#: Fields moved to their own sections of the issue record (comments, worklogs, attachments).
+SECTION_FIELDS = {"comment", "worklog", "attachment"}
+#: Fields describing the person running the export, not the issue.
+EXCLUDED_FIELDS = {"lastViewed"}
+#: Keys removed everywhere: links to avatars/icons/REST resources, useless once Jira is gone.
+NOISE_KEYS = {"avatarUrls", "self", "iconUrl"}
 
 
-def _as_list(value: Any) -> list[Any]:
-    """R4J sometimes gives one object where a list is expected (``{"childReq": {...}}``)."""
+class ProjectTooLargeError(Exception):
+    """The project has more issues than the configured limit."""
+
+
+class IncompleteExportError(Exception):
+    """Some issues could not be exported; re-running the command will retry them."""
+
+
+def strip_noise(value: Any) -> Any:
+    """Recursively drop :data:`NOISE_KEYS` from Jira objects."""
+    if isinstance(value, dict):
+        return {k: strip_noise(v) for k, v in value.items() if k not in NOISE_KEYS}
     if isinstance(value, list):
-        return value
-    return [value] if isinstance(value, dict) else []
+        return [strip_noise(v) for v in value]
+    return value
 
 
-def _position(item: dict[str, Any]) -> float:
-    position = item.get("position")
-    return position if isinstance(position, (int, float)) and not isinstance(position, bool) else 0
+@dataclass
+class WorkPaths:
+    """Folder layout of a project being exported (``<output>/work/<KEY>/``)."""
+
+    root: Path
+
+    @property
+    def state(self) -> Path:
+        return self.root / "state"
+
+    @property
+    def issues(self) -> Path:
+        return self.state / "issues"
+
+    @property
+    def archive(self) -> Path:
+        """Content that ends up in the ZIP file."""
+        return self.root / "archive"
+
+    @property
+    def attachments(self) -> Path:
+        return self.archive / "attachments"
+
+    def create(self) -> None:
+        for path in (self.issues, self.attachments):
+            path.mkdir(parents=True, exist_ok=True)
 
 
-def _text(value: Any) -> str:
-    return value if isinstance(value, str) else ("" if value is None else str(value))
+@dataclass
+class ExportResult:
+    project_key: str
+    paths: WorkPaths
+    metadata: dict[str, Any]
+    inventory: list[dict[str, str]]
+    failures: dict[str, str] = field(default_factory=dict)
 
 
-def _issue(raw: dict[str, Any], depth: int) -> dict[str, Any]:
-    children: list[Any] = []
-    if depth < MAX_DEPTH:
-        nested = raw.get("childReqs")
-        if isinstance(nested, dict):
-            nested = nested.get("childReq")
-        children = _as_list(nested) + _as_list(raw.get("issues"))
-    issue_id = raw.get("issueId", raw.get("id"))
-    return {
-        "key": _text(raw.get("key")),
-        "id": None if issue_id is None else str(issue_id),
-        "summary": _text(raw.get("summary")),
-        "type": _text(raw.get("issueType")),
-        "children": [_issue(c, depth + 1) for c in sorted((c for c in children if isinstance(c, dict)), key=_position)
-                     if c.get("key")],
-    }
+class ProjectExporter:
+    """Exports one project. See the module docstring for the overall flow."""
 
+    def __init__(self, client: JiraClient, project_ref: str, work_root: Path, *, page_size: int = 25,
+                 max_issues: int | None = None, include_attachments: bool = True) -> None:
+        self.client = client
+        self.project_ref = project_ref
+        self.work_root = work_root
+        self.page_size = page_size
+        self.max_issues = max_issues
+        self.include_attachments = include_attachments
 
-def _folder(raw: dict[str, Any], depth: int) -> dict[str, Any]:
-    folders = _as_list(raw.get("folders")) if depth < MAX_DEPTH else []
-    issues = _as_list(raw.get("issues"))
-    folder_id = raw.get("id")
-    return {
-        "id": None if folder_id is None else str(folder_id),
-        "name": _text(raw.get("name_display") or raw.get("name")),
-        "description": _text(raw.get("description")),
-        "folders": [_folder(f, depth + 1) for f in sorted((f for f in folders if isinstance(f, dict)), key=_position)],
-        "issues": [_issue(i, 0) for i in sorted((i for i in issues if isinstance(i, dict)), key=_position)
-                   if i.get("key")],
-    }
+    # ================================================================== run
+    def run(self) -> ExportResult:
+        project = self._get_project()
+        key = project["key"]
+        if self.max_issues is not None:  # checked before anything is written to disk
+            total = int(self.client.search(f'project = "{key}"', 0, 0, ["key"]).get("total", 0))
+            if total > self.max_issues:
+                raise ProjectTooLargeError(f"{key} has {total} issues (limit is {self.max_issues}).")
+        paths = WorkPaths(self.work_root / key)
+        paths.create()
 
+        metadata = self._metadata(paths, project)
+        inventory = self._inventory(paths, key)
+        log.info("[%s] %d issue(s) in the project.", key, len(inventory))
 
-def normalize_tree(raw: Any) -> dict[str, Any] | None:
-    """The tree given by R4J, reduced to what is useful in an archive. ``None`` when it is empty."""
-    if not isinstance(raw, dict):
-        return None
-    root = _folder(raw, 0)
-    if not root["folders"] and not root["issues"]:
-        return None
-    return {"folders": root["folders"], "issues": root["issues"]}
+        done = {p.stem for p in paths.issues.glob("*.json")}
+        todo = [item for item in inventory if item["key"] not in done]
+        if done:
+            log.info("[%s] Resuming: %d already exported, %d remaining.", key, len(inventory) - len(todo), len(todo))
 
+        self._zephyr = ZephyrExporter(self.client, metadata["zephyr"], self.include_attachments)
+        result = ExportResult(key, paths, metadata, inventory)
+        processed = 0
+        for batch in chunks(todo, self.page_size):
+            try:
+                issues = self._fetch_batch([item["id"] for item in batch])
+            except JiraError as exc:
+                for item in batch:
+                    result.failures[item["key"]] = str(exc)
+                log.error("[%s] Batch failed: %s", key, exc)
+                continue
+            returned = {str(issue["id"]) for issue in issues}
+            for item in batch:
+                if item["id"] not in returned:
+                    result.failures[item["key"]] = "Issue not returned by Jira (deleted or moved during export?)"
+            for raw in issues:
+                try:
+                    self._process_issue(raw, metadata, paths)
+                except Exception as exc:  # one broken issue must not stop the run
+                    result.failures[raw.get("key", raw.get("id", "?"))] = repr(exc)
+                    log.error("[%s] Issue %s failed: %r", key, raw.get("key"), exc)
+                processed += 1
+            log.info("[%s] Progress: %d / %d issue(s) exported.", key,
+                     len(inventory) - len(todo) + processed, len(inventory))
 
-def count_tree(tree: dict[str, Any] | None) -> tuple[int, int]:
-    """(number of folders, number of issues placed in the tree, child requirements included)."""
-    if not tree:
-        return 0, 0
+        failures_file = paths.state / "failures.json"
+        if result.failures:
+            atomic_write_json(failures_file, result.failures)
+        else:
+            failures_file.unlink(missing_ok=True)
+        return result
 
-    def issues(items: list[dict[str, Any]]) -> int:
-        return sum(1 + issues(i.get("children") or []) for i in items)
+    # ============================================================= metadata
+    def _get_project(self) -> dict[str, Any]:
+        return self.client.get_json(f"{API}/project/{quote(self.project_ref)}",
+                                    {"expand": "description,lead,url,projectKeys,issueTypes"})
 
-    folders = issue_count = 0
-    stack = [tree]
-    while stack:
-        node = stack.pop()
-        issue_count += issues(node.get("issues") or [])
-        folders += len(node.get("folders") or [])
-        stack.extend(node.get("folders") or [])
-    return folders, issue_count
-
-
-def export_r4j(client: JiraClient, project_key: str, warnings: list[str]) -> dict[str, Any]:
-    """Tree and baselines of one project: ``{"installed", "tree", "baselines"}``."""
-    try:
-        raw_tree = client.get_json(f"{R4J}/tree/{quote(project_key)}")
-    except JiraError as exc:
-        if exc.status_code == 404:  # the plugin is not installed: nothing to say
-            return dict(NOT_INSTALLED)
-        if exc.status_code == 400:  # R4J is installed, but this project is not managed with it
-            log.info("[%s] R4J is installed but has no requirements tree for this project.", project_key)
-            return {"installed": True, "tree": None, "baselines": []}
-        warnings.append(f"R4J requirements: the R4J API did not answer ({exc}). The requirements tree and the "
-                        "baselines are NOT archived.")
-        log.warning("R4J API not available: %s", exc)
-        return dict(NOT_INSTALLED)
-    except ValueError:  # not JSON (e.g. an HTML page): treated as "not installed"
-        return dict(NOT_INSTALLED)
-
-    tree = normalize_tree(raw_tree)
-    baselines = _baselines(client, project_key, warnings)
-    folders, issues = count_tree(tree)
-    if tree or baselines:
-        log.info("[%s] R4J detected: %d folder(s), %d issue(s) in the requirements tree, %d baseline(s).",
-                 project_key, folders, issues, len(baselines))
-    return {"installed": True, "tree": tree, "baselines": baselines}
-
-
-def _baselines(client: JiraClient, project_key: str, warnings: list[str]) -> list[dict[str, Any]]:
-    try:
-        listed = client.get_json(f"{R4J}/baselines/project/{quote(project_key)}")
-    except JiraError as exc:
-        if exc.status_code not in (400, 404):
-            warnings.append(f"R4J baselines: the list could not be read ({exc}). Baselines are NOT archived.")
-            log.warning("R4J baselines not available: %s", exc)
-        return []
-    except ValueError:
-        return []
-    if isinstance(listed, dict):  # tolerated: {"baselines": [...]}
-        listed = listed.get("baselines") or listed.get("values") or []
-
-    result = []
-    for baseline in listed if isinstance(listed, list) else []:
-        if not isinstance(baseline, dict) or baseline.get("id") is None:
-            continue
-        item = dict(baseline)
-        item["issues"] = []
+    def _optional(self, warnings: list[str], label: str, path: str, params: dict | None = None) -> Any:
+        """Fetch an optional piece of metadata; record a warning instead of failing."""
         try:
-            detail = client.get_json(f"{R4J}/baseline/{quote(str(baseline['id']))}")
-            if isinstance(detail, dict):
-                item.update(detail)
-                item["issues"] = [i for i in _as_list(detail.get("issues")) if isinstance(i, dict)]
-        except (JiraError, ValueError) as exc:
-            warnings.append(f"R4J baseline \"{baseline.get('name')}\" (id {baseline['id']}): its content could not "
-                            f"be read ({exc}). Only its name and date are archived.")
-            log.warning("R4J baseline %s not readable: %s", baseline["id"], exc)
-        result.append(item)
-    return result
+            return strip_noise(self.client.get_json(path, params))
+        except JiraError as exc:
+            if exc.status_code == 404:
+                return None
+            warnings.append(f"{label}: {exc}")
+            log.warning("Could not read %s: %s", label, exc)
+            return None
+
+    def _metadata(self, paths: WorkPaths, project: dict[str, Any]) -> dict[str, Any]:
+        cache = paths.state / "metadata.json"
+        if cache.is_file():
+            metadata = read_json(cache)
+            if "zephyr" not in metadata:  # work folder started by an older version of the tool
+                metadata["zephyr"] = ZephyrExporter.detect(self.client, metadata.setdefault("warnings", []))
+                atomic_write_json(cache, metadata)
+            if "r4j" not in metadata:
+                metadata["r4j"] = export_r4j(self.client, project["key"], metadata.setdefault("warnings", []))
+                atomic_write_json(cache, metadata)
+            return metadata
+
+        key = project["key"]
+        log.info("[%s] Reading project configuration...", key)
+        warnings: list[str] = []
+        base = f"{API}/project/{quote(key)}"
+
+        roles: dict[str, Any] = {}
+        for name, url in (self._optional(warnings, "project roles", f"{base}/role") or {}).items():
+            role = self._optional(warnings, f"role {name}", url) if isinstance(url, str) else None
+            if role is not None:
+                roles[name] = role
+
+        all_fields = self.client.get_json(f"{API}/field")
+        catalog = {f["id"]: strip_noise(f) for f in all_fields}
+
+        issue_types = []
+        for issue_type in project.get("issueTypes") or []:
+            fields = self._create_screen_fields(warnings, key, issue_type)
+            issue_types.append({**strip_noise(issue_type), "create_screen_fields": fields})
+
+        metadata = {
+            "export_started_at": utc_now().isoformat(),
+            "project": strip_noise(project),
+            "components": self._optional(warnings, "components", f"{base}/components") or [],
+            "versions": self._optional(warnings, "versions", f"{base}/versions") or [],
+            "statuses_by_issue_type": self._optional(warnings, "statuses", f"{base}/statuses") or [],
+            "roles": roles,
+            "permission_scheme": self._optional(warnings, "permission scheme", f"{base}/permissionscheme"),
+            "notification_scheme": self._optional(warnings, "notification scheme", f"{base}/notificationscheme"),
+            "issue_security_scheme": self._optional(warnings, "issue security scheme",
+                                                    f"{base}/issuesecuritylevelscheme"),
+            "issue_types": issue_types,
+            "field_catalog": catalog,
+            "zephyr": ZephyrExporter.detect(self.client, warnings),
+            "r4j": export_r4j(self.client, key, warnings),
+            "warnings": warnings,
+        }
+        atomic_write_json(cache, metadata)
+        return metadata
+
+    def _create_screen_fields(self, warnings: list[str], key: str, issue_type: dict[str, Any]) -> list[dict]:
+        """Fields configured for an issue type (as on its create screen), with rules and allowed values."""
+        path = f"{API}/issue/createmeta/{quote(key)}/issuetypes/{quote(str(issue_type['id']))}"
+        try:
+            values = self.client.paged_values(path, page_size=100)
+        except JiraError as exc:
+            warnings.append(f"field configuration of issue type {issue_type.get('name')}: {exc}")
+            log.warning("Could not read fields of issue type %s: %s", issue_type.get("name"), exc)
+            return []
+        if not values:
+            # Typically: the account lacks the "Create Issues" permission on the project.
+            warnings.append(f"field configuration of issue type {issue_type.get('name')}: Jira returned no field "
+                            "(the account may lack the 'Create Issues' permission). Fields with a value are all "
+                            "kept; empty fields of this issue type may be missing.")
+            log.warning("No field configuration returned for issue type %s", issue_type.get("name"))
+        return [strip_noise(v) for v in values]
+
+    # ============================================================ inventory
+    def _inventory(self, paths: WorkPaths, key: str) -> list[dict[str, str]]:
+        cache = paths.state / "inventory.json"
+        if cache.is_file():
+            return read_json(cache)
+        jql = f'project = "{key}" ORDER BY id ASC'
+        log.info("[%s] Listing issues...", key)
+        inventory = [{"id": str(i["id"]), "key": i["key"]}
+                     for i in self.client.iter_search(jql, ["key"], page_size=1000)]
+        atomic_write_json(cache, inventory)
+        return inventory
+
+    # =============================================================== issues
+    def _fetch_batch(self, ids: list[str]) -> list[dict[str, Any]]:
+        jql = f"id in ({','.join(ids)}) ORDER BY id ASC"
+        page = self.client.search(jql, 0, len(ids), ["*all"], expand=["renderedFields", "changelog"])
+        return page.get("issues") or []
+
+    def _process_issue(self, raw: dict[str, Any], metadata: dict[str, Any], paths: WorkPaths) -> None:
+        key = raw["key"]
+        log.debug("Processing %s", key)
+        notes: list[str] = []
+        record = self._normalize(raw, metadata)
+        record["comments"] = self._comments(raw)
+        record["worklogs"] = self._worklogs(raw)
+        record["changelog"] = self._changelog(raw)
+        record["remote_links"] = self._remote_links(raw)
+        record["attachments"] = self._attachments(raw, paths, notes)
+        if self._zephyr.is_test(record["issue_type"]["id"]):
+            record["zephyr"] = self._zephyr.export(record["id"], key, paths.archive, notes)
+        record["archive_notes"] = notes
+        atomic_write_json(paths.issues / f"{key}.json", record)  # written last => issue is "done"
+
+    def _normalize(self, raw: dict[str, Any], metadata: dict[str, Any]) -> dict[str, Any]:
+        catalog = metadata["field_catalog"]
+        fields = raw.get("fields") or {}
+        rendered = raw.get("renderedFields") or {}
+        issue_type = fields.get("issuetype") or {}
+
+        configured: set[str] = set()
+        for it in metadata["issue_types"]:
+            if str(it.get("id")) == str(issue_type.get("id")):
+                configured = {f.get("fieldId") for f in it.get("create_screen_fields") or [] if f.get("fieldId")}
+
+        wanted = (configured | CORE_FIELDS | {fid for fid, value in fields.items() if not is_empty(value)})
+        wanted -= SECTION_FIELDS | EXCLUDED_FIELDS
+
+        def order(field_id: str) -> tuple[int, str]:
+            info = catalog.get(field_id) or {}
+            return (1 if info.get("custom") else 0, str(info.get("name", field_id)).lower())
+
+        out: dict[str, Any] = {}
+        for field_id in sorted(wanted, key=order):
+            value = strip_noise(fields.get(field_id))
+            entry: dict[str, Any] = {"name": (catalog.get(field_id) or {}).get("name", field_id), "value": value}
+            html = rendered.get(field_id)
+            schema_type = ((catalog.get(field_id) or {}).get("schema") or {}).get("type")
+            if isinstance(html, str) and html.strip() and schema_type == "string" and html != value:
+                entry["rendered_html"] = html
+            out[field_id] = entry
+
+        return {
+            "id": str(raw["id"]),
+            "key": raw["key"],
+            "issue_type": {"id": issue_type.get("id"), "name": issue_type.get("name"),
+                           "subtask": issue_type.get("subtask")},
+            "fields": out,
+        }
+
+    def _comments(self, raw: dict[str, Any]) -> list[dict[str, Any]]:
+        block = (raw.get("fields") or {}).get("comment") or {}
+        comments = block.get("comments") or []
+        rendered = {c.get("id"): c.get("body") for c in
+                    (((raw.get("renderedFields") or {}).get("comment") or {}).get("comments") or [])}
+        if int(block.get("total", len(comments))) > len(comments):
+            comments, start = [], 0
+            while True:
+                page = self.client.get_json(f"{API}/issue/{raw['id']}/comment",
+                                            {"startAt": start, "maxResults": 100, "expand": "renderedBody"})
+                batch = page.get("comments") or []
+                comments += batch
+                start += len(batch)
+                if not batch or start >= int(page.get("total", 0)):
+                    break
+        result = []
+        for comment in comments:
+            item = strip_noise(comment)
+            item.setdefault("renderedBody", rendered.get(comment.get("id")))
+            result.append(item)
+        return result
+
+    def _worklogs(self, raw: dict[str, Any]) -> list[dict[str, Any]]:
+        block = (raw.get("fields") or {}).get("worklog") or {}
+        worklogs = block.get("worklogs") or []
+        if int(block.get("total", len(worklogs))) > len(worklogs):
+            worklogs = self.client.get_json(f"{API}/issue/{raw['id']}/worklog").get("worklogs") or []
+        return strip_noise(worklogs)
+
+    def _changelog(self, raw: dict[str, Any]) -> list[dict[str, Any]]:
+        changelog = raw.get("changelog") or {}
+        histories = changelog.get("histories") or []
+        if int(changelog.get("total", len(histories))) > len(histories):
+            full = self.client.get_json(f"{API}/issue/{raw['id']}", {"expand": "changelog", "fields": "key"})
+            histories = (full.get("changelog") or {}).get("histories") or histories
+        return strip_noise(histories)
+
+    def _remote_links(self, raw: dict[str, Any]) -> list[dict[str, Any]]:
+        try:
+            return strip_noise(self.client.get_json(f"{API}/issue/{raw['id']}/remotelink")) or []
+        except JiraError as exc:
+            if exc.status_code == 404:
+                return []
+            raise
+
+    def _attachments(self, raw: dict[str, Any], paths: WorkPaths, notes: list[str]) -> list[dict[str, Any]]:
+        key = raw["key"]
+        result = []
+        for attachment in (raw.get("fields") or {}).get("attachment") or []:
+            item = strip_noise(attachment)
+            item.pop("content", None)
+            item.pop("thumbnail", None)
+            att_id = str(attachment["id"])
+            filename = attachment.get("filename") or "file"
+            relative = f"attachments/{key}/{att_id}_{safe_filename(filename)}"
+            target = paths.archive / relative
+            archive: dict[str, Any] = {"path": None, "status": "skipped"}
+            if self.include_attachments:
+                # The URL is rebuilt from the configured base URL on purpose: the "content" URL
+                # returned by Jira may use another host name (Jira's own "Base URL" setting).
+                url = f"{self.client.base_url}/secure/attachment/{quote(att_id)}/{quote(filename)}"
+                try:
+                    size = self.client.download(url, target)
+                    archive = {"path": relative, "status": "ok", "size": size, "sha256": sha256_file(target)}
+                    expected = attachment.get("size")
+                    if isinstance(expected, int) and expected != size:
+                        notes.append(f"Attachment {filename}: size {size} differs from Jira metadata ({expected}).")
+                except JiraError as exc:
+                    if exc.status_code not in (403, 404):
+                        raise  # temporary problem: the issue will be retried on the next run
+                    archive = {"path": None, "status": f"missing on server (HTTP {exc.status_code})"}
+                    notes.append(f"Attachment {filename} (id {att_id}) could not be downloaded: {exc}")
+                    log.warning("[%s] Attachment %s not downloadable: %s", key, filename, exc)
+            item["archive"] = archive
+            result.append(item)
+        return result
