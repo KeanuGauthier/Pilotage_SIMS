@@ -1,353 +1,508 @@
-/* automatic-jira-archiving - offline viewer layout. Colors and spacing are close to Jira Data Center. */
+# automatic-jira-archiving
 
-:root {
-  --text: #172b4d;
-  --text-subtle: #5e6c84;
-  --link: #0052cc;
-  --border: #dfe1e6;
-  --border-strong: #c1c7d0;
-  --background: #ffffff;
-  --background-subtle: #f4f5f7;
-  --background-hover: #ebecf0;
-  --header: #0747a6;
-  --header-hover: #0052cc;
-  --selected: #deebff;
-  --font: "Segoe UI", system-ui, -apple-system, BlinkMacSystemFont, Roboto, "Helvetica Neue", Arial, sans-serif;
-  --mono: Consolas, "SFMono-Regular", Menlo, "Courier New", monospace;
-  color-scheme: light;
-}
+Archive old Jira projects before removing them from Jira.
 
-* { box-sizing: border-box; }
-html, body { margin: 0; padding: 0; }
-body { font-family: var(--font); font-size: 14px; line-height: 1.43; color: var(--text); background: var(--background); }
-a { color: var(--link); text-decoration: none; }
-a:hover { text-decoration: underline; }
-a.external::after { content: " \2197"; font-size: 0.85em; color: var(--text-subtle); }
-h1, h2, h3 { font-weight: 500; }
-button, input, select { font: inherit; color: inherit; }
-:focus-visible { outline: 2px solid #4c9aff; outline-offset: 1px; }
-[hidden] { display: none !important; }
+For each project, the tool creates **one ZIP file** that contains:
 
-.muted { color: var(--text-subtle); }
-.small { font-size: 12px; }
-.nowrap { white-space: nowrap; }
-.num { text-align: right; white-space: nowrap; }
-.pre-wrap { white-space: pre-wrap; overflow-wrap: anywhere; }
-.break { overflow-wrap: anywhere; }
+- **`OPEN_ARCHIVE.html`**: a viewer that shows the whole project in the web browser, much like Jira did: issue list with search and filters, board, issue pages with comments, history and attachments. **Anyone can use it: no Python, no installation, no Internet needed.**
+- **`project.json`**: all the data of the project and of every issue, including empty fields, comments, work logs, full change history, links and the attachment list.
+- **`attachments/`**: every file attached to the issues.
+- **Zephyr tests** (if the Zephyr Squad plugin is installed): the test steps and the test executions of every "Test" issue, in the JSON and in the viewer. See [Zephyr tests](#zephyr-tests).
+- **R4J requirements** (if the R4J plugin is installed and used by the project): the requirements tree (folders) and the baselines, in the JSON and in the viewer. See [R4J requirements](#r4j-requirements).
+- **`manifest.json`**: the list of all files with a digital fingerprint (SHA-256), to prove later that nothing was changed or damaged.
+- **`README.txt`**: a short explanation for whoever opens the archive in a few years.
 
-/* ---------------------------------------------------------------- top bar */
-.topbar { position: sticky; top: 0; z-index: 10; display: flex; align-items: center; gap: 8px; height: 48px;
-  padding: 0 16px; background: var(--header); color: #fff; }
-.brand { display: flex; align-items: center; gap: 8px; color: #fff; font-weight: 600; font-size: 15px; padding: 6px 8px;
-  border-radius: 3px; white-space: nowrap; }
-.brand:hover, .topnav-link:hover { background: var(--header-hover); text-decoration: none; }
-.brand-icon { width: 20px; height: 20px; display: block; }
-.topnav { display: flex; gap: 2px; }
-.topnav-link { color: #deebff; padding: 6px 10px; border-radius: 3px; }
-.topnav-link.active { color: #fff; background: rgba(255, 255, 255, 0.16); }
-.topbar-spacer { flex: 1; }
-.quick-search { width: 240px; max-width: 32vw; padding: 5px 10px; border-radius: 3px; border: 1px solid transparent;
-  background: rgba(255, 255, 255, 0.2); color: #fff; }
-.quick-search::placeholder { color: #deebff; }
-.quick-search:focus { background: #fff; color: var(--text); outline: none; }
-.readonly-badge { font-size: 11px; font-weight: 700; text-transform: uppercase; padding: 2px 6px; border-radius: 3px;
-  background: #ffab00; color: #172b4d; white-space: nowrap; }
+The tool **only reads** Jira. It never creates, changes or deletes anything in Jira.
 
-/* ---------------------------------------------------------------- sidebar */
-.layout { display: flex; min-height: calc(100vh - 48px); }
-.sidebar { flex: 0 0 240px; background: var(--background-subtle); border-right: 1px solid var(--border); padding: 20px 12px;
-  display: flex; flex-direction: column; position: sticky; top: 48px; height: calc(100vh - 48px); overflow-y: auto; }
-.sidebar-project { display: flex; gap: 10px; align-items: center; padding: 0 8px 20px; }
-.sidebar-project-name { font-weight: 600; overflow-wrap: anywhere; }
-.sidenav { display: flex; flex-direction: column; gap: 2px; }
-.sidenav-link { color: var(--text); padding: 8px 12px; border-radius: 3px; }
-.sidenav-link:hover { background: var(--background-hover); text-decoration: none; }
-.sidenav-link.active { background: var(--selected); color: var(--link); font-weight: 600; }
-.sidebar-footer { margin-top: auto; padding: 16px 8px 0; }
+Built for **Jira Data Center 11.x**, running on **Windows** with **Python 3.10 or newer** (tested with 3.12).
 
-.content { flex: 1; min-width: 0; padding: 24px 32px 48px; }
-.content:focus { outline: none; }
+---
 
-/* ---------------------------------------------------------------- common */
-.page-header { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; margin-bottom: 16px; }
-.page-header h1 { font-size: 24px; margin: 0; flex: 1; }
-.columns { display: flex; gap: 32px; align-items: flex-start; }
-.column-main { flex: 1; min-width: 0; }
-.column-side { flex: 0 0 340px; min-width: 0; }
-.module { margin-bottom: 24px; }
-.module-title { font-size: 16px; font-weight: 600; margin: 0 0 8px; padding-bottom: 6px; border-bottom: 1px solid var(--border);
-  display: flex; align-items: center; gap: 8px; }
-.count { display: inline-block; min-width: 20px; padding: 0 6px; border-radius: 10px; background: var(--background-hover);
-  color: var(--text); font-size: 12px; font-weight: 600; text-align: center; }
+## Table of contents
 
-.button { display: inline-flex; align-items: center; gap: 4px; padding: 4px 10px; border-radius: 3px; border: none;
-  background: rgba(9, 30, 66, 0.06); color: var(--text); cursor: pointer; white-space: nowrap; font-size: 14px; }
-.button:hover { background: rgba(9, 30, 66, 0.12); text-decoration: none; }
-.button.selected { background: var(--text); color: #fff; }
-.button.disabled, .button:disabled { opacity: 0.45; pointer-events: none; }
-.button-subtle { background: transparent; color: var(--link); }
+1. [Installation (first time only)](#1-installation-first-time-only)
+2. [Configuration: URL and token](#2-configuration-url-and-token)
+3. [Test the connection](#3-test-the-connection)
+4. [Archive projects](#4-archive-projects)
+5. [What you get](#5-what-you-get)
+   - [Opening an archive (for everyone)](#opening-an-archive-for-everyone)
+6. [Load on the Jira server](#6-load-on-the-jira-server)
+7. [Updating the tool](#7-updating-the-tool)
+8. [Troubleshooting](#8-troubleshooting)
+9. [Security](#9-security)
+10. [Known limitations](#10-known-limitations)
+11. [For maintainers](#11-for-maintainers)
 
-.message { border-radius: 3px; padding: 10px 14px; margin: 8px 0 16px; }
-.message ul { margin: 6px 0 0; padding-left: 20px; }
-.message p { margin: 0; }
-.message-info { background: #deebff; }
-.message-warning { background: #fffae6; border-left: 4px solid #ffab00; }
-.message-error { background: #ffebe6; border-left: 4px solid #de350b; }
+---
 
-.lozenge { display: inline-block; padding: 0 5px; border-radius: 3px; font-size: 11px; font-weight: 700; line-height: 18px;
-  text-transform: uppercase; white-space: nowrap; max-width: 220px; overflow: hidden; text-overflow: ellipsis; vertical-align: middle;
-  background: #dfe1e6; color: #42526e; }
-.lozenge-indeterminate { background: #deebff; color: #0747a6; }
-.lozenge-done { background: #e3fcef; color: #006644; }
+## 1. Installation (first time only)
 
-.icon { display: inline-flex; vertical-align: middle; flex: 0 0 auto; }
-.icon svg { width: 16px; height: 16px; display: block; }
-.with-icon { display: inline-flex; align-items: center; gap: 6px; }
-.avatar { display: inline-block; flex: 0 0 auto; width: 32px; height: 32px; line-height: 32px; border-radius: 50%; color: #fff;
-  font-size: 13px; font-weight: 600; text-align: center; vertical-align: middle; user-select: none; }
-.avatar-small { width: 24px; height: 24px; line-height: 24px; font-size: 10px; }
-.project-avatar { border-radius: 4px; }
-.user { display: inline-flex; align-items: center; gap: 6px; vertical-align: middle; }
-.value-list { display: inline-flex; flex-wrap: wrap; gap: 4px 10px; }
-.issue-link.done { text-decoration: line-through; }
-.external-issue { color: var(--text-subtle); }
-.labels { display: inline-flex; flex-wrap: wrap; gap: 4px; }
-.label { padding: 0 6px; border: 1px solid var(--border-strong); border-radius: 3px; font-size: 12px; }
+You do **not** need to know Python. Follow these steps.
 
-.info-table { border-collapse: collapse; width: 100%; }
-.info-table th { text-align: left; font-weight: 400; color: var(--text-subtle); padding: 5px 12px 5px 0; vertical-align: top;
-  width: 160px; }
-.column-side .info-table th { width: 40%; }
-.info-table td { padding: 5px 0; vertical-align: top; overflow-wrap: anywhere; }
-.info-table.roles th { width: 35%; }
-.actor { display: inline-block; margin: 0 8px 2px 0; }
+### How to type the commands
 
-/* ---------------------------------------------------------------- summary page */
-.project-header { display: flex; align-items: center; gap: 16px; margin-bottom: 20px; }
-.project-header h1 { margin: 0; font-size: 26px; }
-.stats { display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 24px; }
-.stat { flex: 1 1 140px; border: 1px solid var(--border); border-radius: 4px; padding: 12px 16px; color: var(--text); }
-a.stat:hover { border-color: var(--link); text-decoration: none; }
-.stat-value { font-size: 24px; font-weight: 600; }
-.stat-label { color: var(--text-subtle); }
-.bar-list { border-collapse: collapse; width: 100%; }
-.bar-list td { padding: 4px 8px 4px 0; }
-.bar-label { width: 40%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 260px; }
-.bar-cell { width: 50%; }
-.bar { display: block; height: 8px; border-radius: 4px; background: #4c9aff; }
-.bar-count { text-align: right; width: 10%; }
+Every command in this guide is typed in a **terminal opened in the tool's folder**:
 
-/* ---------------------------------------------------------------- issue list */
-.filters { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 16px; }
-.filter-search { flex: 1 1 280px; padding: 6px 10px; border: 2px solid var(--border); border-radius: 3px; background: var(--background-subtle); }
-.filter-search:focus { border-color: #4c9aff; background: #fff; outline: none; }
-.filter-select { max-width: 220px; padding: 5px 6px; border: 1px solid var(--border); border-radius: 3px; background: var(--background-subtle); cursor: pointer; }
-.filter-select.active { background: var(--selected); border-color: #4c9aff; color: var(--link); }
-.chip { display: inline-flex; align-items: center; gap: 4px; padding: 2px 4px 2px 8px; border-radius: 3px; background: var(--selected); color: var(--link); }
-.chip-remove { border: none; background: transparent; color: inherit; cursor: pointer; font-size: 16px; line-height: 1; padding: 0 4px; }
-.table-scroll { overflow-x: auto; }
-.issue-table, .data-table { border-collapse: collapse; width: 100%; }
-.issue-table th, .data-table th { text-align: left; font-size: 12px; color: var(--text-subtle); font-weight: 600; border-bottom: 2px solid var(--border);
-  padding: 6px 8px; white-space: nowrap; }
-.issue-table td, .data-table td { border-bottom: 1px solid var(--border); padding: 6px 8px; vertical-align: middle; }
-.data-table td { vertical-align: top; }
-.issue-table tbody tr:hover, .data-table tbody tr:hover { background: var(--background-subtle); }
-.issue-table th button { border: none; background: none; padding: 0; cursor: pointer; font-weight: 600; color: inherit; }
-.issue-table th.sorted { color: var(--text); }
-.issue-table .col-type, .issue-table .col-priority { width: 28px; text-align: center; }
-.issue-table .col-key { white-space: nowrap; }
-.issue-table .col-summary { min-width: 260px; }
-.issue-table .col-created, .issue-table .col-updated, .issue-table .col-assignee, .issue-table .col-reporter { white-space: nowrap; }
-.summary-link { color: var(--text); }
-.parent-ref { color: var(--text-subtle); }
-.pager { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; padding: 12px 0; }
-.view-switch { display: inline-flex; gap: 4px; }
+1. Open the tool's folder in the Windows Explorer.
+2. Click the address bar at the top, type `cmd`, then press **Enter**. A black window opens, already in the right folder.
+3. Type the command, then press **Enter**.
 
-/* ---------------------------------------------------------------- board */
-.board-scroll { overflow-x: auto; padding-bottom: 8px; }
-.board { display: flex; gap: 8px; align-items: flex-start; }
-.board-column { flex: 0 0 270px; background: var(--background-subtle); border-radius: 4px; padding: 8px; }
-.board-column-title { display: flex; align-items: center; justify-content: space-between; margin: 2px 4px 10px; font-size: 14px; }
-.board-cards { display: flex; flex-direction: column; gap: 6px; }
-.card { display: block; background: #fff; border-radius: 3px; padding: 8px 10px; color: var(--text);
-  box-shadow: 0 1px 2px rgba(9, 30, 66, 0.25); }
-.card:hover { background: var(--background-subtle); text-decoration: none; }
-.card-summary { margin-bottom: 8px; overflow-wrap: anywhere; }
-.card-footer { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-subtle); }
-.card-key.done { text-decoration: line-through; }
-.board-more { display: block; padding: 6px; text-align: center; font-size: 12px; }
+`py` is the Python launcher installed with Python on Windows. If the `py` command is not found, use `python` instead (e.g. `python install.py`).
 
-/* ---------------------------------------------------------------- issue page */
-.breadcrumbs { color: var(--text-subtle); font-size: 13px; margin-bottom: 6px; }
-.breadcrumbs a { color: var(--text-subtle); }
-.issue-summary { display: flex; align-items: flex-start; gap: 10px; font-size: 24px; margin: 0 0 12px; overflow-wrap: anywhere; }
-.issue-summary .icon { margin-top: 8px; }
-.toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 20px; }
-.issue-nav { display: inline-flex; align-items: center; gap: 8px; }
-.details { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 2px 24px; margin: 0; }
-.detail { display: flex; gap: 8px; padding: 3px 0; min-width: 0; }
-.detail dt { flex: 0 0 140px; color: var(--text-subtle); overflow-wrap: anywhere; }
-.detail dd { margin: 0; flex: 1; min-width: 0; overflow-wrap: anywhere; }
-.detail-wide { grid-column: 1 / -1; }
+> **Why no `.bat` files?** Company policy blocks `.bat` files on the workstations. The tool is therefore started directly with Python. You can also double-click `install.py`, `check_connection.py` or `archive_project.py`: the window then stays open at the end so you can read the result.
 
-/* Values of plugin fields: small tables and outlines */
-.mini-table { border-collapse: collapse; }
-.mini-table th { text-align: left; font-size: 12px; color: var(--text-subtle); font-weight: 600; padding: 0 16px 2px 0; }
-.mini-table td { padding: 2px 16px 2px 0; border-top: 1px solid var(--border); }
-.mini-table .num { text-align: right; }
-.struct { margin: 0; }
-.struct > div { display: flex; gap: 6px; }
-.struct dt { color: var(--text-subtle); white-space: nowrap; }
-.struct dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
-.struct .struct, .struct .struct-list { margin-top: 2px; }
-.struct-list { margin: 0; padding-left: 18px; }
-.struct-list > li { margin-bottom: 4px; }
-.label.asset { background: var(--background-subtle); }
+**Step 1: get the files.** In a terminal opened in the folder where you want the tool, run:
 
-.attachments { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 10px; }
-.attachment { display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: 3px; overflow: hidden; color: var(--text); }
-a.attachment:hover { border-color: var(--link); text-decoration: none; }
-.attachment-preview { height: 110px; display: flex; align-items: center; justify-content: center; background: var(--background-subtle); }
-.attachment-preview img { max-width: 100%; max-height: 110px; object-fit: contain; }
-.file-ext { font-weight: 700; font-size: 18px; color: var(--text-subtle); }
-.attachment-meta { padding: 6px 8px; }
-.attachment-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.attachment.missing { opacity: 0.75; }
-.attachment-status { padding: 0 8px 6px; font-size: 12px; color: #bf2600; }
+```
+git clone <URL of this git repository>
+cd automatic-jira-archiving
+```
 
-.link-table { border-collapse: collapse; width: 100%; }
-.link-table th { text-align: left; font-weight: 400; color: var(--text-subtle); white-space: nowrap; padding: 4px 12px 4px 0; vertical-align: middle; width: 1%; }
-.link-table td { padding: 4px 8px 4px 0; border-bottom: 1px solid var(--border); vertical-align: middle; }
-.link-table .col-type, .link-table .col-priority, .link-table .col-number { width: 24px; }
-.link-table .col-key, .link-table .col-status { white-space: nowrap; width: 1%; }
-.web-links { margin: 0; padding-left: 20px; }
-.web-links li { margin-bottom: 6px; }
+**Step 2: install.**
 
-.time-tracking .tt-row { margin-bottom: 8px; }
-.tt-label { display: flex; justify-content: space-between; font-size: 13px; }
-.tt-track { display: flex; height: 6px; border-radius: 3px; background: var(--background-hover); overflow: hidden; margin-top: 2px; }
-.tt-bar { display: block; height: 100%; }
-.tt-estimate { background: #4c9aff; }
-.tt-spent { background: #36b37e; }
-.tt-remaining { background: #ffab00; }
+```
+py install.py
+```
 
-.tabs { display: flex; gap: 4px; border-bottom: 2px solid var(--border); margin-bottom: 12px; }
-.tab { border: none; background: none; padding: 6px 10px; margin-bottom: -2px; border-bottom: 2px solid transparent; cursor: pointer;
-  color: var(--text-subtle); display: inline-flex; gap: 6px; align-items: center; }
-.tab:hover { color: var(--text); }
-.tab.selected { color: var(--link); border-bottom-color: var(--link); }
-.action { border-bottom: 1px solid var(--border); padding: 10px 0; }
-.action-header { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; color: var(--text-subtle); }
-.action-header strong { color: var(--text); }
-.action-body { padding: 6px 0 0 30px; min-width: 0; }
-.restricted { padding: 0 6px; border-radius: 3px; background: #ffebe6; color: #bf2600; font-size: 12px; }
-.history-table { border-collapse: collapse; width: 100%; table-layout: fixed; }
-.history-table th { text-align: left; font-size: 12px; color: var(--text-subtle); font-weight: 600; padding: 2px 8px 2px 0; }
-.history-table th:first-child { width: 22%; }
-.history-table td { vertical-align: top; padding: 2px 8px 2px 0; }
-.history-field { font-weight: 600; overflow-wrap: anywhere; }
-.change-value { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 220px; overflow-y: auto; }
+It does three things:
 
-/* ---------------------------------------------------------------- rich text (HTML written by Jira) */
-.rich { overflow-wrap: anywhere; min-width: 0; }
-.rich a:not([href]) { color: inherit; }
-.rich.plain { white-space: pre-wrap; }
-.rich.inline { display: inline; }
-.rich.inline span[style*="background"] { padding: 0 4px; border-radius: 3px; }
-.rich > :first-child { margin-top: 0; }
-.rich > :last-child { margin-bottom: 0; }
-.rich p { margin: 0 0 10px; }
-.rich h1 { font-size: 22px; } .rich h2 { font-size: 19px; } .rich h3 { font-size: 17px; }
-.rich h4, .rich h5, .rich h6 { font-size: 15px; }
-.rich ul, .rich ol { padding-left: 24px; margin: 0 0 10px; }
-.rich blockquote { margin: 0 0 10px; padding-left: 12px; border-left: 2px solid var(--border-strong); color: var(--text-subtle); }
-.rich pre, .rich code, .rich tt { font-family: var(--mono); font-size: 12px; }
-.rich pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; }
-.rich .code, .rich .preformatted, .rich .panel { border: 1px solid var(--border); border-radius: 3px; margin: 0 0 10px; background: var(--background-subtle); }
-.rich .panel { background: transparent; }
-.rich .codeHeader, .rich .preformattedHeader, .rich .panelHeader { padding: 4px 10px; border-bottom: 1px solid var(--border); font-weight: 600; }
-.rich .codeContent, .rich .preformattedContent, .rich .panelContent { padding: 8px 10px; }
-.rich .code-keyword { color: #0052cc; } .rich .code-quote { color: #00875a; } .rich .code-comment { color: #6b778c; font-style: italic; }
-.rich .code-object { color: #6554c0; } .rich .code-tag { color: #de350b; }
-.rich .table-wrap { overflow-x: auto; margin: 0 0 10px; }
-.rich table { border-collapse: collapse; }
-.rich th, .rich td { border: 1px solid var(--border-strong); padding: 4px 8px; vertical-align: top; text-align: left; }
-.rich th { background: var(--background-subtle); font-weight: 600; }
-.rich hr { border: none; border-top: 1px solid var(--border); }
-.rich .aui-message, .rich .information-macro { padding: 8px 12px; border-radius: 3px; background: var(--selected); margin: 0 0 10px; }
-.rich .aui-message.warning, .rich .information-macro-warning { background: #fffae6; }
-.rich .aui-message.error, .rich .information-macro-note { background: #ffebe6; }
-.rich .aui-message.success, .rich .information-macro-tip { background: #e3fcef; }
-.rich .error { color: #bf2600; }
-.rich-image { max-width: 100%; height: auto; border: 1px solid var(--border); }
-.missing-image { display: inline-block; padding: 2px 6px; border: 1px dashed var(--border-strong); border-radius: 3px; color: var(--text-subtle); font-size: 12px; }
+- It creates a private Python environment in a `.venv` folder. Nothing is installed system-wide.
+- It installs the 2 libraries listed in `requirements.txt`: `requests` and `pip-system-certs`.
+- It creates your configuration file `.env` from `.env.example`.
 
-/* ---------------------------------------------------------------- small screens */
-@media (max-width: 1100px) {
-  .columns { flex-direction: column; }
-  .column-side { flex: 1 1 auto; width: 100%; }
-}
-@media (max-width: 800px) {
-  .layout { display: block; }
-  .sidebar { position: static; height: auto; flex-direction: row; flex-wrap: wrap; align-items: center; padding: 8px 16px; }
-  .sidebar-project { padding: 0 8px 0 0; }
-  .sidenav { flex-direction: row; flex-wrap: wrap; }
-  .sidebar-footer { display: none; }
-  .content { padding: 16px; }
-  .topnav, .readonly-badge { display: none; }
-  .quick-search { max-width: 45vw; }
-  .detail dt { flex-basis: 110px; }
-}
+When it finishes, you see `=== Installation finished ===`.
 
-/* ---------------------------------------------------------------- printing */
-/* Zephyr tests: test steps and executions */
-.zephyr-steps td, .zephyr-executions td { vertical-align: top; }
-.zephyr-steps .rich, .zephyr-details .rich { margin: 0; }
-.data-table .col-number { width: 24px; color: var(--text-subtle); }
-.zephyr-status { background: #dfe1e6; color: #42526e; }
-.zephyr-files { margin: 0; padding-left: 16px; }
-.zephyr-details { margin-top: 12px; }
-.zephyr-execution { border: 1px solid var(--border); border-radius: 3px; margin-bottom: 8px; padding: 6px 10px; }
-.zephyr-execution > summary { cursor: pointer; }
-.zephyr-execution[open] > summary { margin-bottom: 8px; }
-.zephyr-comment { margin-bottom: 8px; }
+You never need to "activate" the `.venv` folder: `check_connection.py` and `archive_project.py` find it and use it by themselves.
 
-/* R4J: requirements tree and baselines */
-.tree-list { list-style: none; margin: 0; padding-left: 22px; }
-.tree-root { padding-left: 0; }
-.tree-folder > summary { cursor: pointer; padding: 4px 6px; border-radius: 3px; display: flex; align-items: center; gap: 8px; }
-.tree-folder > summary::before { content: "\25B8"; color: var(--text-subtle); width: 10px; }
-.tree-folder[open] > summary::before { content: "\25BE"; }
-.tree-folder > summary::-webkit-details-marker { display: none; }
-.tree-folder > summary:hover, .tree-row:hover { background: var(--background-subtle); }
-.tree-folder-name { font-weight: 600; }
-.tree-description { margin: 0 0 4px 46px; }
-.tree-row { display: flex; align-items: center; gap: 8px; padding: 3px 6px; border-radius: 3px; min-width: 0; }
-.tree-row .issue-link { white-space: nowrap; }
-.tree-summary { flex: 1; min-width: 0; overflow-wrap: anywhere; }
-.tree-item > .tree-row { margin-left: 18px; }
-.tree-target { background: #fffae6; outline: 1px solid #ffc400; }
-.baseline-issue { border-bottom: 1px solid var(--border); }
-.baseline-issue > summary { cursor: pointer; padding: 2px 0; }
-.baseline-issue > summary .tree-row { display: inline-flex; width: calc(100% - 24px); vertical-align: middle; }
-.baseline-fields { padding: 6px 0 12px 24px; }
+### Installation without `.venv`
 
-/* Printing / "Save as PDF" (Print button of an issue, or Ctrl+P) */
-.print-only { display: none; }
-@media print {
-  @page { margin: 15mm; }
-  body { background: #fff; font-size: 12px; }
-  .topbar, .sidebar, .toolbar, .filters, .pager, .tabs, .issue-nav { display: none !important; }
-  .print-only { display: block; }
-  .zephyr-details > p.muted { display: none; }
-  .print-source { color: var(--text-subtle); font-size: 10px; border-bottom: 1px solid var(--border); padding-bottom: 4px; margin: 0 0 8px; }
-  .layout, .content, .main { display: block; padding: 0; margin: 0; max-width: none; }
-  .columns { display: block; }
-  .module-title { break-after: avoid; }
-  .action, .detail:not(.detail-wide), tr, .zephyr-execution > summary, .attachment, .tree-row { break-inside: avoid; }
-  .rich pre { white-space: pre-wrap; overflow-wrap: anywhere; }
-  .rich, .rich table { overflow: visible !important; }
-  .lozenge, .zephyr-status, .avatar, .type-icon { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
-  a { color: inherit; text-decoration: none; }
-  a.external::after { content: ""; }
-}
+If the installation says that *the Python of the .venv folder cannot start* (some company policies block programs in user folders), delete the `.venv` folder and run:
+
+```
+py install.py --no-venv
+```
+
+The libraries are then installed in your Windows user profile instead. Everything else works the same way.
+
+> **Note:** `pip-system-certs` lets Python trust the company's internal certificate, which is installed in Windows. Without it, the connection to Jira fails with a "certificate" error.
+
+---
+
+## 2. Configuration: URL and token
+
+Open the **`.env`** file with Notepad and fill in two lines:
+
+```
+JIRA_BASE_URL=https://jira.mycompany.local
+JIRA_PAT=your-personal-access-token
+```
+
+- **`JIRA_BASE_URL`**: the address of Jira, exactly as in your browser, without the trailing `/`.
+- **`JIRA_PAT`**: your *Personal Access Token*. This is a kind of password just for scripts. To create one in Jira:
+  1. Click your avatar (top right), then **Profile**.
+  2. Open **Personal Access Tokens** and click **Create token**.
+  3. Give it a name (e.g. `automatic-jira-archiving`) and an expiry date.
+  4. Copy the token right away: Jira shows it only once.
+
+**Which account?** Being *Jira Administrator* is **not** required. What matters are the account's permissions **on each project to archive** (given by the project's permission scheme, often through groups):
+
+| Permission on the project | Needed for | If missing |
+|---|---|---|
+| **Browse Projects** | Issues, comments, history, work logs, attachments | ❌ The project cannot be archived. |
+| **Administer Projects** | Roles and schemes of the project | ⚠️ Archived, but without roles and schemes. |
+| **Create Issues** | List of fields configured per issue type | ⚠️ Archived; fields with a value are all kept, but some *empty* fields may be missing. |
+
+The token always has exactly the same rights as the account that created it. Section 3 explains how to check all this.
+
+> ⚠️ The `.env` file contains your token. **Never send it, never put it on git.** It is already excluded by `.gitignore`. If the token leaks, revoke it in Jira on the same page.
+
+Other optional settings (output folder, timeout, etc.) are explained in `.env.example`.
+
+---
+
+## 3. Test the connection
+
+```
+py check_connection.py
+```
+
+The script checks, one by one:
+
+1. Python and the libraries.
+2. The configuration.
+3. That the server answers and the certificate is valid.
+4. That the token is accepted.
+5. The global rights of the account (*Jira Administrators*, *Jira System Administrators*). This is **for information only**: they are not required.
+
+Each line shows `[ OK ]`, `[INFO]`, `[WARN]` or `[FAIL]`, with a hint (`->`) explaining what to do when something goes wrong.
+
+### Check one project in detail
+
+```
+py check_connection.py ABC
+```
+
+Several keys can be given (`py check_connection.py ABC DEF`). For each project, the script:
+
+- shows how many issues it has;
+- checks the 3 permissions of section 2 (*Browse Projects*, *Administer Projects*, *Create Issues*);
+- **really tries** the reads done by the archive (roles, schemes, fields of each issue type). This is the surest proof, however the permissions are given;
+- warns if the project uses **issue security** (see the box below).
+
+It ends with one line: `OK` (can be archived), `WARNING` (can be archived, read the warnings), or `BLOCKED` (cannot be archived with this account).
+
+### Check a whole list of projects before archiving
+
+```
+py check_connection.py --file projects.txt
+```
+
+A quick check of every project in the list: access, permissions and number of issues. The result is shown in the window and saved in a report that opens in Excel: `output/project_check_<date>_<time>.csv`. Use it to find the blocked projects **before** starting the archives, and to see their sizes.
+
+It respects the same load limits as the archive (about 3 requests per project), so it takes time: count roughly **1 hour for 2,000 projects**. It cannot run at the same time as an archive run on the same installation.
+
+> **Issue security.** If a project uses an *issue security scheme*, Jira hides the issues of a security level the account is not part of. They are invisible, **even to Jira administrators**: Jira does not even count them, so the tool cannot know they exist, and they would not be archived. When the detailed check shows this warning, ask the project owners or the Jira team to add the account to every security level of the project before archiving.
+
+---
+
+## 4. Archive projects
+
+### One project
+
+```
+py archive_project.py ABC
+```
+
+Without a project key (or with a double-click on `archive_project.py`), the tool asks for it.
+
+### Several projects
+
+```
+py archive_project.py ABC DEF GHI
+```
+
+Or put the keys in a text file, one per line (see `projects.example.txt`):
+
+```
+py archive_project.py --file projects.txt
+```
+
+### Small projects first
+
+`--max-issues` skips any project with more issues than the number you give. This is useful to archive the many small projects first (`py check_connection.py --file projects.txt` gives the size of each project beforehand):
+
+```
+py archive_project.py --file projects.txt --max-issues 1000
+```
+
+### All options
+
+| Option | What it does |
+|---|---|
+| `--file FILE` | Read the project keys from a text file. |
+| `--max-issues N` | Skip projects with more than N issues. |
+| `--output FOLDER` | Put the archives in another folder (default: `output`). |
+| `--no-attachments` | Do not download attachment files. They stay listed in the JSON and in the viewer. |
+| `--keep-work` | Keep the temporary working folder after success (for debugging). |
+| `--verbose` | Show more details in the window. |
+| `--help` | Show the help. |
+
+### If it stops in the middle (network cut, PC restarted…)
+
+**Run the same command again.** Issues already exported are skipped, and the tool continues where it stopped. This matters for big projects, which can take hours.
+
+If some issues fail, the project is reported as `INCOMPLETE` and **no ZIP is created**. This way you can never get an archive with missing issues by mistake. Run the command again to retry them. The reasons are listed in `output/work/<KEY>/state/failures.json` and in the log file.
+
+### At the end
+
+The window shows a summary:
+
+```
+SUMMARY
+  ABC             OK  ABC_jira_archive_20261105.zip
+  DEF             SKIPPED (too many issues)
+  GHI             INCOMPLETE (2 issue(s) failed, run again)
+```
+
+### How long does it take?
+
+The tool is **deliberately slow** so it does not disturb Jira (see [section 6](#6-load-on-the-jira-server)). It needs about one request per issue, plus one per attachment. At most 2 requests per second gives roughly these durations:
+
+| Issues in the project | Approximate duration |
+|---|---|
+| 100 | 1 to 3 minutes |
+| 1,000 | 10 to 30 minutes |
+| 10,000 | 2 to 5 hours |
+| 70,000 | 15 to 30 hours |
+
+Durations grow when there are many attachments, many Zephyr test executions (see [Zephyr tests](#zephyr-tests)) or when Jira is busy. For big projects, run the tool overnight or over a weekend. If it stops, just restart it.
+
+---
+
+## 5. What you get
+
+In the `output` folder:
+
+```
+output/
+├── ABC_jira_archive_20261105.zip          <- the archive to keep
+├── ABC_jira_archive_20261105.zip.sha256   <- fingerprint of the ZIP file
+└── logs/archive_20261105_101500.log       <- detailed log of the run
+```
+
+Inside the ZIP:
+
+```
+ABC_jira_archive_20261105/
+├── OPEN_ARCHIVE.html      <- double-click it to browse the project (after extracting the ZIP)
+├── README.txt
+├── project.json
+├── manifest.json
+├── attachments/
+│   └── ABC-1/
+│       ├── 10200_screenshot.png ...
+│       └── zephyr/        <- files attached to Zephyr test steps and executions (Test issues only)
+└── viewer/                <- program and data used by OPEN_ARCHIVE.html (do not separate them)
+```
+
+### Opening an archive (for everyone)
+
+You can send these steps as they are to anyone who needs to consult an archive. **No Python and no installation are needed**, only a web browser (Edge, Chrome or Firefox).
+
+1. **Extract the ZIP file:** right-click it, choose **Extract All…**, then **Extract**.
+   Windows can show the inside of a ZIP file without extracting it, but the viewer does not work that way: it needs all the files of the archive.
+2. Open the extracted folder and **double-click `OPEN_ARCHIVE.html`**. The project opens in the web browser.
+
+What you can do:
+
+| Page | What it shows |
+|---|---|
+| **Summary** | Project description, lead, roles, number of issues by status, type, priority and assignee, archive information and warnings. |
+| **Issues** | All the issues in a table, like the Jira issue navigator. Filters (type, status, priority, resolution, assignee, reporter, component, versions, label, and sprint and epic when the project uses them), a text search (summary, description, comments, any field, file names), sorting by clicking a column title, pages of 50 issues. |
+| **Board** | The issues as cards, in one column per status, with the same filters. |
+| **An issue** | Everything about it, like in Jira: details and all fields, description with its formatting and images, attachments (click to open), links to other issues, sub-tasks, the issues of an epic, web links, comments, work log, full history, time tracking. The **Print / Save as PDF** button prints the issue or saves it as a PDF file. |
+| **A Zephyr test** | In addition: the **Test Details** (table of the test steps) and the **Test Executions** (version, test cycle, status, defects, who ran it and when). Click an execution to see the result and comment of each step. |
+| **Requirements** (R4J) | The requirements tree of the R4J plugin: folders, the issues placed in them, and child requirements. A text box filters the tree. Each issue also shows its **Requirement path** (click it to see the issue in the tree). |
+| **Baselines** (R4J) | The baselines of the R4J plugin. Open one to see the issues it contains and the values their fields had when the baseline was taken. |
+| **Components / Versions** | The lists, with the number of issues of each (click to see them). |
+
+Good to know:
+
+- **The search ignores upper/lower case and accents:** `evenement` also finds `évènement`.
+- The search box at the top accepts an issue key: `ABC-123` + Enter opens that issue directly.
+- The address of each page can be saved as a favorite in the browser (as long as the extracted folder stays in the same place).
+- **Nothing is sent anywhere and nothing can be changed:** the page works completely offline. Its security rules forbid it to connect to any server.
+- Links that pointed to pages of the old Jira server (user profiles, other projects…) are shown as plain text, because these pages will no longer exist. Links to issues of the same project open them in the viewer. Links to issues of **other** projects show the key, greyed out: open the archive of that project to see them.
+- If the page stays on "Loading the archive…", the ZIP file was not extracted (see step 1), or the `viewer` folder was separated from `OPEN_ARCHIVE.html`.
+
+### Printing an issue or saving it as a PDF
+
+The archive contains no PDF files: the viewer produces them on demand, only for the issues that need one (to send to someone, to attach to a file, to print).
+
+1. Open the issue in the viewer.
+2. Click **Print / Save as PDF** (or press Ctrl+P).
+3. As printer, choose **Save as PDF** (Edge, Chrome) or **Microsoft Print to PDF**, then **Save**.
+
+The printed version contains everything about the issue: details and all fields, description with its images, Zephyr test steps and executions (all expanded), links, attachments, and the whole activity (comments, work log and history together). A line at the top says where and when the issue was archived.
+
+### Zephyr tests
+
+With the **Zephyr Squad** plugin (formerly "Zephyr for Jira"), a test is a Jira issue of the type **Test**, but its test steps and executions are not stored in Jira fields: the plugin keeps them apart. The tool reads them through the plugin's own API, read-only, and adds them to the archive:
+
+- **Test steps:** number, step, test data, expected result, attached files.
+- **Test executions:** version, test cycle and folder, status (PASS, FAIL, WIP, BLOCKED…), who ran it and when, comment, linked defects, attached files, and the **result of every step** (status, comment, defects).
+
+Nothing to set up: the tool checks at the start of each project whether Zephyr is installed. If it is not, nothing changes (one single extra request).
+
+**Load on Jira:** each Test issue needs 2 more requests (steps, executions), and each execution that was actually run needs 2 more (step results, attached files), plus one per attached file. A test run 10 times therefore costs about 22 requests instead of 1. The protections of [section 6](#6-load-on-the-jira-server) apply to these requests too. Projects with many test executions take longer.
+
+If the account is not allowed to see the executions of a test, the issue is archived anyway, and an archive note says what is missing.
+
+### R4J requirements
+
+With the **R4J** plugin ("R4J - Requirements Management for Jira"), a requirement is a normal Jira issue: it is archived like any other issue. What the plugin adds is kept apart by the plugin. The tool reads it through the plugin's own API, read-only, and adds it to the archive:
+
+- **The requirements tree:** the folders of the project, the issues placed in each folder, in their order, and the child requirements of an issue.
+- **The baselines:** the frozen copies of the requirements taken at a given date, with the field values they had on that day.
+
+Nothing to set up: the tool checks at the start of each project whether R4J is installed and used by the project. If it is not, nothing changes (one single extra request), and the viewer shows no "Requirements" page.
+
+**Load on Jira:** 2 requests per project (tree, list of baselines), plus 1 request per baseline.
+
+The coverage and traceability views of R4J are not copied as such: they are computed by R4J from the **issue links**, and the links of every issue are in the archive (section "Issue Links" of each issue).
+
+### Fields of other plugins
+
+Every field of an issue is archived, whatever plugin created it. The viewer shows them in a readable way, for example:
+
+- **Time in Status** (Jira Software): a small table with each status, how many times the issue was in it and for how long.
+- **Sprint**, **Epic Link**, **Parent Link**: the sprint with its state, a link to the epic or parent issue. An epic lists its issues.
+- **Assets** (formerly Insight) object fields: the name and key of each object. The attributes of the objects are not archived.
+- Fields that contain HTML (for example fields computed by ScriptRunner): shown formatted, as in Jira.
+- Fields of plugins that give structured data (BigPicture and others): shown as a readable outline, never as raw code.
+- Web addresses and issue keys inside plain text become links.
+
+### The JSON file
+
+`project.json` is the reference copy of all the data, and remains readable without the viewer. It is fully described in [docs/ARCHIVE_FORMAT.md](docs/ARCHIVE_FORMAT.md).
+
+### Checking an archive later
+
+`manifest.json` lists every file with its SHA-256 fingerprint. A fingerprint is like a unique signature of the file content: if a single byte changes, the fingerprint changes completely. To check a file in PowerShell:
+
+```powershell
+Get-FileHash .\project.json -Algorithm SHA256
+```
+
+The value must be the same as in `manifest.json` (upper or lower case does not matter). The fingerprint of the whole ZIP is in the `.sha256` file next to it:
+
+```powershell
+Get-FileHash .\ABC_jira_archive_20261105.zip -Algorithm SHA256
+```
+
+---
+
+## 6. Load on the Jira server
+
+Archiving must never slow down or endanger Jira for its users. The tool is therefore **gentle by design**. These protections are always on:
+
+| Protection | What it means |
+|---|---|
+| **One request at a time** | The tool never sends two requests to Jira at the same time. |
+| **At most 2 requests per second** | There is always at least 0.5 s between two requests (`JIRA_REQUEST_DELAY`). It cannot be set below 0.2 s, even by mistake. |
+| **Slows down when Jira is slow** | If Jira took 3 s to answer, the tool waits at least 3 s before the next request (up to 30 s). When Jira is busy, the tool automatically gives it room. In practice, the tool uses less than half of the time of a single Jira worker. |
+| **Backs off when Jira says so** | If Jira answers "too many requests" (HTTP 429) or "unavailable" (HTTP 503), the tool waits the time Jira asks for, retries, and doubles its pause (up to 5 s between requests). After 200 normal answers in a row, it speeds up again step by step. |
+| **Small requests** | Issues are fetched 25 at a time (`JIRA_PAGE_SIZE`), so each request stays light for the server. |
+| **One run at a time** | If someone starts a second archive run from the same installation while one is running, it is refused. |
+
+At the end of each project, the log shows the load created, for example: `Load on Jira so far: 1250 API request(s), 180 s spent waiting for Jira`.
+
+**Recommendations:**
+
+- **Do not run the tool on several computers at the same time.** The protections work per run. Two runs on two PCs mean twice the load.
+- Run big projects outside working hours (evening, night, weekend).
+- To be even gentler, raise the pause in `.env`, e.g. `JIRA_REQUEST_DELAY=1` (1 request per second at most).
+- The Jira administrators can also set a *rate limit* on the account used (Jira administration > System > Rate limiting). The tool respects it automatically.
+
+---
+
+## 7. Updating the tool
+
+```
+git pull
+py install.py
+```
+
+Running `install.py` again installs any new library. It keeps your `.env` file. (If you installed with `--no-venv`, add it again: `py install.py --no-venv`.)
+
+---
+
+## 8. Troubleshooting
+
+| Message | What it means / what to do |
+|---|---|
+| `'py' is not recognized...` | Use `python` instead of `py`. If neither works, install Python 3.12 (tick *Add python.exe to PATH*). |
+| `This program is blocked by group policy` / `.venv Python cannot start` | See [Installation without .venv](#installation-without-venv). |
+| `ERROR: a required library is missing` | The installation was not done or failed. Run `py install.py` again. |
+| `pip install` fails on a library | The internal package mirror may not have it. Note the name and version, and ask for it to be made available. The accepted versions are in `requirements.txt`. |
+| `CONFIGURATION ERROR: JIRA_BASE_URL is not set` | The `.env` file is missing or empty. Run `py install.py`, then fill in `.env`. |
+| `TLS/SSL certificate error` | Python does not trust the company certificate. Check that `pip-system-certs` is installed (`py check_connection.py` shows it). Otherwise, ask for the certificate file (`.pem`) and set `JIRA_CA_BUNDLE` in `.env`. |
+| `Network error` / `Cannot reach the Jira server` | Check the URL in `.env`, and that you are on the company network or VPN. |
+| `HTTP 401 ... authentication failed` | The token is wrong, expired or revoked. Create a new one (section 2). |
+| `HTTP 403 ... access denied` | The account lacks a permission on this project. Run `py check_connection.py <KEY>` to see which one (section 3). |
+| `Global rights: 'Jira Administrators' = no` | Not a problem: this global right is not required. Only the permissions on each project matter (section 2). |
+| `HTTP 404 ... not found` on a project | Wrong project key, or the account cannot see the project. |
+| `Jira answered HTTP 429 ... slowing down` | Jira asked the tool to slow down. Nothing to do: it adapts by itself. If it happens often, set `JIRA_REQUEST_DELAY=1` in `.env`. |
+| `Another archive run is already in progress` | An archive run is already working from this folder. Wait for it to finish (one run at a time protects Jira). |
+| A project is `INCOMPLETE` | Run the same command again. See `output/work/<KEY>/state/failures.json` and the log. |
+| `OPEN_ARCHIVE.html` stays on "Loading the archive…" | The ZIP file was opened without being extracted. Right-click the ZIP file, **Extract All…**, then open `OPEN_ARCHIVE.html` in the extracted folder. |
+| `Attachment ... could not be downloaded: HTTP 404` | The file no longer exists on the Jira server (already lost in Jira). It is recorded in the archive notes of the issue and in `manifest.json`. |
+
+The log file in `output/logs/` always holds the full details. **It never contains the token.**
+
+---
+
+## 9. Security
+
+- **Token stored locally only.** The token is read from `.env`, which is excluded from git. It is never written in logs (a filter hides it, just in case) and never shown on screen.
+- **Encrypted connection only.** HTTPS is mandatory, and certificates are always verified. There is no "ignore certificate" option.
+- **The token never leaves Jira.** It is only ever sent to the Jira server set in `JIRA_BASE_URL`. Any link to another server is refused. Images from outside sites, inside descriptions, are never downloaded.
+- **Read-only.** The tool only reads Jira. Its only `POST` request is the issue search, which changes nothing.
+- **Validated input.** Project keys are checked before use. File names coming from Jira are cleaned, which prevents writing outside the archive folder and avoids names Windows refuses.
+- **Safe archive viewer.** Texts written in Jira are shown as plain text. Formatted texts (descriptions, comments) are cleaned by an allow-list before being shown: scripts, forms, event handlers and images from other sites are removed. On top of that, the security policy of `OPEN_ARCHIVE.html` (Content-Security-Policy) only allows the viewer's own files and blocks any network connection.
+- **Archives are not encrypted.** They contain all the data of the projects, possibly confidential. Store them in a place with appropriate access rights.
+
+---
+
+## 10. Known limitations
+
+- **Screens:** Jira Data Center has no official API that says which screen is used by which project and issue type. For each issue type, the archive therefore records the **fields configured for it**: name, required or not, allowed values, default value. They come from the official *create issue* API (`issue_types[].create_screen_fields` in the JSON). The names and tabs of the screens themselves are not included.
+- **Issue security and restricted comments:** issues at a security level the account is not part of, and comments or work logs restricted to a group or role the account is not in, are invisible to it, even for a Jira administrator. They cannot be archived. See section 3.
+- **Workflows:** the statuses of each issue type are archived, but not the workflow diagrams (transitions).
+- **Viewer:** the board shows one column per status. The Jira Software boards (their columns, swimlanes and sprints), dashboards and saved filters are not archived. The sprint of each issue is still shown in its "Sprint" field.
+- **Plugins:** data stored by add-ons outside standard Jira fields is not exported, for example some time-tracking add-ons. Their custom fields, however, are exported like any other field. **Exceptions:** the test steps and executions of **Zephyr Squad** (see [Zephyr tests](#zephyr-tests)) and the requirements tree and baselines of **R4J** (see [R4J requirements](#r4j-requirements)) are archived.
+- **BigPicture:** the fields it puts on the issues (dates, etc.) and the links between issues are archived. The Gantt charts, programs and boards of BigPicture are not: they usually cover several projects and live outside the project.
+- **Assets:** an issue keeps the name and key of the Assets objects it points to. The objects themselves (their attributes, their history) stay in Assets.
+- **Refined, eazyBI:** nothing to archive per project. Refined is the look of the portals, and eazyBI reports are computed from the issues.
+- **R4J:** the tree and baselines are read with the R4J API version 1.0. Coverage and traceability views, reuse rules and the R4J configuration are not archived.
+- **Zephyr:** only **Zephyr Squad** is supported. **Zephyr Scale** (formerly TM4J, test keys like `ABC-T12`) stores its tests outside Jira issues: they are not archived. For Zephyr Squad, the test cycles appear through the executions of each test (cycle, folder, version); a cycle that contains no test of the project is not archived. Files attached to a single step *result* are not downloaded (files attached to steps and to executions are).
+
+---
+
+## 11. For maintainers
+
+### Code layout
+
+```
+install.py                Installation: .venv + libraries + .env (standard library only)
+archive_project.py        Command-line entry point: archive projects
+check_connection.py       Command-line entry point: connection and per-project permission checks
+jira_archiver/
+├── bootstrap.py          Re-starts the scripts with the .venv Python; keeps double-clicked windows open
+├── config.py             Settings from environment variables / .env
+├── jira_client.py        Read-only REST client (auth, retries, throttling, host check, downloads)
+├── exporter.py           Fetches project metadata and issues, resumable working folder
+├── formatting.py         Readable text for the "Development" field (used by the viewer search)
+├── zephyr.py             Zephyr Squad test steps and executions (plugin API /rest/zapi/latest)
+├── r4j.py                R4J requirements tree and baselines (plugin API /rest/com.easesolutions.jira.plugins.requirements/1.0)
+├── packager.py           Writes project.json, manifest.json, README.txt and the ZIP
+├── viewer.py             Writes the offline viewer and its data files into the archive
+├── viewer_assets/        The viewer itself: OPEN_ARCHIVE.html, app.js (plain JavaScript, no library), app.css
+├── logging_setup.py      Console + file logs, token redaction
+└── utils.py              File names, hashing, atomic writes
+docs/ARCHIVE_FORMAT.md    Description of the archive and of the JSON structure
+```
+
+### How a project is processed
+
+1. `exporter.py` reads the project configuration (with the R4J tree and baselines when the plugin is there), then the list of all issues. Both are cached in `output/work/<KEY>/state/`.
+2. Issues are fetched in batches of `JIRA_PAGE_SIZE`, through `POST /rest/api/2/search` with `expand=renderedFields,changelog`. Missing comments and work logs are completed with dedicated calls.
+3. For each issue: attachments (and Zephyr test data) are downloaded, then the issue JSON is written **last** to `state/issues/<KEY>.json`. If that file exists, the issue is done, and this is what makes resuming possible.
+4. `packager.py` streams all issue files into `project.json`, so even 70,000+ issues do not fill the memory. `viewer.py` then writes the viewer and its data (one file per issue, also streamed). Finally the manifest is written, the ZIP is built and verified, and its fingerprint is written.
+
+### The viewer
+
+- `viewer_assets/` is copied as is into every archive. **No build step**: edit `app.js` / `app.css` and the next archives use the new version. Keep it plain JavaScript without external libraries, so an archive opened in 10 years still works.
+- The data is written as `.js` files (`jaLoad("issue", {...});`) and not `.json`, because a page opened from the disk (`file://`) may load scripts but may not read JSON files. The format of these files is described in `docs/ARCHIVE_FORMAT.md`.
+- To test a change of the viewer without Jira: copy `app.js` / `app.css` into the `viewer/` folder of an extracted archive and reload the page (F5).
+- Field values are displayed by `fieldNode()` in `app.js`: it chooses the display from the type of the field (`schema.custom` in the field catalog) and from the shape of the value. To support a new plugin field, add a case there. Unknown shapes fall back to a readable outline (`structNode()`).
+- Security rules to keep: never insert data from Jira with `innerHTML`; use the `h()` helper (text only) or `sanitizeHtml()` for Jira's rendered HTML. Keep the Content-Security-Policy of `OPEN_ARCHIVE.html` strict.
+
+### Jira REST endpoints used (all read-only)
+
+`/serverInfo`, `/myself`, `/mypermissions`, `/field`, `/project/{key}` (+ `/components`, `/versions`, `/statuses`, `/role`, `/permissionscheme`, `/notificationscheme`, `/issuesecuritylevelscheme`), `/issue/createmeta/{key}/issuetypes/{id}`, `POST /search`, `/issue/{id}/comment`, `/issue/{id}/worklog`, `/issue/{id}/remotelink`, `/secure/attachment/{id}/{name}`.
+
+Zephyr Squad (only when installed, see `zephyr.py`): `/rest/zapi/latest/util/zephyrTestIssueType`, `/util/testExecutionStatus`, `/util/teststepExecutionStatus`, `/teststep/{issueId}`, `/execution?issueId=`, `/stepResult?executionId=`, `/attachment/attachmentsByEntity`, `/attachment/{fileId}/file`.
+
+R4J (only when installed, see `r4j.py`): `/rest/com.easesolutions.jira.plugins.requirements/1.0/tree/{key}`, `/baselines/project/{key}`, `/baseline/{id}`.
+
+### Quality checks
+
+```
+.venv\Scripts\python.exe -m pip install ruff
+.venv\Scripts\python.exe -m ruff check .
+```
+
+Any change to the JSON structure must update `ARCHIVE_FORMAT_VERSION` in `jira_archiver/__init__.py` and `docs/ARCHIVE_FORMAT.md`.
+
+Do not add `.bat`, `.cmd` or `.ps1` files: scripts of this kind are blocked on the workstations. Every entry point is a Python script started with `py`. Entry points must call `use_project_venv()` (see `jira_archiver/bootstrap.py`) before importing any third-party library.
