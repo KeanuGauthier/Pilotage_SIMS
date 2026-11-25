@@ -1,323 +1,505 @@
-# Jira & Confluence non-regression tests
-
-Automated UI tests for our Jira and Confluence Data Center plugins and macros.
-The tests drive Microsoft Edge with Playwright, exactly like a user would, and
-the results are sent to Zephyr Squad (one execution per test, one result per step,
-with screenshots and logs attached when something fails).
-
-The goal is simple: **when a test passes, the plugin works**. When it fails, the
-message should tell you why without having to replay the test by hand.
-
-## Contents of the project
-
-| File | What it is |
-|---|---|
-| `master.py` | Runs the tests and reports to Zephyr. Also provides `RegressionTest`, used by every test. |
-| `actions.py` | The actions used inside the tests (`test.ui.click(...)`, `test.ui.expect_visible(...)`...). |
-| `boilerPlate.py` | Template to copy when you write a new test. |
-| `selftest_actions.py` | Checks that `actions.py` behaves correctly, on local test pages. |
-| `.env.example` | Configuration template. |
-
-The tests themselves are the `ZTEST-*.py` files, usually in a `Confluence` and a
-`Jira` folder.
-
-## Installation
-
-You need Python 3.9 or newer and Microsoft Edge.
-
-```
-pip install playwright requests python-dotenv
-```
-
-Playwright 1.42 or newer is required. Since the tests use the Edge installed on
-the machine, there is no need to run `playwright install`.
-
-Then:
-
-1. Copy `.env.example` to `.env` and fill in at least `JIRA_BASE_URL`,
-   `JIRA_TOKEN` (a Jira personal access token), `ZEPHYR_PROJECT_ID` and
-   `TEST_DIRECTORIES`.
-2. Run `python selftest_actions.py`. It should end with `0 problem(s)`. If it
-   does not, the problem comes from the machine or the Playwright version, not
-   from your tests.
-
-## Running the tests
-
-```
-python master.py                  run every test
-python master.py --test ZTEST-12  run one test (file name or part of it)
-python master.py --list           list the tests found
-python master.py --headless       hide the browser (--headed to show it)
-python master.py --verbose        more logs
-```
-
-`master.py` creates a Zephyr cycle, then runs the tests one after the other and
-prints a summary. A single test can also be started directly with
-`python Confluence/ZTEST-12_chart.py`. In that case it uses the cycle saved in
-`cycle_id.txt`, or creates a new one.
-
-## Writing a test
-
-Copy `boilerPlate.py`, rename it `ZTEST-<number>_<short name>.py` and fill in the
-configuration at the top. Each `test.step(n, "...")` block matches step `n` of the
-Zephyr test, so keep the same numbering.
-
-```python
-with test:
-    ui = test.ui
-
-    with test.step(1, "Authenticate and open the page"):
-        ui.login_sso(PAGE_URL, expect="#main-content")
-
-    with test.step(2, "The chart macro is displayed"):
-        ui.expect_rendered(".chart-macro")
-        ui.expect_no_errors()
-
-    with test.step(3, "Change the period"):
-        ui.click(by_role("button", re.compile("^(Edit|Modifier)$")), expect="#chart-settings")
-        ui.select_option("#period", value="30d")
-        ui.click("#chart-settings .save", retries=0, expect_hidden="#chart-settings")
-        ui.expect_text(".chart-macro .period", "30")
-```
-
-If a step fails, the error is recorded and the next steps still run.
-
-### Authentication
-
-When the browser opens a Jira or Confluence URL without a session, it first
-lands on the SSO page where you choose the instance, and a click on "Next" sends
-it back to the requested page.
-
-`ui.login_sso(PAGE_URL)` handles that: it opens the page, clicks through the SSO
-page, and checks that you end up on the requested page with an authenticated
-session. Use it in the first step of every test. Add `user="jdoe"` to also check
-the user name, and `expect=` to check an element of the page.
-
-`ui.goto()` goes through the SSO page the same way if it shows up again later
-(expired session).
-
-How it works, in case it needs adjusting:
-
-- The SSO page is recognised because it is on another site than the requested
-  URL. If that is not the case, set `SSO_PAGE_URL_PATTERN` in `.env` (a regex
-  matching its URL).
-- The button clicked is the one named "Suivant", "Next", "Continuer", "Continue",
-  "Valider", "OK" or "Se connecter" / "Sign in". If yours has another name, set
-  `SSO_CONTINUE_SELECTOR` in `.env`, for example `#next-button` or `text=Go`.
-- The session check reads the `ajs-remote-user` meta tag that Jira and Confluence
-  put in their pages, so it works in French and in English.
-
-## Targeting elements
-
-Every action takes a `target`: the element to act on. The simplest form is a
-selector string:
-
-```python
-ui.click("#save-button")                     # id
-ui.click(".aui-button.save")                 # classes
-ui.click("div[data-macro-name='chart']")     # any attribute
-ui.click("xpath=//table//tr[2]/td[3]")       # XPath
-```
-
-For the harder cases, use the helpers or a `Target`:
-
-```python
-by_id("weird.id:with-dots")                 # ids that "#..." cannot handle
-by_attr("id", "chart-", match="starts")      # generated ids like chart-8f3a2c
-by_class("aui-button", "save")
-by_role("button", "Save")                    # buttons, links, tabs, checkboxes...
-by_text("Report generated", exact=True)
-by_label("Title")                            # form fields
-by_test_id("save-btn")                       # data-testid
-
-Target(".cell", within="#results", has_text="Done")   # inside a container, with a text
-Target(".row", nth=2)                                  # third visible match (-1 = last)
-Target("button", description="Save button")            # nicer name in the reports
-```
-
-**Iframes.** Many macros and dialogs live in iframes. Give the iframe with
-`frame=`:
-
-```python
-Target("canvas.chart", frame="iframe[src*='my-plugin']")
-Target("#field", frame=["#outer-frame", "iframe.inner"])   # nested iframes, outermost first
-Target("#widget", frame=ANY_FRAME)                         # search the page and every iframe
-ui.fill("#tinymce", "Hello", frame=CONFLUENCE_EDITOR_FRAME)  # Confluence editor
-```
-
-If you forget the iframe, the error tells you where the element actually is, for
-example `found 1 match(es) (1 visible) in an iframe: use frame='#macro-frame-1'`.
-
-**Alternatives.** When an element differs between versions, give a list. The
-first one that exists is used:
-
-```python
-ui.click(["#new-save-id", "#old-save-id"])
-```
-
-**French and English.** The instance can be in either language, so prefer ids,
-classes and attributes over texts. When a text is the only way, accept both:
-
-```python
-by_role("button", re.compile("^(Save|Enregistrer)$"))
-["text=Save", "text=Enregistrer"]
-```
-
-Only visible elements are taken into account by the actions. If the target
-matches several visible elements, the action refuses to guess and fails: make it
-more precise with `within=`, `has_text=` or `nth=`.
-
-## Available actions
-
-All of them are methods of `test.ui`. Timeouts are in milliseconds and most
-methods accept `timeout_ms=`.
-
-**Navigation**
-
-| Method | What it does |
-|---|---|
-| `login_sso(url, user=None, expect=None)` | Opens a page, goes through the SSO page and checks the session is authenticated. |
-| `goto(url, expect=None)` | Opens a page (going through the SSO page if needed). Fails on HTTP errors or if you end up on a login page. |
-| `reload()` | Reloads the current page. |
-| `expect_logged_in(user=None)` | Checks the current page belongs to an authenticated user. |
-| `expect_url(text_or_regex)`, `expect_title(...)` | Checks the URL or the page title. |
-| `click_new_tab(target)` | Clicks a link that opens a tab and returns the new page (`test.use_page(page)` to switch to it). |
-
-**Checks**
-
-| Method | What it does |
-|---|---|
-| `expect_visible(target)` | The element is visible on screen: not hidden, not transparent, not covered by something else, not cut off. |
-| `expect_all_visible([targets])` | Same for several elements, all problems are reported at once. |
-| `expect_hidden(target)` / `expect_absent(target)` | The element is not visible / not in the page at all. |
-| `expect_text(target, text, exact=False)` | The displayed text contains (or equals) `text`. Accepts a regex. |
-| `expect_no_text(text)` | A text is not displayed anywhere. |
-| `expect_rendered(target)` | The macro is visible, done loading, has content and shows no error. |
-| `expect_no_errors(within=None)` | No error message is displayed ("Error rendering macro", "Macro inconnue", Java exceptions, AUI error messages...). |
-| `expect_count(target, n)` | Number of visible matches. Use `minimum=` / `maximum=` for a range. |
-| `expect_table(target, headers=, min_rows=, contains_rows=)` | Checks the content of a table. `read_table(target)` returns it. |
-| `expect_image_loaded(target)` | An image is loaded, a canvas is not blank, an svg draws something. |
-| `expect_value`, `expect_attribute`, `expect_class` | Value of a field, attribute, CSS class. |
-| `expect_enabled`, `expect_disabled`, `expect_checked`, `expect_editable` | State of a field or a button. |
-| `expect_no_server_errors()` | No HTTP 5xx answer during the step (done automatically, see `FAIL_STEP_ON_HTTP_5XX`). |
-| `expect_no_js_errors()` | No JavaScript exception during the step. |
-
-**Actions**
-
-| Method | What it does |
-|---|---|
-| `click(target, expect=None, expect_hidden=None, expect_url=None)` | Clicks, then checks the expected result if you give one. |
-| `fill(target, text)` | Types into a field or an editable area and checks the value was kept. |
-| `type_text(target, text)` | Types key by key, for autocompletes and editor shortcuts. |
-| `press(key, target=None)` | Presses a key or a shortcut. |
-| `select_option(target, value= / label= / index=)` | Chooses in a native `<select>`. |
-| `choose_option(trigger, option, search=None)` | Chooses in a custom dropdown or an autocomplete (AUI, Select2, user picker). |
-| `check(target)` / `uncheck(target)` | Ticks or unticks a checkbox. |
-| `hover(target, expect=None)` | Hovers an element (tooltips, menus). |
-| `drag_and_drop(source, destination, expect=None)` | Drags an element onto another. |
-| `upload_file(target, path)` | Uploads a file. |
-| `click_and_download(target, expected_extension=".pdf")` | Clicks, downloads and checks the file is a real one. Returns its path. |
-| `click_and_handle_dialog(target, expected_message=None)` | Clicks and accepts the browser `confirm()` / `alert()` that opens. |
-| `scroll_to(target)` | Scrolls to an element. |
-
-**Utilities**
-
-| Method | What it does |
-|---|---|
-| `get_text`, `get_value`, `get_attribute`, `count` | Read something from the page. |
-| `is_visible(target, timeout_ms=0)` | Returns True/False without failing. For optional things only. |
-| `dismiss_if_present(popup, close=None)` | Closes a popup if it shows up ("What's new", onboarding...). |
-| `auto_dismiss(popup, close=None)` | Closes a popup automatically whenever it shows up during the test. |
-| `wait_for_ready()` / `wait_for_dom_stable(target)` | Waits until the page or an element stops loading / changing. |
-| `wait_until(function)` | Waits until your own condition is true. |
-| `screenshot(name, target=None)` | Saves a screenshot as evidence. |
-
-## Writing reliable tests
-
-- **End every step with a check.** A click that did not fail proves nothing. Check
-  what the user should see afterwards.
-- **Give clicks an expected result** (`expect=`, `expect_hidden=` or
-  `expect_url=`). It proves the click worked, and a click that had no effect
-  (page not fully loaded yet) is repeated once. Use `retries=0` on buttons that
-  must not be clicked twice: Save, Submit, toggles.
-- **Never wait a fixed time** (`time.sleep`, `wait_for_timeout`). All the actions
-  already wait for the page. If you need more, use `wait_for_ready()`,
-  `wait_for_dom_stable()` or an `expect_...`.
-- **For a macro, use `expect_rendered()` and `expect_no_errors()`.** A visible
-  macro container does not mean the macro worked.
-- **Avoid `force=True`.** It clicks even when the element is covered, which a user
-  could not do.
-- **Use `test.ui` rather than raw `page.*` calls.** Raw Playwright calls do not
-  have the checks described here.
-
-Checks that something is absent (`expect_hidden`, `expect_absent`,
-`expect_no_errors`, `expect_count`) first wait until the page has finished
-loading: an error that appears one second after a spinner would be missed
-otherwise.
-
-## When a step fails
-
-- The Zephyr step is set to FAIL. The comment starts with the cause, followed by
-  the URL and the browser errors (console, failed requests, HTTP errors).
-- A full-page screenshot and the error report are attached to the step. The
-  Playwright trace is attached to the first failed step.
-- Everything is also saved locally in `artifacts/<run date>/<issue key>/`.
-
-The trace replays the whole test, action by action, with the page at each moment:
-
-```
-python -m playwright show-trace artifacts/<run>/<issue>/traces/<issue>_trace.zip
-```
-
-A passing step can still have warnings, for example when a click had to be
-repeated. Zephyr then shows `SUCCESS (with 1 warning(s), check for flakiness)`.
-These are worth a look: they usually point to a page that is slow or a test that
-could be made more precise.
-
-## Configuration
-
-The main settings of `.env` (see `.env.example` for all of them):
-
-| Setting | Default | Meaning |
-|---|---|---|
-| `BROWSER_CHANNEL` | `msedge` | Browser used. |
-| `HEADLESS` | `false` | Hide the browser. |
-| `DEFAULT_TIMEOUT_MS` | `15000` | Default time an action waits for an element. |
-| `NAVIGATION_TIMEOUT_MS` | `30000` | Time allowed to load a page. |
-| `UI_READY_TIMEOUT_MS` | `8000` | Max time spent waiting for the page to finish loading before an action. Only a warning if exceeded. |
-| `UI_SETTLE_MS` | `300` | An element found visible must still be visible after this delay. |
-| `UI_CLICK_RETRY_AFTER_MS` | `3000` | When a click has no effect after this delay, it is repeated once. |
-| `UI_STRICT_VISIBILITY` | `true` | Set to `false` to fall back to the plain Playwright definition of "visible". |
-| `FAIL_STEP_ON_HTTP_5XX` | `true` | A step fails if the server answered with a 5xx error, even if the page looks fine. |
-| `FAIL_STEP_ON_JS_ERRORS` | `false` | A step fails on JavaScript exceptions (often noisy in Jira). |
-| `IGNORED_HTTP_ERROR_PATTERN` | empty | Regex of URLs whose errors are tolerated. |
-| `IGNORED_JS_ERROR_PATTERN` | empty | Regex of JavaScript errors that are tolerated. |
-| `TRACE_MODE` | `retain-on-failure` | `on`, `off` or `retain-on-failure`. |
-| `ARTIFACTS_DIR` | `artifacts` | Where screenshots, reports and traces are saved. |
-| `SSO_CONTINUE_SELECTOR` | empty | Button to click on the SSO page, if the default one is not found. |
-| `SSO_PAGE_URL_PATTERN` | empty | Regex of the SSO page URL, if it is on the same site as Jira/Confluence. |
-
-## Self-test
-
-`selftest_actions.py` starts a small local web server with pages built to trap
-a test: a button that is transparent or hidden under an overlay, content inside
-a 0px-high iframe, an error that shows up after a spinner, an HTTP 500 behind a
-page that looks fine, an HTML error page downloaded as `.pdf`, an SSO page with a
-"Suivant" button, and so on. For each case it checks that the actions pass or fail as they should.
-
-Run it after changing `actions.py`, after upgrading Playwright or Edge, or on a
-new machine. It needs neither Jira nor Zephyr.
-
-## Common messages
-
-| Message | What to do |
-|---|---|
-| `matches several visible elements` | The target is ambiguous. Add `within=`, `has_text=` or `nth=`. |
-| `... in an iframe: use frame=...` | The element is in an iframe. Add the suggested `frame=`. |
-| `is covered by div.aui-blanket` (or another element) | Something is on top of the element: an open dialog, a popup, a banner. Close it, or use `dismiss_if_present` / `auto_dismiss` if it is not part of the test. |
-| `is transparent` / `is not painted at its position` / `is outside the visible area` | The element exists but a user cannot see it. Usually a real bug, or a section that must be expanded first. |
-| `the browser is on a login page` | The session is not authenticated. Check the SSO step. |
-| `... is not a Jira/Confluence page. If it is the SSO page, set SSO_CONTINUE_SELECTOR` | The SSO button was not recognised. Set `SSO_CONTINUE_SELECTOR` in `.env`. |
-| `Page still busy after ... ms` (warning) | A spinner or a request never finished. If it is a normal background request, add it to `DEFAULT_IGNORED_PENDING_URLS` in `actions.py`. |
-| `Server error response(s) received` | The server answered with a 5xx error during the step. If it is unrelated to the plugin, add the URL to `IGNORED_HTTP_ERROR_PATTERN`. |
-| `Typed ... but it contains ...` | The field did not keep the value. If the application reformats it on purpose, use `fill(..., expected_value=...)`. |
+"""Checks actions.py against local test pages (no Jira or Zephyr needed).
+
+Every case must either pass or fail as stated. Run it after changing actions.py
+or upgrading Playwright:
+
+    python selftest_actions.py [--headed]
+"""
+
+import argparse
+import base64
+import os
+import sys
+import tempfile
+import threading
+import time
+import traceback
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any, Callable, List, Optional, Tuple
+from urllib.parse import parse_qs, quote, urlparse
+
+from dotenv import load_dotenv
+from playwright.sync_api import expect, sync_playwright
+
+from actions import ANY_FRAME, Actions, Target, UiCheckError, by_role
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+load_dotenv(PROJECT_ROOT / ".env")
+
+ORIGIN = ""  # set by start_server()
+SPINNER = '<div class="aui-spinner" id="sp" style="width:16px;height:16px;background:#ccc"></div>'
+PNG_1PX = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+)
+
+PAGES = {
+    "/delayed": """<script>setTimeout(() => { const b = document.createElement('button');
+        b.id = 'late'; b.textContent = 'Late'; document.body.appendChild(b); }, 1200)</script>""",
+    "/opacity": """<button id="ok">OK</button><button id="ghost" style="opacity:0">Ghost</button>
+        <div style="opacity:0"><span id="ghost2">In a transparent parent</span></div>""",
+    "/covered": """<button id="target">Target</button>
+        <div id="overlay" style="position:fixed;inset:0;background:rgba(0,0,0,.3)"></div>""",
+    "/frames": """<h1>Main</h1>
+        <iframe id="outer" src="/frame-outer" style="width:600px;height:300px"></iframe>""",
+    "/frame-outer": """<p>outer</p>
+        <iframe class="inner" src="/frame-inner" style="width:500px;height:200px"></iframe>""",
+    "/frame-inner": """<button id="deep" onclick="this.textContent='Clicked'">Deep</button>""",
+    "/zero-frame": """<iframe id="z" src="/frame-inner" style="height:0;border:0"></iframe>""",
+    "/hidden-dup": """<div style="display:none"><button class="save">Save</button></div>
+        <button class="save" onclick="document.getElementById('res').textContent='saved'">Save</button>
+        <div id="res"></div>""",
+    "/late-handler": """<button id="open">Open</button><div id="menu" style="display:none">Menu</div>
+        <script>setTimeout(() => document.getElementById('open').addEventListener('click',
+        () => { document.getElementById('menu').style.display = 'block'; }), 1000)</script>""",
+    "/react-input": """<input id="r"><script>let first = true;
+        document.getElementById('r').addEventListener('input', e => {
+        if (first) { first = false; e.target.value = ''; } })</script>""",
+    "/uppercase": """<input id="u"><script>document.getElementById('u').addEventListener('input',
+        e => { e.target.value = e.target.value.toUpperCase(); })</script>""",
+    "/editable": """<div id="ed" contenteditable="true" style="min-height:40px;border:1px solid">old</div>""",
+    "/macro-error": """<div class="macro" id="m">""" + SPINNER + """</div>
+        <script>setTimeout(() => { document.getElementById('m').innerHTML =
+        '<div class="aui-message aui-message-error">Error rendering macro chart: NullPointerException</div>';
+        }, 1000)</script>""",
+    "/macro-ok": """<div class="macro" id="m">""" + SPINNER + """</div>
+        <script>setTimeout(() => { document.getElementById('m').innerHTML = 'Chart: 42 items'; }, 800)</script>""",
+    "/macro-empty": """<div class="macro" id="m" style="width:200px;height:40px;border:1px solid"></div>""",
+    "/xhr500": """<div id="x">x</div><script>fetch('/api/fail')</script>""",
+    "/images": """<img id="good" src="/img/ok.png" width="20" height="20">
+        <img id="bad" src="/img/missing.png" width="20" height="20" alt="bad">
+        <canvas id="blank" width="50" height="50"></canvas><canvas id="drawn" width="50" height="50"></canvas>
+        <script>const c = document.getElementById('drawn').getContext('2d');
+        c.fillStyle = 'red'; c.fillRect(10, 10, 20, 20);</script>""",
+    "/download": """<a id="pdf" href="/file/report.pdf">PDF</a> <a id="fake" href="/file/fake.pdf">Fake</a>""",
+    "/dropdown": """<div id="trigger" tabindex="0" style="border:1px solid;padding:4px;width:150px">Choose...</div>
+        <ul id="list" role="listbox" style="display:none;border:1px solid">
+        <li role="option">Alpha</li><li role="option">Beta</li><li role="option">Beta Max</li></ul>
+        <script>const t = document.getElementById('trigger'), l = document.getElementById('list');
+        t.addEventListener('click', () => { l.style.display = 'block'; });
+        l.querySelectorAll('li').forEach(li => li.addEventListener('click',
+        () => { t.textContent = li.textContent; l.style.display = 'none'; }));</script>""",
+    "/login.jsp": """<form id="login-form"><input name="os_username"><input type="password"></form>""",
+    "/confirm": """<div id="row">Row to delete</div>
+        <button id="del" onclick="if (confirm('Supprimer la ligne ?')) document.getElementById('row').remove()">Delete</button>""",
+    "/hidden-later": """<div id="toast">Saving...</div>""" + SPINNER + """
+        <script>setTimeout(() => { document.getElementById('toast').remove();
+        document.getElementById('sp').remove(); }, 1000)</script>""",
+    "/appears-later": SPINNER + """<script>setTimeout(() => { const d = document.createElement('div');
+        d.className = 'err'; d.textContent = 'Boom'; document.body.appendChild(d);
+        document.getElementById('sp').remove(); }, 700)</script>""",
+    "/table": """<table id="t"><tr><th>Clé</th><th>Statut</th></tr>
+        <tr><td>ZTEST-1</td><td>Done</td></tr><tr><td>ZTEST-2</td><td>Open</td></tr></table>""",
+    "/clipped": """<div style="height:0;overflow:hidden"><button id="c">Clipped</button></div>""",
+    "/strict": """<button class="btn">One</button><button class="btn">Two</button>""",
+    "/alternatives": """<button id="new" onclick="this.textContent='done'">New</button>""",
+    "/progressive": """<ul id="items"></ul>""" + SPINNER + """<script>let n = 0;
+        const iv = setInterval(() => { n++; const li = document.createElement('li');
+        li.className = 'item'; li.textContent = 'item ' + n; document.getElementById('items').appendChild(li);
+        if (n === 5) { clearInterval(iv); document.getElementById('sp').remove(); } }, 200);</script>""",
+    "/text": """<p id="p">Total:&nbsp;&nbsp; 42
+        items</p><p id="hiddentext" style="visibility:hidden">Secret</p>""",
+    "/form": """<select id="s"><option value="a">A</option><option value="b">B</option></select>
+        <input type="checkbox" id="cb"><label for="cb">Agree</label>""",
+    "/popup": """<button id="btn" onclick="document.getElementById('out').textContent='ok'">Go</button>
+        <div id="out"></div>
+        <script>setTimeout(() => { const p = document.createElement('div'); p.id = 'popup';
+        p.style.cssText = 'position:fixed;inset:0;background:#fff';
+        p.innerHTML = '<button class=\"close\">Close</button>';
+        p.querySelector('.close').onclick = () => p.remove(); document.body.appendChild(p); }, 300)</script>""",
+    "/newtab": """<a id="nt" href="/frame-inner" target="_blank">Open in a new tab</a>""",
+    "/upload": """<input type="file" id="f" style="display:none">
+        <button id="pick" onclick="document.getElementById('f').click()">Pick</button><div id="name"></div>
+        <script>const f = document.getElementById('f');
+        f.onchange = () => { document.getElementById('name').textContent = f.files[0].name; };</script>""",
+    "/autocomplete": """<input id="ac" autocomplete="off"><ul id="sugg" role="listbox"></ul>
+        <script>const people = ['Jean Dupont', 'Jeanne Martin', 'Paul Durand'];
+        const ac = document.getElementById('ac'), ul = document.getElementById('sugg');
+        ac.addEventListener('keyup', () => { ul.innerHTML = '';
+          if (ac.value.length < 2) return;
+          people.filter(p => p.toLowerCase().includes(ac.value.toLowerCase())).forEach(p => {
+            const li = document.createElement('li'); li.setAttribute('role', 'option'); li.textContent = p;
+            li.onclick = () => { ac.value = p; ul.innerHTML = ''; }; ul.appendChild(li); }); });</script>""",
+    "/hover": """<span id="h" style="padding:4px;border:1px solid">i</span>
+        <div id="tip" style="display:none">Tooltip</div>
+        <script>const h = document.getElementById('h'), tip = document.getElementById('tip');
+        h.onmouseenter = () => { tip.style.display = 'block'; };
+        h.onmouseleave = () => { tip.style.display = 'none'; };</script>""",
+    "/drag": """<div id="src" style="width:60px;height:30px;background:#9cf">Card</div>
+        <div id="dst" style="margin-top:80px;width:200px;height:60px;border:2px dashed">Column</div>
+        <script>let down = false, moves = 0; const dst = document.getElementById('dst');
+        document.getElementById('src').onmousedown = () => { down = true; moves = 0; };
+        document.onmousemove = () => { if (down) moves++; };
+        document.onmouseup = (e) => { if (down && moves >= 3 &&
+          dst.contains(document.elementFromPoint(e.clientX, e.clientY))) dst.textContent = 'dropped';
+          down = false; };</script>""",
+    "/attrs": """<div id="a" class="x aui-message-success" data-state="ok">Hi</div>""",
+    "/optional-popup": """<div id="whatsnew">What's new
+        <button class="close" onclick="this.parentElement.remove()">x</button></div>""",
+    "/chooser": """<h1>Choisissez votre instance</h1>
+        <select id="instance"><option>Confluence</option><option>Jira</option></select>
+        <button type="button" id="go">Suivant</button>
+        <script>document.getElementById('go').onclick = () => {
+          const next = new URLSearchParams(location.search).get('next');
+          setTimeout(() => { location.href = 'http://127.0.0.1:' + location.port
+            + '/sso-callback?next=' + encodeURIComponent(next); }, 300); };</script>""",
+    "/idp-stuck": """<p>Please wait...</p>""",
+    "/anonymous": """<meta name="ajs-remote-user" content=""><div>Public page</div>""",
+    "/counter": """<div id="counter">0</div><script>let i = 0; const iv = setInterval(() => {
+        document.getElementById('counter').textContent = ++i; if (i === 8) clearInterval(iv); }, 100);</script>""",
+}
+
+
+class _Handler(BaseHTTPRequestHandler):
+    """Serves the trap pages over real HTTP (redirects, downloads, errors)."""
+
+    def log_message(self, *args: Any) -> None:  # keep the console quiet
+        pass
+
+    def _send(self, status: int, body: bytes, headers: Optional[dict] = None) -> None:
+        self.send_response(status)
+        for key, value in (headers or {}).items():
+            self.send_header(key, value)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:  # noqa: N802 (http.server API)
+        path = urlparse(self.path).path
+        html = {"Content-Type": "text/html; charset=utf-8"}
+        if path in PAGES:
+            page = "<!doctype html><html><body>{}</body></html>".format(PAGES[path])
+            self._send(200, page.encode("utf-8"), html)
+        elif path == "/api/fail":
+            self._send(500, b"boom", {"Content-Type": "text/plain"})
+        elif path == "/img/ok.png":
+            self._send(200, PNG_1PX, {"Content-Type": "image/png"})
+        elif path == "/app":
+            port = self.server.server_address[1]
+            if "sso=ok" in (self.headers.get("Cookie") or ""):
+                body = '<meta name="ajs-remote-user" content="jdoe"><div id="dashboard">Dashboard</div>'
+                self._send(200, "<!doctype html><html><body>{}</body></html>".format(body).encode(), html)
+            else:
+                here = "http://127.0.0.1:{}{}".format(port, self.path)
+                chooser = "http://localhost:{}/chooser?next={}".format(port, quote(here, safe=""))
+                self._send(302, b"", {"Location": chooser})
+        elif path == "/sso-callback":
+            target = parse_qs(urlparse(self.path).query)["next"][0]
+            self._send(302, b"", {"Location": target, "Set-Cookie": "sso=ok; Path=/"})
+        elif path == "/app-stuck":
+            self._send(302, b"", {"Location": "http://localhost:{}/idp-stuck".format(self.server.server_address[1])})
+        elif path == "/sso-broken":
+            self._send(302, b"", {"Location": "/login.jsp?os_destination=%2Fdashboard"})
+        elif path == "/secure":
+            self._send(302, b"", {"Location": "/login.jsp?os_destination=%2Fsecure"})
+        elif path == "/file/report.pdf":
+            self._send(200, b"%PDF-1.4\n%fake but well-formed header\n", {
+                "Content-Type": "application/pdf",
+                "Content-Disposition": "attachment; filename=report.pdf"})
+        elif path == "/file/fake.pdf":
+            self._send(200, b"<!DOCTYPE html><html><body>Internal error</body></html>", {
+                "Content-Type": "application/pdf",
+                "Content-Disposition": "attachment; filename=fake.pdf"})
+        else:
+            self._send(404, b"<h1>Not found</h1>", html)
+
+
+def start_server() -> Tuple[ThreadingHTTPServer, str]:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server, "http://127.0.0.1:{}".format(server.server_address[1])
+
+
+def assert_true(value: Any) -> None:
+    if not value:
+        raise UiCheckError("expected a truthy value, got {!r}".format(value))
+
+
+class SelfTest:
+    def __init__(self, ui: Actions) -> None:
+        self.ui = ui
+        self.results: List[Tuple[str, bool, str]] = []
+
+    def open(self, path: str) -> None:
+        self.ui.goto(ORIGIN + path)
+
+    def must_pass(self, name: str, check: Callable[[], Any]) -> None:
+        started = time.monotonic()
+        try:
+            check()
+        except Exception as error:
+            detail = "{}: {}".format(type(error).__name__, str(error).splitlines()[0][:160])
+            self.results.append((name, False, "expected PASS, got " + detail))
+            traceback.print_exc()
+            return
+        self.results.append((name, True, "passed ({:.1f}s)".format(time.monotonic() - started)))
+
+    def must_fail(self, name: str, check: Callable[[], Any], contains: Optional[str] = None) -> None:
+        started = time.monotonic()
+        try:
+            check()
+        except UiCheckError as error:
+            message = str(error)
+            if contains and contains.lower() not in message.lower():
+                self.results.append((name, False, "failed but message lacks {!r}: {}".format(
+                    contains, message.splitlines()[0][:160])))
+                return
+            first = message.splitlines()[0][:110]
+            self.results.append((name, True, "failed as expected ({:.1f}s): {}".format(
+                time.monotonic() - started, first)))
+            return
+        except Exception as error:
+            self.results.append((name, False, "expected UiCheckError, got {}: {}".format(
+                type(error).__name__, str(error).splitlines()[0][:160])))
+            return
+        self.results.append((name, False, "expected FAIL, but the check passed (false positive!)"))
+
+
+def run(headed: bool) -> int:
+    global ORIGIN
+    server, ORIGIN = start_server()
+    channel = os.getenv("BROWSER_CHANNEL", "msedge").strip() or None
+    download_dir = Path(tempfile.mkdtemp(prefix="nrt-selftest-"))
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(channel=channel, headless=not headed)
+        context = browser.new_context(viewport={"width": 1280, "height": 800}, accept_downloads=True)
+        page = context.new_page()
+        ui = Actions(
+            page,
+            timeout_ms=4_000,
+            navigation_timeout_ms=10_000,
+            ready_timeout_ms=3_000,
+            settle_ms=200,
+            click_retry_after_ms=900,
+            artifacts_dir=download_dir,
+        )
+        t = SelfTest(ui)
+
+        # --- waiting & visibility -------------------------------------------------
+        t.open("/delayed")
+        t.must_pass("element appearing after 1.2s is found", lambda: ui.expect_visible("#late"))
+
+        t.open("/opacity")
+        t.must_pass("normal button is visible", lambda: ui.expect_visible("#ok"))
+        t.must_fail("opacity:0 button is NOT visible", lambda: ui.expect_visible("#ghost", timeout_ms=1_000),
+                    "transparent")
+        t.must_fail("element in opacity:0 parent is NOT visible",
+                    lambda: ui.expect_visible("#ghost2", timeout_ms=1_000), "transparent")
+        t.must_pass("(info) plain Playwright wrongly says opacity:0 is visible",
+                    lambda: expect(page.locator("#ghost")).to_be_visible(timeout=1_000))
+
+        t.open("/covered")
+        t.must_fail("element under an overlay is NOT visible",
+                    lambda: ui.expect_visible("#target", timeout_ms=1_000), "covered by div#overlay")
+
+        t.open("/clipped")
+        t.must_fail("element clipped by overflow:hidden is NOT visible",
+                    lambda: ui.expect_visible("#c", timeout_ms=1_000))
+
+        # --- iframes ---------------------------------------------------------------
+        deep = Target("#deep", frame=["#outer", "iframe.inner"])
+        t.open("/frames")
+        t.must_pass("click in nested iframes with post-condition",
+                    lambda: ui.click(deep, expect=Target("#deep", frame=["#outer", "iframe.inner"],
+                                                         has_text="Clicked")))
+        t.must_pass("ANY_FRAME finds the element in nested iframes",
+                    lambda: ui.expect_visible(Target("#deep", frame=ANY_FRAME)))
+        t.must_fail("missing frame= gives a hint where the element is",
+                    lambda: ui.expect_visible("#deep", timeout_ms=800), "use frame=")
+
+        t.open("/zero-frame")
+        t.must_fail("content of a 0px-high iframe is NOT visible",
+                    lambda: ui.expect_visible(Target("#deep", frame="#z"), timeout_ms=1_000))
+
+        # --- clicks ----------------------------------------------------------------
+        t.open("/hidden-dup")
+        t.must_pass("hidden duplicate is ignored (no strict-mode error)",
+                    lambda: ui.click(".save", expect=Target("#res", has_text="saved")))
+
+        t.open("/strict")
+        t.must_fail("two visible matches are refused", lambda: ui.click(".btn", timeout_ms=1_000), "SEVERAL")
+
+        t.open("/alternatives")
+        t.must_pass("alternatives: the matching one is used",
+                    lambda: ui.click(["#old", "#new"], expect=Target("#new", has_text="done")))
+
+        def late_handler_with_retry() -> None:
+            ui.click_retry_after_ms = 1_500
+            try:
+                ui.begin_step()
+                ui.click("#open", expect="#menu")
+                assert any("clicking again" in warning for warning in ui.warnings), ui.warnings
+            finally:
+                ui.click_retry_after_ms = 900
+
+        t.open("/late-handler")
+        t.must_pass("click before JS is bound is retried (warning recorded)", late_handler_with_retry)
+        t.open("/late-handler")
+        t.must_fail("with retries=0 the same click fails",
+                    lambda: ui.click("#open", expect="#menu", retries=0, timeout_ms=1_500), "did not happen")
+
+        # --- typing ----------------------------------------------------------------
+        t.open("/react-input")
+        t.must_pass("input rejecting the first set is retyped and verified",
+                    lambda: (ui.fill("#r", "hello"), ui.expect_value("#r", "hello")))
+        t.open("/uppercase")
+        t.must_fail("value rewritten by the app is detected", lambda: ui.fill("#u", "abc"), "contains 'ABC'")
+        t.open("/uppercase")
+        t.must_pass("expected_value= accepts a legit reformat", lambda: ui.fill("#u", "abc", expected_value="ABC"))
+        t.open("/editable")
+        t.must_pass("contenteditable is filled and verified",
+                    lambda: (ui.fill("#ed", "Hello world"), ui.expect_text("#ed", "Hello world", exact=True)))
+
+        # --- macro checks ----------------------------------------------------------
+        t.open("/macro-error")
+        t.must_fail("error displayed AFTER a spinner is caught",
+                    lambda: ui.expect_no_errors(), "Error rendering macro")
+        t.open("/macro-ok")
+        t.must_pass("macro rendered after spinner passes expect_rendered", lambda: ui.expect_rendered("#m"))
+        t.must_pass("no error on the working macro", lambda: ui.expect_no_errors())
+        t.open("/macro-empty")
+        t.must_fail("visible but empty macro is NOT rendered",
+                    lambda: ui.expect_rendered("#m", timeout_ms=1_500), "never finished rendering")
+
+        def server_error() -> None:
+            ui.begin_step()
+            t.open("/xhr500")
+            ui.expect_no_server_errors()
+
+        t.must_fail("HTTP 500 behind a nice-looking page is caught", server_error, "HTTP 500")
+
+        t.open("/images")
+        t.must_pass("loaded image", lambda: ui.expect_image_loaded("#good"))
+        t.must_fail("broken image", lambda: ui.expect_image_loaded("#bad", timeout_ms=1_000), "broken image")
+        t.must_fail("blank canvas", lambda: ui.expect_image_loaded("#blank", timeout_ms=1_000), "blank")
+        t.must_pass("drawn canvas", lambda: ui.expect_image_loaded("#drawn"))
+
+        # --- negative checks wait for the page --------------------------------------
+        t.open("/hidden-later")
+        t.must_pass("toast disappearing after the spinner is hidden", lambda: ui.expect_hidden("#toast"))
+        t.open("/appears-later")
+        t.must_fail("error appearing after the spinner makes expect_absent FAIL",
+                    lambda: ui.expect_absent(".err", timeout_ms=1_000), "still present")
+        t.open("/progressive")
+        t.must_fail("list still loading: count 3 must NOT pass (final is 5)",
+                    lambda: ui.expect_count(".item", 3, timeout_ms=1_000))
+        t.open("/progressive")
+        t.must_pass("final count 5", lambda: ui.expect_count(".item", 5))
+
+        # --- text, tables, forms ----------------------------------------------------
+        t.open("/text")
+        t.must_pass("text with nbsp and newlines is normalized",
+                    lambda: ui.expect_text("#p", "Total: 42 items", exact=True))
+        t.must_fail("text present but visibility:hidden is NOT accepted",
+                    lambda: ui.expect_text("#hiddentext", "Secret", timeout_ms=1_000))
+        t.open("/table")
+        t.must_pass("table content", lambda: ui.expect_table(
+            "#t", headers=["Clé", "Statut"], min_rows=2, contains_rows=[["ZTEST-1", "Done"]]))
+        t.must_fail("wrong table row is detected", lambda: ui.expect_table(
+            "#t", contains_rows=[["ZTEST-2", "Done"]], timeout_ms=1_000), "no row matches")
+        t.open("/form")
+        t.must_pass("native select", lambda: ui.select_option("#s", label="B"))
+        t.must_pass("checkbox", lambda: (ui.check("#cb"), ui.expect_checked("#cb")))
+        t.open("/dropdown")
+        t.must_pass("custom dropdown picks the EXACT option (Beta, not Beta Max)",
+                    lambda: (ui.choose_option("#trigger", "Beta"), ui.expect_text("#trigger", "Beta", exact=True)))
+
+        # --- navigation, dialogs, downloads, popups ---------------------------------
+        context.clear_cookies()
+        t.must_pass("SSO: instance chooser, 'Suivant', back on the page", lambda: (
+            assert_true(ui.login_sso(ORIGIN + "/app", user="jdoe", expect="#dashboard") == "jdoe"),
+            ui.expect_url(ORIGIN + "/app")))
+        t.must_fail("SSO: logged in as another user", lambda: ui.login_sso(
+            ORIGIN + "/app", user="someone", timeout_ms=3_000), "logged in as 'jdoe'")
+        context.clear_cookies()
+        t.must_pass("goto() also goes through the SSO page", lambda: ui.goto(
+            ORIGIN + "/app", expect="#dashboard"))
+        t.must_fail("SSO page without a known button", lambda: ui.login_sso(
+            ORIGIN + "/app-stuck", timeout_ms=3_000), "SSO_CONTINUE_SELECTOR")
+        t.must_fail("SSO: back on the login page", lambda: ui.login_sso(
+            ORIGIN + "/sso-broken", timeout_ms=2_000), "login page")
+        t.open("/anonymous")
+        t.must_fail("anonymous session is not logged in", lambda: ui.expect_logged_in(
+            timeout_ms=800), "anonymous")
+        t.must_fail("redirect to the login page is detected", lambda: ui.goto(ORIGIN + "/secure"), "LOGIN")
+        t.must_fail("HTTP 404 page is detected", lambda: ui.goto(ORIGIN + "/missing"), "HTTP 404")
+        t.open("/confirm")
+        t.must_pass("native confirm() accepted and verified", lambda: (
+            ui.click_and_handle_dialog("#del", expected_message="Supprimer"), ui.expect_absent("#row")))
+        t.open("/download")
+        t.must_pass("real PDF download", lambda: ui.click_and_download(
+            "#pdf", expected_extension=".pdf", save_dir=download_dir))
+        t.must_fail("HTML error page saved as .pdf is detected", lambda: ui.click_and_download(
+            "#fake", save_dir=download_dir), "HTML")
+
+        def new_tab() -> None:
+            new_page = ui.click_new_tab("#nt")
+            try:
+                ui.use_page(new_page)
+                ui.expect_visible("#deep")
+            finally:
+                ui.use_page(page)
+                new_page.close()
+
+        t.open("/newtab")
+        t.must_pass("link opening a new tab", new_tab)
+
+        upload_file = download_dir / "evidence.txt"
+        upload_file.write_text("NRT", encoding="utf-8")
+        t.open("/upload")
+        t.must_pass("upload through a hidden <input type=file>", lambda: (
+            ui.upload_file("#f", upload_file), ui.expect_text("#name", "evidence.txt")))
+        t.open("/upload")
+        t.must_pass("upload through a button opening a file chooser", lambda: (
+            ui.upload_file("#pick", upload_file), ui.expect_text("#name", "evidence.txt")))
+        t.must_fail("upload of a missing local file is refused", lambda: ui.upload_file(
+            "#f", download_dir / "nope.txt"), "not found")
+
+        t.open("/autocomplete")
+        t.must_pass("autocomplete: type, pick the exact suggestion, verify", lambda: (
+            ui.choose_option("#ac", "Jeanne Martin", search="Jean"), ui.expect_value("#ac", "Jeanne Martin")))
+        t.open("/hover")
+        t.must_pass("hover shows the tooltip", lambda: ui.hover("#h", expect="#tip"))
+        t.open("/drag")
+        t.must_pass("drag & drop needing real mouse moves", lambda: ui.drag_and_drop(
+            "#src", "#dst", expect=Target("#dst", has_text="dropped")))
+        t.open("/attrs")
+        t.must_pass("class and attribute", lambda: (
+            ui.expect_class("#a", "aui-message-success"), ui.expect_attribute("#a", "data-state", "ok")))
+        t.must_fail("class must match a whole class name", lambda: ui.expect_class(
+            "#a", "aui-message", timeout_ms=800), "does not have class")
+        t.must_fail("all missing elements are reported together", lambda: ui.expect_all_visible(
+            ["#x1", "#x2", "#a"], timeout_ms=1_000), "2 of 3")
+        t.open("/optional-popup")
+        t.must_pass("optional popup closed when present", lambda: (
+            assert_true(ui.dismiss_if_present("#whatsnew", close="#whatsnew .close")),
+            assert_true(not ui.dismiss_if_present("#whatsnew", timeout_ms=300))))
+        t.open("/counter")
+        t.must_pass("wait for a changing element to stabilize", lambda: (
+            ui.wait_for_dom_stable("#counter", quiet_ms=400, raise_on_timeout=True),
+            ui.expect_text("#counter", "8", exact=True, timeout_ms=200)))
+
+        t.open("/popup")
+        t.must_pass("popup appearing at any time is auto-dismissed", lambda: (
+            ui.auto_dismiss("#popup", close=by_role("button", "Close")),
+            page.wait_for_timeout(500),
+            ui.click("#btn", expect=Target("#out", has_text="ok"))))
+
+        context.close()
+        browser.close()
+    server.shutdown()
+
+    print("\n" + "=" * 100)
+    failures = 0
+    for name, ok, detail in t.results:
+        failures += not ok
+        print("{:<5} {:<62} {}".format("OK" if ok else "KO", name[:62], detail))
+    print("=" * 100)
+    print("{} case(s), {} problem(s)".format(len(t.results), failures))
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--headed", action="store_true", help="show the browser")
+    sys.exit(run(parser.parse_args().headed))
