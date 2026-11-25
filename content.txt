@@ -1,3 +1,536 @@
-En gros, avant, chaque test appelait Playwright directement. Du coup, on se retrouvait avec des attentes fixes, des clics un peu à l’aveugle sans vérifier ce qui se passait derrière, et la définition de « visible » de Playwright qui laissait passer plein de cas limites — genre un élément transparent, recouvert par un autre, ou coincé dans une iframe de 0 pixel.
-Là, la nouvelle couche actions.py vient s’intercaler entre les tests et Playwright pour ajouter des contrôles systématiques. Concrètement, on vérifie la vraie visibilité — l’opacité, le recouvrement, le découpage, les iframes —, on relit les valeurs saisies dans les champs, et on s'assure qu’un clic a bien eu le résultat attendu. Aussi, avant de vérifier qu’un élément n’est pas là, on attend vraiment que tout ait fini de charger : l’AJAX, les spinners, et que le DOM soit bien stable. En plus de ça, on détecte les messages d’erreur de macro, les réponses serveur en 5xx, les pages de login et les faux fichiers téléchargés.
-Les seuls retries qu’on s'autorise sont très ciblés — un souci réseau ou un clic sans effet — et ils sont toujours signalés dans Zephyr, histoire de ne jamais masquer un vrai bug. Sous le capot, c’est du JavaScript exécuté directement dans la page, pour tester la visibilité au point d’affichage et observer le DOM, combiné à l’écoute du trafic réseau par Playwright.
+# Playwright Non-Regression Test Framework
+
+## Purpose
+
+This project runs non-regression tests on our Jira and Confluence Data Center plugins and macros, through the user interface only, and reports the results to Zephyr Squad.
+
+The tests drive Microsoft Edge with Playwright, the way a user would: open a page, click, type, check what is displayed. Zephyr receives one execution per test and one result per step, with a screenshot and an error report when something fails.
+
+The goal is simple: **when a test passes, the plugin works**. When it fails, the message should tell you why without having to replay the test by hand.
+
+The framework is designed for Windows, Python 3.9, Microsoft Edge, and an environment with prod access `https://atlas.fr.space.corp/` and qual access `https://atlas-qual.fr.space.corp/`. It uses the Edge installed on the machine and does not need a browser download through `playwright install`. Playwright officially supports driving the installed Edge through the `msedge` channel; enterprise browser policies can still affect automation ([Playwright browser documentation](https://playwright.dev/python/docs/browsers#google-chrome--microsoft-edge)).
+
+## Project files
+
+| File | Responsibility |
+|---|---|
+| `master.py` | Runs the tests: Edge lifecycle, Zephyr API client, step execution, artifacts, test discovery and command line. Also provides `RegressionTest`, used by every test. |
+| `actions.py` | The actions used inside the tests: `test.ui.click(...)`, `test.ui.expect_visible(...)`, etc. |
+| `boilerPlate.py` | Template copied for each new test. |
+| `selftest_actions.py` | Checks that `actions.py` behaves correctly, on local test pages. No Jira or Zephyr needed. |
+| `.env` | Local URLs, token, paths and settings. **Never commit this file.** |
+| `.env.example` | Configuration reference without credentials. |
+| `artifacts/` | Screenshots, error reports and Playwright traces created during runs. |
+
+The tests themselves are the `ZTEST-*.py` files, in the `Confluence` and `Jira` folders.
+
+## Prerequisites
+
+- Windows with Microsoft Edge installed in its standard location
+- Python 3.9
+- Access to the Jira, Confluence and Zephyr intranet endpoints
+- A Jira personal access token allowed to read test issues and update Zephyr executions
+
+## Setting up the environment
+
+### 1. Offline installation of Playwright
+
+Playwright and its dependencies are in the `Playwright_Dependencies.zip` file.
+
+1. Extract `Playwright_Dependencies.zip`.
+2. In the project's terminal, run these commands in this order:
+
+```powershell
+pip install ".\Playwright_Dependencies\typing_extensions-4.12.2-py3-none-any.whl"
+pip install ".\Playwright_Dependencies\pyee-12.0.0-py3-none-any.whl"
+pip install ".\Playwright_Dependencies\greenlet-3.1.1-cp39-cp39-win_amd64.whl"
+pip install ".\Playwright_Dependencies\playwright-1.60.0-py3-none-win_amd64.whl"
+```
+
+Any Playwright version from 1.42 works.
+
+### 2. Other requirements
+
+```powershell
+pip install pip_system_certs requests python-dotenv
+```
+
+`pip_system_certs` makes Python trust the intranet certificates installed on Windows.
+
+### 3. Configuration
+
+Create your local configuration from the example:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+Then fill in the real values. The ones you must set:
+
+| Setting | Description | Typical value |
+|---|---|---|
+| `JIRA_BASE_URL` | Jira base URL, including `/jira` when the server uses it | `https://atlas.fr.space.corp/jira` |
+| `JIRA_TOKEN` | Personal access token used for the Zephyr API calls | Secret value |
+| `ZEPHYR_PROJECT_ID` | Numeric Jira project ID used by Zephyr | `80302` |
+| `ZEPHYR_VERSION_ID` | Zephyr version ID; `-1` means "unscheduled" | `-1` |
+| `TEST_DIRECTORIES` | Folders containing the tests, separated with `;` | `.\Confluence;.\Jira` |
+| `TEST_FILE_PATTERN` | File name pattern of the tests | `ZTEST-*.py` |
+| `HEADLESS` | `false` while you write tests, `true` on the VM | `false` |
+| `VERIFY_TLS` | Whether API calls check the server certificate | `true` |
+
+The other settings have sensible defaults; see [Configuration](#configuration) below.
+
+Keep tokens and credentials in `.env`, never in Python files. Prefer installing the intranet certificate authority on Windows over setting `VERIFY_TLS=false`.
+
+The old `CONFLUENCE_DIR` and `JIRA_DIR` variables still work when `TEST_DIRECTORIES` is not set.
+
+### 4. Check the installation
+
+```powershell
+python selftest_actions.py
+```
+
+It should end with `0 problem(s)`. If not, the problem comes from the machine or the Playwright version, not from your tests. Then check that your tests are found:
+
+```powershell
+python master.py --list
+```
+
+## Running tests
+
+List the tests found, without contacting Zephyr:
+
+```powershell
+python master.py --list
+```
+
+Run every test in one new Zephyr cycle:
+
+```powershell
+python master.py
+```
+
+Run one test, by file name or an unambiguous part of it:
+
+```powershell
+python master.py --test ZTEST-26_PluginJira
+```
+
+Show or hide the browser for one run, or get more logs:
+
+```powershell
+python master.py --test ZTEST-26_PluginJira --headed --verbose
+python master.py --headless
+```
+
+While writing a test, you can also start it directly:
+
+```powershell
+python .\Confluence\ZTEST-26_PluginJira.py
+```
+
+A direct run reuses the cycle ID stored in `cycle_id.txt`, or creates a new cycle if the file does not exist. Either way, **the results are sent to Zephyr**, so `ISSUE_KEY` must be a real Zephyr test.
+
+The exit code is `0` when every test passed, `1` when a test failed and `2` when the configuration is invalid. `master.py` keeps going after a failed test and prints a summary at the end.
+
+## Writing a test
+
+1. Copy `boilerPlate.py` and give it a name matching `TEST_FILE_PATTERN`, for example `ZTEST-18_questions.py`.
+2. Set `ISSUE_KEY`, `TEST_NAME` and `PAGE_URL`.
+3. Make sure the steps already exist in Zephyr. Step `n` in Python is step `n` in Zephyr: keep the same numbering.
+4. Find the elements you need in the page (see [Finding the right selector](#finding-the-right-selector)) and declare them in the configuration part, at the top of the file.
+5. Write the steps with `test.ui` actions. End every step with a check.
+
+A complete example:
+
+```python
+# ==============================================================================
+# Configuration
+# ==============================================================================
+
+ISSUE_KEY = "ZTEST-18"
+TEST_NAME = "Questions - ask a question"
+PAGE_URL = "https://atlas-qual.fr.space.corp/confluence/questions"
+
+QUESTIONS_APP = Target(".cq", description="Questions app")
+ASK_BUTTON = Target(".cq-bsb-ask", within=QUESTIONS_APP, description="Ask question button")
+TITLE_FIELD = by_id("cq-question-title", description="Question title field")
+DESCRIPTION_EDITOR = Target("#tinymce", frame="iframe.tox-edit-area__iframe",
+                            description="Question description editor")
+
+
+def run_test() -> bool:
+    test = RegressionTest(issue_key=ISSUE_KEY, test_name=TEST_NAME)
+
+    with test:
+        ui = test.ui
+
+        with test.step(1, "Authenticate and open Questions"):
+            ui.login_sso(PAGE_URL, expect=QUESTIONS_APP)
+
+        with test.step(2, "The app is displayed without error"):
+            ui.expect_rendered(QUESTIONS_APP)
+            ui.expect_visible(ASK_BUTTON)
+            ui.expect_no_errors()
+
+        with test.step(3, "The Ask question form opens"):
+            ui.click(ASK_BUTTON, expect=TITLE_FIELD)
+            ui.expect_no_errors()
+
+        with test.step(4, "Fill in the question"):
+            ui.fill(TITLE_FIELD, "Question NRT")
+            ui.fill(DESCRIPTION_EDITOR, "Description question NRT")
+            ui.expect_no_errors()
+
+    return test.success
+```
+
+There is no need for `try/except` around a step. `master.py` records the error, fails the Zephyr step and moves on to the next one. Keep steps as independent as you can: if step 2 needs something created by a failed step 1, step 2 will fail too.
+
+Tests written for the previous version, with raw `page.*` calls and `expect(...)`, still run unchanged. They just don't benefit from the extra checks of `test.ui`.
+
+### Authentication (SSO)
+
+When the browser opens a Jira or Confluence URL without a session, it first lands on the SSO page where you pick the instance, and a click on "Continue" sends it back to the requested page.
+
+`ui.login_sso(PAGE_URL)` handles that. It opens the page, clicks through the SSO page, and checks that you end up on the requested page with a logged-in session. Use it in step 1 of every test. Add `expect=` to also check an element of the page, and `user="jdoe"` to check the user name.
+
+`ui.goto()` goes through the SSO page the same way if it shows up again later, for example when the session has expired.
+
+How it works, in case it needs adjusting:
+
+- The SSO page is recognised because it is on another site than the requested URL. If that is not the case, set `SSO_PAGE_URL_PATTERN` in `.env` (a regex matching part of its URL).
+- The button clicked is the button or link named "Suivant", "Next", "Continuer", "Continue", "Valider", "OK" or "Se connecter" / "Sign in". If yours has another name, set `SSO_CONTINUE_SELECTOR`, for example `#next-button` or `role=button[name="Go" s]`.
+- The session check reads the `ajs-remote-user` meta tag that Jira and Confluence put in their pages, so it works in French and in English.
+
+### New tabs
+
+When a click opens a new tab, switch to it so that actions, screenshots and URLs refer to that tab:
+
+```python
+with test.step(5, "Open the report"):
+    test.use_page(ui.click_new_tab("a.open-report"))
+    ui.expect_visible("#report")
+```
+
+## Finding the right selector
+
+You don't need the "official" class of a macro. You need a selector that finds the right element, and only it, every time.
+
+1. Open the page in Edge, in view mode (not edit mode).
+2. Right-click the element, then **Inspect**.
+3. For a macro, go up the parent tags until the highlight covers the whole macro and nothing more.
+4. On that element, pick in this order:
+   - a `data-...` attribute naming the plugin, such as `data-macro-name="chart"` → `"[data-macro-name='chart']"`;
+   - an `id` that does not contain a generated number → `by_id("cq-question-title")`;
+   - a readable class specific to the plugin, such as `polls-content` → `".polls-content"`;
+   - the role and visible text, such as `by_role("button", "Save")`, if nothing else is stable.
+5. **Check it.** In the Elements tab, press **Ctrl+F** and type the selector. Edge shows how many elements match ("1 of 3") and highlights them. Then reload the page (F5) and search again: the result must be the same.
+
+How to read the inspector: `div.cq.cq-base` is a `<div class="cq cq-base">`. Each dot starts a new class. The CSS selector is `.cq.cq-base`, or `.cq` if that is enough.
+
+Avoid:
+
+- generated classes such as `css-1x9f2ab` or `sc-hKgILt`;
+- ids with a number, such as `macro-123456`;
+- styling classes such as `aui-button`, `active`, `hidden`;
+- texts and placeholders when there is another way, because the instance can be in French or in English;
+- state classes such as `...-ready`, `...-loading`, which come and go.
+
+### Using Playwright Codegen
+
+Codegen records your clicks and suggests selectors. It is a good way to find them quickly:
+
+```powershell
+playwright codegen --channel msedge -o generated_test.py https://atlas-qual.fr.space.corp/confluence
+```
+
+Don't paste its code as is: translate each line into a `test.ui` action, and add the check that proves the action worked.
+
+| Codegen | In a test |
+|---|---|
+| `page.locator("#save")` | `"#save"` |
+| `page.get_by_role("button", name="Save")` | `by_role("button", "Save")` |
+| `page.get_by_label("Title")` | `by_label("Title")` |
+| `page.get_by_placeholder("Search")` | `by_placeholder("Search")` |
+| `page.get_by_text("Done")` | `by_text("Done")` |
+| `page.get_by_test_id("save-btn")` | `by_test_id("save-btn")` |
+| `page.frame_locator("#f").locator("#x")` | `Target("#x", frame="#f")` |
+| `....click()` | `ui.click(target, expect=...)` |
+| `....fill("abc")` | `ui.fill(target, "abc")` |
+| `expect(...).to_be_visible()` | `ui.expect_visible(target)` |
+| `expect(...).to_have_text("abc")` | `ui.expect_text(target, "abc")` |
+
+Never copy `sync_playwright()`, `chromium.launch(...)`, `browser.new_context()`, `context.close()` or `browser.close()`. `RegressionTest` already owns the browser.
+
+## Targeting elements
+
+Every action takes a `target`. The simplest form is a selector string:
+
+```python
+ui.click("#save-button")                      # id
+ui.click(".aui-button.save")                  # classes
+ui.click("[data-macro-name='chart']")         # any attribute
+ui.click('.cq-accept-button[data-accepted="true"]')  # class + attribute value
+ui.click("xpath=//table//tr[2]/td[3]")        # XPath
+```
+
+For the harder cases, use the helpers or a `Target`:
+
+```python
+by_id("weird.id:with-dots")                  # ids that "#..." cannot handle
+by_attr("id", "chart-", match="starts")       # generated ids like chart-8f3a2c
+by_class("aui-button", "save")
+by_role("button", "Save")                     # buttons, links, tabs, checkboxes...
+by_text("Report generated", exact=True)
+by_label("Title")                             # form fields
+by_test_id("save-btn")                        # data-testid
+
+Target(".cell", within="#results", has_text="Done")   # inside a container, with a text
+Target(".row", nth=2)                                  # third visible match (-1 = last)
+Target("button", description="Save button")            # nicer name in the reports
+```
+
+Declare targets once, in the configuration part of the test, and reuse them. A target used in `within=` must be declared before the targets that use it.
+
+**Inside a container.** When a page shows several macros, polls or answers, pick the right one by its text and look for the elements inside it:
+
+```python
+MY_POLL = Target(".polls-content", has_text="Which day for the meeting?")
+VOTE_BUTTON = by_role("button", "Vote", within=MY_POLL)
+```
+
+**Iframes.** Many macros, dialogs and editors live in iframes. Give the iframe selector with `frame=`, as a string:
+
+```python
+Target("canvas.chart", frame="iframe[src*='my-plugin']")
+Target("#field", frame=["#outer-frame", "iframe.inner"])    # nested iframes, outermost first
+Target("#widget", frame=ANY_FRAME)                          # search the page and every iframe
+Target("#tinymce", frame=CONFLUENCE_EDITOR_FRAME)           # Confluence page editor
+```
+
+If you forget the iframe, the error tells you where the element actually is, for example `found 1 match(es) (1 visible) in an iframe: use frame='#macro-frame-1'`.
+
+**Alternatives.** When an element differs between versions, give a list. The first one found is used:
+
+```python
+ui.click(["#new-save-id", "#old-save-id"])
+```
+
+A list always means "one **or** the other", never "all of them".
+
+**French and English.** Prefer ids, classes and attributes over texts. When a text is the only way, accept both:
+
+```python
+by_role("button", re.compile("^(Save|Enregistrer)$"))
+```
+
+Only visible elements are taken into account. If a target matches several visible elements, the action refuses to guess and fails: make it more precise with `within=`, `has_text=` or `nth=`.
+
+## Available actions
+
+All of them are methods of `test.ui`. Timeouts are in milliseconds and most methods accept `timeout_ms=`.
+
+**Navigation**
+
+| Method | What it does |
+|---|---|
+| `login_sso(url, user=None, expect=None)` | Opens a page, goes through the SSO page and checks the session is logged in. |
+| `goto(url, expect=None)` | Opens a page (through the SSO page if needed). Fails on HTTP errors or if you end up on a login page. |
+| `reload()` | Reloads the current page. |
+| `expect_logged_in(user=None)` | Checks the current page belongs to a logged-in user. |
+| `expect_url(text_or_regex)`, `expect_title(...)` | Checks the URL or the page title. |
+| `click_new_tab(target)` | Clicks a link that opens a tab and returns the new page (`test.use_page(page)` to switch to it). |
+
+**Checks**
+
+| Method | What it does |
+|---|---|
+| `expect_visible(target)` | The element is visible on screen: not hidden, not transparent, not covered by something else, not cut off. |
+| `expect_all_visible([targets])` | Same for several elements; all problems are reported at once. |
+| `expect_hidden(target)` / `expect_absent(target)` | The element is not visible / not in the page at all. |
+| `expect_text(target, text, exact=False)` | The displayed text contains (or equals) `text`. Accepts a regex. |
+| `expect_no_text(text)` | A text is not displayed anywhere. |
+| `expect_rendered(target)` | The macro is visible, done loading, has content and shows no error. |
+| `expect_no_errors(within=None)` | No error message is displayed ("Error rendering macro", "Macro inconnue", Java exceptions, AUI error messages...). |
+| `expect_count(target, n)` | Number of visible matches. Use `minimum=` / `maximum=` for a range. |
+| `expect_table(target, headers=, min_rows=, contains_rows=)` | Checks the content of a table. `read_table(target)` returns it. |
+| `expect_image_loaded(target)` | An image is loaded, a canvas is not blank, an svg draws something. |
+| `expect_value(target, value)` | Value of a field. |
+| `expect_attribute(target, name, value=None)` | An attribute exists, or has a given value. |
+| `expect_class(target, name)` | The element has a CSS class. |
+| `expect_enabled`, `expect_disabled`, `expect_checked`, `expect_editable` | State of a field or a button. |
+| `expect_no_server_errors()` | No HTTP 5xx answer during the step (done automatically, see `FAIL_STEP_ON_HTTP_5XX`). |
+| `expect_no_js_errors()` | No JavaScript exception during the step. |
+
+**Actions**
+
+| Method | What it does |
+|---|---|
+| `click(target, expect=None, expect_hidden=None, expect_url=None)` | Clicks, then checks the expected result. |
+| `fill(target, text)` | Types into a field or an editable area (editor included) and checks the value was kept. |
+| `type_text(target, text)` | Types key by key, for autocompletes and editor shortcuts. |
+| `press(key, target=None)` | Presses a key or a shortcut. |
+| `select_option(target, value= / label= / index=)` | Chooses in a native `<select>`. |
+| `choose_option(trigger, option, search=None)` | Chooses in a custom dropdown or an autocomplete (AUI, Select2, user picker). |
+| `check(target)` / `uncheck(target)` | Ticks or unticks a checkbox. |
+| `hover(target, expect=None)` | Hovers an element (tooltips, menus). |
+| `drag_and_drop(source, destination, expect=None)` | Drags an element onto another. |
+| `upload_file(target, path)` | Uploads a file. |
+| `click_and_download(target, expected_extension=".pdf")` | Clicks, downloads and checks the file is a real one. Returns its path. |
+| `click_and_handle_dialog(target, expected_message=None)` | Clicks and accepts the browser `confirm()` / `alert()` that opens. |
+| `scroll_to(target)` | Scrolls to an element. |
+
+**Utilities**
+
+| Method | What it does |
+|---|---|
+| `get_text`, `get_value`, `get_attribute`, `count` | Read something from the page. |
+| `is_visible(target, timeout_ms=0)` | Returns True/False without failing. For optional things only. |
+| `dismiss_if_present(popup, close=None)` | Closes a popup if it shows up ("What's new", onboarding...). |
+| `auto_dismiss(popup, close=None)` | Closes a popup automatically whenever it shows up during the test. |
+| `wait_for_ready()` / `wait_for_dom_stable(target)` | Waits until the page or an element stops loading / changing. |
+| `wait_until(function)` | Waits until your own condition is true. |
+| `screenshot(name, target=None)` | Saves a screenshot as evidence. |
+
+## Writing reliable tests
+
+- **End every step with a check.** A click that did not fail proves nothing. Check what the user should see afterwards.
+- **Give every click an expected result** with `expect=`, `expect_hidden=` or `expect_url=`. Choose an element that **only appears after the click**: if it is already on the page, the check passes even when the click did nothing.
+- **Several things to check after a click?** Put one of them in `expect=`, then check the others with `expect_all_visible([...])` or other `expect_...` calls.
+- **A click with no effect is repeated once**, for example when the page was not fully loaded yet. It is shown as a warning in Zephyr. Use `retries=0` on buttons that must not be clicked twice: Save, Submit, Accept, toggles.
+- **Check the state before an action that changes it.** For example `expect_attribute(BUTTON, "data-accepted", "false")` before accepting an answer. Otherwise, if the state was already right, the test passes without proving anything.
+- **The server is shared.** Data created by a test stays there. Make titles unique (`"Question NRT " + time.strftime("%Y%m%d-%H%M%S")`), or undo what the test did at the end.
+- **Never wait a fixed time** (`time.sleep`, `wait_for_timeout`). The actions already wait for the page. If you need more, use `wait_for_ready()`, `wait_for_dom_stable()` or an `expect_...`.
+- **For a macro, use `expect_rendered()` and `expect_no_errors()`.** A visible macro container does not mean the macro worked.
+- **Avoid `force=True`.** It clicks even when the element is covered, which a user could not do.
+- **Use `test.ui` rather than raw `page.*` calls.** Raw Playwright calls don't have these checks.
+
+Checks that something is absent (`expect_hidden`, `expect_absent`, `expect_no_errors`, `expect_count`) first wait until the page has finished loading. Otherwise an error that appears one second after a spinner would be missed.
+
+## Zephyr reporting workflow
+
+For each full run, `master.py`:
+
+1. creates one Zephyr cycle;
+2. starts every selected test with the same cycle ID;
+3. creates one Zephyr execution for the test's `ISSUE_KEY`;
+4. marks the execution as in progress;
+5. initializes the Zephyr step results through `expand=checksteps`;
+6. marks each step as passed or failed;
+7. attaches the failure diagnostics to the failed step;
+8. marks the whole execution as passed or failed.
+
+The `expand=checksteps` API replaces the old Selenium automation that opened the Zephyr interface only to create the step IDs. SmartBear documents this endpoint for exactly that purpose ([SmartBear ZAPI guidance](https://support.smartbear.com/zephyr-enterprise/faq/no-data-returned-test-step-id-s-are-not-created-on/)). If an older Zephyr version does not support it, set `ZEPHYR_UI_FALLBACK_ENABLED=true` and `ZEPHYR_TEST_SUMMARY_URL`: the fallback does the same through the Zephyr interface.
+
+Zephyr API calls are retried on network errors and on 502/503/504 answers. Calls that create something are only retried when the request did not reach the server, so nothing is created twice.
+
+## Failure diagnostics
+
+When a step fails:
+
+- the Zephyr step is set to FAIL, with a comment starting with the cause, followed by the URL and the browser errors (console, failed requests, HTTP errors);
+- a full-page screenshot and a text report (error, Python traceback, URL, browser errors) are attached to the step;
+- the Playwright trace is attached to the first failed step, when `TRACE_MODE=retain-on-failure`;
+- everything is also saved locally in `artifacts\<run date>\<issue key>\`.
+
+The trace replays the whole test, action by action, with the page at each moment and the network requests ([Trace Viewer documentation](https://playwright.dev/python/docs/trace-viewer)):
+
+```powershell
+playwright show-trace artifacts\<run>\<issue-key>\traces\<issue-key>_trace.zip
+```
+
+Traces can contain page content and typed values. Treat the `artifacts` folder as sensitive and don't commit or share it unnecessarily.
+
+A passing step can still have warnings, for example when a click had to be repeated. Zephyr then shows `SUCCESS (with 1 warning(s), check for flakiness)`. They are worth a look: they usually point to a slow page or a test that could be more precise.
+
+## Configuration
+
+All the settings of `.env` (see `.env.example`):
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `BROWSER_CHANNEL` | `msedge` | Browser used. |
+| `HEADLESS` | `false` | Hide the browser. |
+| `VIEWPORT_WIDTH` / `VIEWPORT_HEIGHT` | `1920` / `1080` | Size of the browser window. |
+| `DEFAULT_TIMEOUT_MS` | `15000` | Default time an action waits for an element. |
+| `NAVIGATION_TIMEOUT_MS` | `30000` | Time allowed to load a page. |
+| `SLOW_MO_MS` | `0` | Slows every action down, to watch a test run. |
+| `UI_READY_TIMEOUT_MS` | `8000` | Max time spent waiting for the page to finish loading before an action. Only a warning if exceeded. |
+| `UI_SETTLE_MS` | `300` | An element found visible must still be visible after this delay. |
+| `UI_CLICK_RETRY_AFTER_MS` | `3000` | When a click has no effect after this delay, it is repeated once. |
+| `UI_STRICT_VISIBILITY` | `true` | Set to `false` to fall back to the plain Playwright definition of "visible". |
+| `FAIL_STEP_ON_HTTP_5XX` | `true` | A step fails if the server answered with a 5xx error, even if the page looks fine. |
+| `FAIL_STEP_ON_JS_ERRORS` | `false` | A step fails on JavaScript exceptions (often noisy in Jira). |
+| `IGNORED_HTTP_ERROR_PATTERN` | empty | Regex of URLs whose errors are tolerated. |
+| `IGNORED_JS_ERROR_PATTERN` | empty | Regex of JavaScript errors that are tolerated. |
+| `SSO_CONTINUE_SELECTOR` | empty | Button to click on the SSO page, if the default one is not found. |
+| `SSO_PAGE_URL_PATTERN` | empty | Regex of the SSO page URL, if it is on the same site as Jira/Confluence. |
+| `ARTIFACTS_DIR` | `artifacts` | Where screenshots, reports and traces are saved. |
+| `TRACE_MODE` | `retain-on-failure` | `on`, `off` or `retain-on-failure`. |
+| `ATTACH_TRACE_ON_FAILURE` | `true` | Attach the trace to the failed Zephyr step. |
+| `ZEPHYR_COMMENT_LIMIT` | `4000` | Max length of a Zephyr step comment. |
+| `REQUEST_TIMEOUT_SECONDS` | `30` | Timeout of Zephyr API calls. |
+| `STEP_RESULTS_TIMEOUT_SECONDS` | `10` | Time allowed for Zephyr to create the step results. |
+| `CYCLE_ID_FILE` | `cycle_id.txt` | Where the current cycle ID is saved. |
+
+## Self-test
+
+`selftest_actions.py` starts a small local web server with pages built to trap a test: a button that is transparent or hidden under an overlay, content inside a 0px-high iframe, an error that shows up after a spinner, an HTTP 500 behind a page that looks fine, an HTML error page downloaded as `.pdf`, an SSO page with a "Suivant" button, and so on. For each case it checks that the actions pass or fail as they should.
+
+Run it after changing `actions.py`, after upgrading Playwright or Edge, or on a new machine:
+
+```powershell
+python selftest_actions.py
+python selftest_actions.py --headed    # to watch it
+```
+
+## Troubleshooting
+
+### No tests are found
+
+Run `python master.py --list`, then check `TEST_DIRECTORIES` and `TEST_FILE_PATTERN`. Several Windows folders must be separated with `;`.
+
+### A Python step number does not exist in Zephyr
+
+Python step `n` is reported to Zephyr step `n`. Add the missing step in Zephyr or fix the number in Python. A mismatch makes the test fail, so that a step is never reported as passed by mistake.
+
+### Zephyr returns no step results
+
+First check that the Zephyr test has steps. If the Zephyr version rejects `expand=checksteps`, enable the UI fallback in `.env` and set `ZEPHYR_TEST_SUMMARY_URL`.
+
+### Microsoft Edge does not start
+
+Check that Edge is installed normally and that `BROWSER_CHANNEL=msedge`. The Playwright Python package must be installed, but Playwright's own Chromium is not needed.
+
+### API calls fail with certificate errors
+
+Check that `pip_system_certs` is installed and that the intranet certificate authority is in the Windows trust store. `VERIFY_TLS=false` is available for local troubleshooting only.
+
+### Common messages
+
+| Message | What to do |
+|---|---|
+| `matches several visible elements` | The target is ambiguous. Add `within=`, `has_text=` or `nth=`. |
+| `... in an iframe: use frame=...` | The element is in an iframe. Add the suggested `frame=`. |
+| `is covered by div.aui-blanket` (or another element) | Something is on top of the element: an open dialog, a popup, a banner. Close it, or use `dismiss_if_present` / `auto_dismiss` if it is not part of the test. |
+| `is transparent` / `is not painted at its position` / `is outside the visible area` | The element exists but a user cannot see it. Usually a real bug, or a section that must be expanded first. |
+| `the browser is on a login page` | The session is not logged in. Check the SSO step. |
+| `... is not a Jira/Confluence page. If it is the SSO page, set SSO_CONTINUE_SELECTOR` | The SSO button was not recognised. Set `SSO_CONTINUE_SELECTOR` in `.env`. |
+| `Page still busy after ... ms` (warning) | A spinner or a request never finished. If it is a normal background request, add it to `DEFAULT_IGNORED_PENDING_URLS` in `actions.py`. |
+| `Server error response(s) received` | The server answered with a 5xx error during the step. If it is unrelated to the plugin, add the URL to `IGNORED_HTTP_ERROR_PATTERN`. |
+| `Typed ... but it contains ...` | The field did not keep the value. If the application reformats it on purpose, use `fill(..., expected_value=...)`. |
+
+## Why pytest is not included
+
+Pytest is an excellent test runner, especially for fixtures, parameterized tests and CI pipelines. This project already has a runner (`master.py`) and needs a one-to-one mapping between business steps and Zephyr step results. Adding pytest would bring a second way of running and reporting tests without making the current workflow simpler. It can be added later if the test suite needs it.
+
+## Maintenance guidelines
+
+- Keep shared browser, Zephyr, retry and artifact behavior in `master.py`.
+- Keep generic UI actions in `actions.py`, and run `selftest_actions.py` after every change to it.
+- Keep plugin-specific selectors and checks in the test files, declared at the top.
+- Prefer stable ids, classes and attributes; use roles and texts when nothing else is stable.
+- Use `test.ui` checks instead of fixed `time.sleep` delays.
+- Never hide a failure on purpose unless the behavior is really optional and documented.
+- Never put tokens, passwords or production data in source files.
