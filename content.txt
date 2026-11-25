@@ -1,0 +1,52 @@
+#Zephyr
+JIRA_BASE_URL=https://baseurl/jira
+JIRA_TOKEN=your_token
+ZEPHYR_PROJECT_ID=80302
+ZEPHYR_VERSION_ID=-1
+CYCLE_ID_FILE=cycle_id.txt
+
+#Test discovery. Separate multiple Windows directories with a semicolon (absolute paths preferred).
+TEST_DIRECTORIES=.\Confluence;.\Jira
+TEST_FILE_PATTERN=ZTEST-*.py
+
+#Playwright configuration
+BROWSER_CHANNEL=msedge
+HEADLESS=false
+VIEWPORT_WIDTH=1920
+VIEWPORT_HEIGHT=1080
+DEFAULT_TIMEOUT_MS=15000
+NAVIGATION_TIMEOUT_MS=30000
+SLOW_MO_MS=0
+
+#UI actions (actions.py)
+UI_READY_TIMEOUT_MS=8000
+UI_SETTLE_MS=300
+UI_CLICK_RETRY_AFTER_MS=3000
+UI_STRICT_VISIBILITY=true
+FAIL_STEP_ON_HTTP_5XX=true
+FAIL_STEP_ON_JS_ERRORS=false
+#Regexes of known errors to tolerate (empty = none)
+IGNORED_HTTP_ERROR_PATTERN=
+IGNORED_JS_ERROR_PATTERN=
+
+#SSO page shown before Jira/Confluence. It is recognised because it is on another site than the
+#requested URL, and its "Suivant / Next / Continuer..." button is clicked. Override if needed:
+#SSO_CONTINUE_SELECTOR is any selector (e.g. #next-button), SSO_PAGE_URL_PATTERN a regex on its URL.
+SSO_CONTINUE_SELECTOR=
+SSO_PAGE_URL_PATTERN=
+
+#Diagnostics
+ARTIFACTS_DIR=artifacts
+TRACE_MODE=retain-on-failure
+ATTACH_TRACE_ON_FAILURE=true
+ZEPHYR_COMMENT_LIMIT=4000
+
+#Network
+VERIFY_TLS=true
+REQUEST_TIMEOUT_SECONDS=30
+STEP_RESULTS_TIMEOUT_SECONDS=10
+
+#To force the test execution on Zephyr
+ZEPHYR_UI_FALLBACK_ENABLED=false
+ZEPHYR_TEST_SUMMARY_URL=https://baseurl/jira/projects/ZTEST?jwupdated=32757&selectedItem=com.thed.zephyr.je:zephyr-tests-page#test-summary-tab
+ZEPHYR_UI_TIMEOUT_MS=15000
