@@ -1,536 +1,2969 @@
-# Playwright Non-Regression Test Framework
+"""Reliable Playwright actions for the Jira / Confluence non-regression tests.
 
-## Purpose
+Available in the tests as ``test.ui``. See README.md for the guide.
+"""
 
-This project runs non-regression tests on our Jira and Confluence Data Center plugins and macros, through the user interface only, and reports the results to Zephyr Squad.
+import logging
+import re
+import sys
+import time
+from dataclasses import dataclass, replace
+from pathlib import Path
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Pattern,
+    Sequence,
+    Tuple,
+    Union,
+)
+from urllib.parse import urlparse
 
-The tests drive Microsoft Edge with Playwright, the way a user would: open a page, click, type, check what is displayed. Zephyr receives one execution per test and one result per step, with a screenshot and an error report when something fails.
+from playwright.sync_api import Error as PlaywrightError
+from playwright.sync_api import Frame, Locator, Page, expect
 
-The goal is simple: **when a test passes, the plugin works**. When it fails, the message should tell you why without having to replay the test by hand.
 
-The framework is designed for Windows, Python 3.9, Microsoft Edge, and an environment with prod access `https://atlas.fr.space.corp/` and qual access `https://atlas-qual.fr.space.corp/`. It uses the Edge installed on the machine and does not need a browser download through `playwright install`. Playwright officially supports driving the installed Edge through the `msedge` channel; enterprise browser policies can still affect automation ([Playwright browser documentation](https://playwright.dev/python/docs/browsers#google-chrome--microsoft-edge)).
+LOGGER = logging.getLogger("nrt.ui")
 
-## Project files
-
-| File | Responsibility |
-|---|---|
-| `master.py` | Runs the tests: Edge lifecycle, Zephyr API client, step execution, artifacts, test discovery and command line. Also provides `RegressionTest`, used by every test. |
-| `actions.py` | The actions used inside the tests: `test.ui.click(...)`, `test.ui.expect_visible(...)`, etc. |
-| `boilerPlate.py` | Template copied for each new test. |
-| `selftest_actions.py` | Checks that `actions.py` behaves correctly, on local test pages. No Jira or Zephyr needed. |
-| `.env` | Local URLs, token, paths and settings. **Never commit this file.** |
-| `.env.example` | Configuration reference without credentials. |
-| `artifacts/` | Screenshots, error reports and Playwright traces created during runs. |
-
-The tests themselves are the `ZTEST-*.py` files, in the `Confluence` and `Jira` folders.
-
-## Prerequisites
-
-- Windows with Microsoft Edge installed in its standard location
-- Python 3.9
-- Access to the Jira, Confluence and Zephyr intranet endpoints
-- A Jira personal access token allowed to read test issues and update Zephyr executions
-
-## Setting up the environment
-
-### 1. Offline installation of Playwright
-
-Playwright and its dependencies are in the `Playwright_Dependencies.zip` file.
-
-1. Extract `Playwright_Dependencies.zip`.
-2. In the project's terminal, run these commands in this order:
-
-```powershell
-pip install ".\Playwright_Dependencies\typing_extensions-4.12.2-py3-none-any.whl"
-pip install ".\Playwright_Dependencies\pyee-12.0.0-py3-none-any.whl"
-pip install ".\Playwright_Dependencies\greenlet-3.1.1-cp39-cp39-win_amd64.whl"
-pip install ".\Playwright_Dependencies\playwright-1.60.0-py3-none-win_amd64.whl"
-```
-
-Any Playwright version from 1.42 works.
-
-### 2. Other requirements
-
-```powershell
-pip install pip_system_certs requests python-dotenv
-```
-
-`pip_system_certs` makes Python trust the intranet certificates installed on Windows.
-
-### 3. Configuration
-
-Create your local configuration from the example:
-
-```powershell
-Copy-Item .env.example .env
-```
-
-Then fill in the real values. The ones you must set:
-
-| Setting | Description | Typical value |
-|---|---|---|
-| `JIRA_BASE_URL` | Jira base URL, including `/jira` when the server uses it | `https://atlas.fr.space.corp/jira` |
-| `JIRA_TOKEN` | Personal access token used for the Zephyr API calls | Secret value |
-| `ZEPHYR_PROJECT_ID` | Numeric Jira project ID used by Zephyr | `80302` |
-| `ZEPHYR_VERSION_ID` | Zephyr version ID; `-1` means "unscheduled" | `-1` |
-| `TEST_DIRECTORIES` | Folders containing the tests, separated with `;` | `.\Confluence;.\Jira` |
-| `TEST_FILE_PATTERN` | File name pattern of the tests | `ZTEST-*.py` |
-| `HEADLESS` | `false` while you write tests, `true` on the VM | `false` |
-| `VERIFY_TLS` | Whether API calls check the server certificate | `true` |
-
-The other settings have sensible defaults; see [Configuration](#configuration) below.
-
-Keep tokens and credentials in `.env`, never in Python files. Prefer installing the intranet certificate authority on Windows over setting `VERIFY_TLS=false`.
-
-The old `CONFLUENCE_DIR` and `JIRA_DIR` variables still work when `TEST_DIRECTORIES` is not set.
-
-### 4. Check the installation
-
-```powershell
-python selftest_actions.py
-```
-
-It should end with `0 problem(s)`. If not, the problem comes from the machine or the Playwright version, not from your tests. Then check that your tests are found:
-
-```powershell
-python master.py --list
-```
-
-## Running tests
-
-List the tests found, without contacting Zephyr:
-
-```powershell
-python master.py --list
-```
-
-Run every test in one new Zephyr cycle:
-
-```powershell
-python master.py
-```
-
-Run one test, by file name or an unambiguous part of it:
-
-```powershell
-python master.py --test ZTEST-26_PluginJira
-```
-
-Show or hide the browser for one run, or get more logs:
-
-```powershell
-python master.py --test ZTEST-26_PluginJira --headed --verbose
-python master.py --headless
-```
-
-While writing a test, you can also start it directly:
-
-```powershell
-python .\Confluence\ZTEST-26_PluginJira.py
-```
-
-A direct run reuses the cycle ID stored in `cycle_id.txt`, or creates a new cycle if the file does not exist. Either way, **the results are sent to Zephyr**, so `ISSUE_KEY` must be a real Zephyr test.
-
-The exit code is `0` when every test passed, `1` when a test failed and `2` when the configuration is invalid. `master.py` keeps going after a failed test and prints a summary at the end.
-
-## Writing a test
-
-1. Copy `boilerPlate.py` and give it a name matching `TEST_FILE_PATTERN`, for example `ZTEST-18_questions.py`.
-2. Set `ISSUE_KEY`, `TEST_NAME` and `PAGE_URL`.
-3. Make sure the steps already exist in Zephyr. Step `n` in Python is step `n` in Zephyr: keep the same numbering.
-4. Find the elements you need in the page (see [Finding the right selector](#finding-the-right-selector)) and declare them in the configuration part, at the top of the file.
-5. Write the steps with `test.ui` actions. End every step with a check.
-
-A complete example:
-
-```python
 # ==============================================================================
-# Configuration
+# Constants
 # ==============================================================================
 
-ISSUE_KEY = "ZTEST-18"
-TEST_NAME = "Questions - ask a question"
-PAGE_URL = "https://atlas-qual.fr.space.corp/confluence/questions"
+# frame=ANY_FRAME searches the page and every iframe.
+ANY_FRAME = "*"
+
+# Iframe of the Confluence Data Center editor.
+CONFLUENCE_EDITOR_FRAME = "#wysiwygTextarea_ifr"
+
+# A visible element matching one of these means that the page is still loading.
+DEFAULT_BUSY_SELECTORS: Tuple[str, ...] = (
+    "aui-spinner",
+    ".aui-spinner",
+    ".aui-icon-wait",
+    ".spinner",
+    "[aria-busy='true']",
+)
+
+# Reported by expect_no_errors() when visible.
+DEFAULT_ERROR_SELECTORS: Tuple[str, ...] = (
+    ".aui-message-error",
+    ".aui-message.error",
+)
+
+# Error texts (English and French), searched case-insensitively in the displayed text.
+DEFAULT_ERROR_PATTERNS: Tuple[str, ...] = (
+    r"error rendering macro",
+    r"erreur (lors )?(du|de) rendu",
+    r"unknown macro",
+    r"macro inconnue",
+    r"an unexpected error (has )?occurred",
+    r"une erreur (inattendue )?s'est produite",
+    r"something went wrong",
+    r"internal server error",
+    r"erreur interne",
+    r"java\.lang\.\w+(exception|error)",
+    r"nullpointerexception",
+    r"\bstack ?trace\b",
+    r"\bunlicensed\b",
+    r"licen[cs]e\W.{0,40}expir",
+)
+
+# Jira / Confluence login pages.
+DEFAULT_LOGIN_URL_PATTERNS: Tuple[str, ...] = (
+    r"/login\.jsp",
+    r"/login\.action",
+    r"/dologin\.action",
+    r"[?&]os_destination=",
+)
+
+# Jira / Confluence login form.
+DEFAULT_LOGIN_SELECTORS: Tuple[str, ...] = ("input[name='os_username']",)
+
+# Requests running for longer than this are considered as long polling and ignored.
+LONG_POLL_SECONDS = 15.0
+
+# Background requests ignored when waiting for the page to be idle.
+DEFAULT_IGNORED_PENDING_URLS = r"/synchrony|/rest/analytics/|heartbeat|/rest/mywork/|/rest/notifications?/"
+
+TextMatch = Union[str, Pattern[str]]
+
+
+class UiCheckError(AssertionError):
+    """Raised when a check or an action fails."""
+
+
+# ==============================================================================
+# Targets
+# ==============================================================================
+
+
+@dataclass(frozen=True)
+class Target:
+    """Where to find an element.
+
+    Give one of: selector (CSS, "xpath=...", "text=..."), role (+ name), text,
+    label, placeholder, test_id or title.
+
+    frame: iframe selector, list of nested iframe selectors, or ANY_FRAME.
+    within: container the element must be inside.
+    has_text / has_not_text: filter on the text of the element.
+    nth: index among the visible matches (-1 = last).
+    alternatives: other targets, tried in order when this one does not match.
+    description: name used in the logs and in Zephyr.
+    """
+
+    selector: Optional[str] = None
+    frame: Any = None
+    role: Optional[str] = None
+    name: Optional[TextMatch] = None
+    text: Optional[TextMatch] = None
+    label: Optional[TextMatch] = None
+    placeholder: Optional[TextMatch] = None
+    test_id: Optional[str] = None
+    title: Optional[TextMatch] = None
+    exact: bool = False
+    within: Any = None
+    has_text: Optional[TextMatch] = None
+    has_not_text: Optional[TextMatch] = None
+    nth: Optional[int] = None
+    alternatives: Tuple[Any, ...] = ()
+    description: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        specs = [
+            name
+            for name in ("selector", "role", "text", "label", "placeholder", "test_id", "title")
+            if getattr(self, name) is not None
+        ]
+        if len(specs) > 1:
+            raise ValueError(
+                "A Target accepts one locating strategy, got: {}".format(", ".join(specs))
+            )
+        if not specs and not self.alternatives:
+            raise ValueError("A Target needs a selector, role, text... or alternatives.")
+        if self.name is not None and self.role is None:
+            raise ValueError("name= is only valid with role=.")
+        if isinstance(self.alternatives, list):
+            object.__setattr__(self, "alternatives", tuple(self.alternatives))
+
+    @property
+    def has_own_strategy(self) -> bool:
+        return any(
+            getattr(self, name) is not None
+            for name in ("selector", "role", "text", "label", "placeholder", "test_id", "title")
+        )
+
+    def or_(self, *alternatives: Any) -> "Target":
+        """Return a copy that falls back on ``alternatives`` (tried in order)."""
+
+        return replace(self, alternatives=tuple(self.alternatives) + tuple(alternatives))
+
+    def in_frame(self, *frames: str) -> "Target":
+        """Return a copy located inside the given (nested) iframe selectors."""
+
+        return replace(self, frame=frames[0] if len(frames) == 1 else list(frames))
+
+    def inside(self, container: Any) -> "Target":
+        """Return a copy restricted to the given container."""
+
+        return replace(self, within=container)
+
+    def describe(self) -> str:
+        if self.description:
+            return self.description
+        if self.role is not None:
+            core = "role={}".format(self.role)
+            if self.name is not None:
+                core += " name={}".format(_fmt(self.name))
+        elif self.selector is not None:
+            core = repr(self.selector)
+        elif self.text is not None:
+            core = "text {}".format(_fmt(self.text))
+        elif self.label is not None:
+            core = "label {}".format(_fmt(self.label))
+        elif self.placeholder is not None:
+            core = "placeholder {}".format(_fmt(self.placeholder))
+        elif self.test_id is not None:
+            core = "test-id {!r}".format(self.test_id)
+        elif self.title is not None:
+            core = "title {}".format(_fmt(self.title))
+        else:
+            core = ""
+        if self.has_text is not None:
+            core += " containing {}".format(_fmt(self.has_text))
+        if self.has_not_text is not None:
+            core += " not containing {}".format(_fmt(self.has_not_text))
+        if self.nth is not None:
+            core += " [index {}]".format(self.nth)
+        if self.within is not None:
+            core += " inside {}".format(describe_target(self.within))
+        if self.frame is not None:
+            core += " in {}".format(_describe_frame_spec(self.frame))
+        if self.alternatives:
+            alternatives = ", ".join(describe_target(alt) for alt in self.alternatives)
+            core = "{} or [{}]".format(core, alternatives) if core else "one of [{}]".format(
+                alternatives
+            )
+        return core.strip()
+
+
+TargetLike = Union[str, Target, Locator, Sequence[Any]]
 
-QUESTIONS_APP = Target(".cq", description="Questions app")
-ASK_BUTTON = Target(".cq-bsb-ask", within=QUESTIONS_APP, description="Ask question button")
-TITLE_FIELD = by_id("cq-question-title", description="Question title field")
-DESCRIPTION_EDITOR = Target("#tinymce", frame="iframe.tox-edit-area__iframe",
-                            description="Question description editor")
 
+def _fmt(value: Any) -> str:
+    if isinstance(value, re.Pattern):
+        return "/{}/".format(value.pattern)
+    return repr(value)
 
-def run_test() -> bool:
-    test = RegressionTest(issue_key=ISSUE_KEY, test_name=TEST_NAME)
 
-    with test:
-        ui = test.ui
+def _css_string(value: str) -> str:
+    return '"{}"'.format(value.replace("\\", "\\\\").replace('"', '\\"'))
 
-        with test.step(1, "Authenticate and open Questions"):
-            ui.login_sso(PAGE_URL, expect=QUESTIONS_APP)
 
-        with test.step(2, "The app is displayed without error"):
-            ui.expect_rendered(QUESTIONS_APP)
-            ui.expect_visible(ASK_BUTTON)
-            ui.expect_no_errors()
+def _describe_frame_spec(frame: Any) -> str:
+    if frame == ANY_FRAME:
+        return "any frame"
+    if isinstance(frame, str):
+        return "iframe {!r}".format(frame)
+    return "iframes {}".format(" > ".join(repr(item) for item in frame))
 
-        with test.step(3, "The Ask question form opens"):
-            ui.click(ASK_BUTTON, expect=TITLE_FIELD)
-            ui.expect_no_errors()
 
-        with test.step(4, "Fill in the question"):
-            ui.fill(TITLE_FIELD, "Question NRT")
-            ui.fill(DESCRIPTION_EDITOR, "Description question NRT")
-            ui.expect_no_errors()
+def describe_target(target: Any) -> str:
+    """Human-readable description of anything accepted as a target."""
 
-    return test.success
-```
+    if isinstance(target, Target):
+        return target.describe()
+    if isinstance(target, str):
+        return repr(target)
+    if isinstance(target, Locator):
+        return str(target)
+    if isinstance(target, (list, tuple)):
+        return "one of [{}]".format(", ".join(describe_target(item) for item in target))
+    return repr(target)
 
-There is no need for `try/except` around a step. `master.py` records the error, fails the Zephyr step and moves on to the next one. Keep steps as independent as you can: if step 2 needs something created by a failed step 1, step 2 will fail too.
 
-Tests written for the previous version, with raw `page.*` calls and `expect(...)`, still run unchanged. They just don't benefit from the extra checks of `test.ui`.
+# Shortcuts. They accept the same options as Target (frame=, within=, nth=...).
 
-### Authentication (SSO)
 
-When the browser opens a Jira or Confluence URL without a session, it first lands on the SSO page where you pick the instance, and a click on "Continue" sends it back to the requested page.
+def css(selector: str, **options: Any) -> Target:
+    """Any Playwright selector (CSS, ``xpath=``, ``text=``...)."""
 
-`ui.login_sso(PAGE_URL)` handles that. It opens the page, clicks through the SSO page, and checks that you end up on the requested page with a logged-in session. Use it in step 1 of every test. Add `expect=` to also check an element of the page, and `user="jdoe"` to check the user name.
+    return Target(selector=selector, **options)
 
-`ui.goto()` goes through the SSO page the same way if it shows up again later, for example when the session has expired.
 
-How it works, in case it needs adjusting:
+def by_id(element_id: str, **options: Any) -> Target:
+    """Element by id. Works with ids containing dots, colons or spaces."""
 
-- The SSO page is recognised because it is on another site than the requested URL. If that is not the case, set `SSO_PAGE_URL_PATTERN` in `.env` (a regex matching part of its URL).
-- The button clicked is the button or link named "Suivant", "Next", "Continuer", "Continue", "Valider", "OK" or "Se connecter" / "Sign in". If yours has another name, set `SSO_CONTINUE_SELECTOR`, for example `#next-button` or `role=button[name="Go" s]`.
-- The session check reads the `ajs-remote-user` meta tag that Jira and Confluence put in their pages, so it works in French and in English.
+    return Target(selector="[id={}]".format(_css_string(element_id)), **options)
 
-### New tabs
 
-When a click opens a new tab, switch to it so that actions, screenshots and URLs refer to that tab:
+def by_class(*class_names: str, tag: str = "", **options: Any) -> Target:
+    """All the given classes, e.g. by_class("aui-button", "save")."""
 
-```python
-with test.step(5, "Open the report"):
-    test.use_page(ui.click_new_tab("a.open-report"))
-    ui.expect_visible("#report")
-```
+    selector = tag + "".join(
+        "[class~={}]".format(_css_string(name)) for name in class_names
+    )
+    return Target(selector=selector, **options)
 
-## Finding the right selector
 
-You don't need the "official" class of a macro. You need a selector that finds the right element, and only it, every time.
+def by_attr(
+    attribute: str,
+    value: Optional[str] = None,
+    match: str = "equals",
+    tag: str = "",
+    **options: Any
+) -> Target:
+    """match is "equals", "contains", "starts" or "ends" (handy for generated ids)."""
 
-1. Open the page in Edge, in view mode (not edit mode).
-2. Right-click the element, then **Inspect**.
-3. For a macro, go up the parent tags until the highlight covers the whole macro and nothing more.
-4. On that element, pick in this order:
-   - a `data-...` attribute naming the plugin, such as `data-macro-name="chart"` → `"[data-macro-name='chart']"`;
-   - an `id` that does not contain a generated number → `by_id("cq-question-title")`;
-   - a readable class specific to the plugin, such as `polls-content` → `".polls-content"`;
-   - the role and visible text, such as `by_role("button", "Save")`, if nothing else is stable.
-5. **Check it.** In the Elements tab, press **Ctrl+F** and type the selector. Edge shows how many elements match ("1 of 3") and highlights them. Then reload the page (F5) and search again: the result must be the same.
+    operators = {"equals": "=", "contains": "*=", "starts": "^=", "ends": "$="}
+    if match not in operators:
+        raise ValueError("match must be one of {}".format(", ".join(operators)))
+    if value is None:
+        selector = "{}[{}]".format(tag, attribute)
+    else:
+        selector = "{}[{}{}{}]".format(tag, attribute, operators[match], _css_string(value))
+    return Target(selector=selector, **options)
 
-How to read the inspector: `div.cq.cq-base` is a `<div class="cq cq-base">`. Each dot starts a new class. The CSS selector is `.cq.cq-base`, or `.cq` if that is enough.
 
-Avoid:
-
-- generated classes such as `css-1x9f2ab` or `sc-hKgILt`;
-- ids with a number, such as `macro-123456`;
-- styling classes such as `aui-button`, `active`, `hidden`;
-- texts and placeholders when there is another way, because the instance can be in French or in English;
-- state classes such as `...-ready`, `...-loading`, which come and go.
-
-### Using Playwright Codegen
-
-Codegen records your clicks and suggests selectors. It is a good way to find them quickly:
-
-```powershell
-playwright codegen --channel msedge -o generated_test.py https://atlas-qual.fr.space.corp/confluence
-```
-
-Don't paste its code as is: translate each line into a `test.ui` action, and add the check that proves the action worked.
-
-| Codegen | In a test |
-|---|---|
-| `page.locator("#save")` | `"#save"` |
-| `page.get_by_role("button", name="Save")` | `by_role("button", "Save")` |
-| `page.get_by_label("Title")` | `by_label("Title")` |
-| `page.get_by_placeholder("Search")` | `by_placeholder("Search")` |
-| `page.get_by_text("Done")` | `by_text("Done")` |
-| `page.get_by_test_id("save-btn")` | `by_test_id("save-btn")` |
-| `page.frame_locator("#f").locator("#x")` | `Target("#x", frame="#f")` |
-| `....click()` | `ui.click(target, expect=...)` |
-| `....fill("abc")` | `ui.fill(target, "abc")` |
-| `expect(...).to_be_visible()` | `ui.expect_visible(target)` |
-| `expect(...).to_have_text("abc")` | `ui.expect_text(target, "abc")` |
-
-Never copy `sync_playwright()`, `chromium.launch(...)`, `browser.new_context()`, `context.close()` or `browser.close()`. `RegressionTest` already owns the browser.
-
-## Targeting elements
-
-Every action takes a `target`. The simplest form is a selector string:
-
-```python
-ui.click("#save-button")                      # id
-ui.click(".aui-button.save")                  # classes
-ui.click("[data-macro-name='chart']")         # any attribute
-ui.click('.cq-accept-button[data-accepted="true"]')  # class + attribute value
-ui.click("xpath=//table//tr[2]/td[3]")        # XPath
-```
-
-For the harder cases, use the helpers or a `Target`:
-
-```python
-by_id("weird.id:with-dots")                  # ids that "#..." cannot handle
-by_attr("id", "chart-", match="starts")       # generated ids like chart-8f3a2c
-by_class("aui-button", "save")
-by_role("button", "Save")                     # buttons, links, tabs, checkboxes...
-by_text("Report generated", exact=True)
-by_label("Title")                             # form fields
-by_test_id("save-btn")                        # data-testid
-
-Target(".cell", within="#results", has_text="Done")   # inside a container, with a text
-Target(".row", nth=2)                                  # third visible match (-1 = last)
-Target("button", description="Save button")            # nicer name in the reports
-```
-
-Declare targets once, in the configuration part of the test, and reuse them. A target used in `within=` must be declared before the targets that use it.
-
-**Inside a container.** When a page shows several macros, polls or answers, pick the right one by its text and look for the elements inside it:
-
-```python
-MY_POLL = Target(".polls-content", has_text="Which day for the meeting?")
-VOTE_BUTTON = by_role("button", "Vote", within=MY_POLL)
-```
-
-**Iframes.** Many macros, dialogs and editors live in iframes. Give the iframe selector with `frame=`, as a string:
-
-```python
-Target("canvas.chart", frame="iframe[src*='my-plugin']")
-Target("#field", frame=["#outer-frame", "iframe.inner"])    # nested iframes, outermost first
-Target("#widget", frame=ANY_FRAME)                          # search the page and every iframe
-Target("#tinymce", frame=CONFLUENCE_EDITOR_FRAME)           # Confluence page editor
-```
-
-If you forget the iframe, the error tells you where the element actually is, for example `found 1 match(es) (1 visible) in an iframe: use frame='#macro-frame-1'`.
-
-**Alternatives.** When an element differs between versions, give a list. The first one found is used:
-
-```python
-ui.click(["#new-save-id", "#old-save-id"])
-```
-
-A list always means "one **or** the other", never "all of them".
-
-**French and English.** Prefer ids, classes and attributes over texts. When a text is the only way, accept both:
-
-```python
-by_role("button", re.compile("^(Save|Enregistrer)$"))
-```
-
-Only visible elements are taken into account. If a target matches several visible elements, the action refuses to guess and fails: make it more precise with `within=`, `has_text=` or `nth=`.
-
-## Available actions
-
-All of them are methods of `test.ui`. Timeouts are in milliseconds and most methods accept `timeout_ms=`.
-
-**Navigation**
-
-| Method | What it does |
-|---|---|
-| `login_sso(url, user=None, expect=None)` | Opens a page, goes through the SSO page and checks the session is logged in. |
-| `goto(url, expect=None)` | Opens a page (through the SSO page if needed). Fails on HTTP errors or if you end up on a login page. |
-| `reload()` | Reloads the current page. |
-| `expect_logged_in(user=None)` | Checks the current page belongs to a logged-in user. |
-| `expect_url(text_or_regex)`, `expect_title(...)` | Checks the URL or the page title. |
-| `click_new_tab(target)` | Clicks a link that opens a tab and returns the new page (`test.use_page(page)` to switch to it). |
-
-**Checks**
-
-| Method | What it does |
-|---|---|
-| `expect_visible(target)` | The element is visible on screen: not hidden, not transparent, not covered by something else, not cut off. |
-| `expect_all_visible([targets])` | Same for several elements; all problems are reported at once. |
-| `expect_hidden(target)` / `expect_absent(target)` | The element is not visible / not in the page at all. |
-| `expect_text(target, text, exact=False)` | The displayed text contains (or equals) `text`. Accepts a regex. |
-| `expect_no_text(text)` | A text is not displayed anywhere. |
-| `expect_rendered(target)` | The macro is visible, done loading, has content and shows no error. |
-| `expect_no_errors(within=None)` | No error message is displayed ("Error rendering macro", "Macro inconnue", Java exceptions, AUI error messages...). |
-| `expect_count(target, n)` | Number of visible matches. Use `minimum=` / `maximum=` for a range. |
-| `expect_table(target, headers=, min_rows=, contains_rows=)` | Checks the content of a table. `read_table(target)` returns it. |
-| `expect_image_loaded(target)` | An image is loaded, a canvas is not blank, an svg draws something. |
-| `expect_value(target, value)` | Value of a field. |
-| `expect_attribute(target, name, value=None)` | An attribute exists, or has a given value. |
-| `expect_class(target, name)` | The element has a CSS class. |
-| `expect_enabled`, `expect_disabled`, `expect_checked`, `expect_editable` | State of a field or a button. |
-| `expect_no_server_errors()` | No HTTP 5xx answer during the step (done automatically, see `FAIL_STEP_ON_HTTP_5XX`). |
-| `expect_no_js_errors()` | No JavaScript exception during the step. |
-
-**Actions**
-
-| Method | What it does |
-|---|---|
-| `click(target, expect=None, expect_hidden=None, expect_url=None)` | Clicks, then checks the expected result. |
-| `fill(target, text)` | Types into a field or an editable area (editor included) and checks the value was kept. |
-| `type_text(target, text)` | Types key by key, for autocompletes and editor shortcuts. |
-| `press(key, target=None)` | Presses a key or a shortcut. |
-| `select_option(target, value= / label= / index=)` | Chooses in a native `<select>`. |
-| `choose_option(trigger, option, search=None)` | Chooses in a custom dropdown or an autocomplete (AUI, Select2, user picker). |
-| `check(target)` / `uncheck(target)` | Ticks or unticks a checkbox. |
-| `hover(target, expect=None)` | Hovers an element (tooltips, menus). |
-| `drag_and_drop(source, destination, expect=None)` | Drags an element onto another. |
-| `upload_file(target, path)` | Uploads a file. |
-| `click_and_download(target, expected_extension=".pdf")` | Clicks, downloads and checks the file is a real one. Returns its path. |
-| `click_and_handle_dialog(target, expected_message=None)` | Clicks and accepts the browser `confirm()` / `alert()` that opens. |
-| `scroll_to(target)` | Scrolls to an element. |
-
-**Utilities**
-
-| Method | What it does |
-|---|---|
-| `get_text`, `get_value`, `get_attribute`, `count` | Read something from the page. |
-| `is_visible(target, timeout_ms=0)` | Returns True/False without failing. For optional things only. |
-| `dismiss_if_present(popup, close=None)` | Closes a popup if it shows up ("What's new", onboarding...). |
-| `auto_dismiss(popup, close=None)` | Closes a popup automatically whenever it shows up during the test. |
-| `wait_for_ready()` / `wait_for_dom_stable(target)` | Waits until the page or an element stops loading / changing. |
-| `wait_until(function)` | Waits until your own condition is true. |
-| `screenshot(name, target=None)` | Saves a screenshot as evidence. |
-
-## Writing reliable tests
-
-- **End every step with a check.** A click that did not fail proves nothing. Check what the user should see afterwards.
-- **Give every click an expected result** with `expect=`, `expect_hidden=` or `expect_url=`. Choose an element that **only appears after the click**: if it is already on the page, the check passes even when the click did nothing.
-- **Several things to check after a click?** Put one of them in `expect=`, then check the others with `expect_all_visible([...])` or other `expect_...` calls.
-- **A click with no effect is repeated once**, for example when the page was not fully loaded yet. It is shown as a warning in Zephyr. Use `retries=0` on buttons that must not be clicked twice: Save, Submit, Accept, toggles.
-- **Check the state before an action that changes it.** For example `expect_attribute(BUTTON, "data-accepted", "false")` before accepting an answer. Otherwise, if the state was already right, the test passes without proving anything.
-- **The server is shared.** Data created by a test stays there. Make titles unique (`"Question NRT " + time.strftime("%Y%m%d-%H%M%S")`), or undo what the test did at the end.
-- **Never wait a fixed time** (`time.sleep`, `wait_for_timeout`). The actions already wait for the page. If you need more, use `wait_for_ready()`, `wait_for_dom_stable()` or an `expect_...`.
-- **For a macro, use `expect_rendered()` and `expect_no_errors()`.** A visible macro container does not mean the macro worked.
-- **Avoid `force=True`.** It clicks even when the element is covered, which a user could not do.
-- **Use `test.ui` rather than raw `page.*` calls.** Raw Playwright calls don't have these checks.
-
-Checks that something is absent (`expect_hidden`, `expect_absent`, `expect_no_errors`, `expect_count`) first wait until the page has finished loading. Otherwise an error that appears one second after a spinner would be missed.
-
-## Zephyr reporting workflow
-
-For each full run, `master.py`:
-
-1. creates one Zephyr cycle;
-2. starts every selected test with the same cycle ID;
-3. creates one Zephyr execution for the test's `ISSUE_KEY`;
-4. marks the execution as in progress;
-5. initializes the Zephyr step results through `expand=checksteps`;
-6. marks each step as passed or failed;
-7. attaches the failure diagnostics to the failed step;
-8. marks the whole execution as passed or failed.
-
-The `expand=checksteps` API replaces the old Selenium automation that opened the Zephyr interface only to create the step IDs. SmartBear documents this endpoint for exactly that purpose ([SmartBear ZAPI guidance](https://support.smartbear.com/zephyr-enterprise/faq/no-data-returned-test-step-id-s-are-not-created-on/)). If an older Zephyr version does not support it, set `ZEPHYR_UI_FALLBACK_ENABLED=true` and `ZEPHYR_TEST_SUMMARY_URL`: the fallback does the same through the Zephyr interface.
-
-Zephyr API calls are retried on network errors and on 502/503/504 answers. Calls that create something are only retried when the request did not reach the server, so nothing is created twice.
-
-## Failure diagnostics
-
-When a step fails:
-
-- the Zephyr step is set to FAIL, with a comment starting with the cause, followed by the URL and the browser errors (console, failed requests, HTTP errors);
-- a full-page screenshot and a text report (error, Python traceback, URL, browser errors) are attached to the step;
-- the Playwright trace is attached to the first failed step, when `TRACE_MODE=retain-on-failure`;
-- everything is also saved locally in `artifacts\<run date>\<issue key>\`.
-
-The trace replays the whole test, action by action, with the page at each moment and the network requests ([Trace Viewer documentation](https://playwright.dev/python/docs/trace-viewer)):
-
-```powershell
-playwright show-trace artifacts\<run>\<issue-key>\traces\<issue-key>_trace.zip
-```
-
-Traces can contain page content and typed values. Treat the `artifacts` folder as sensitive and don't commit or share it unnecessarily.
-
-A passing step can still have warnings, for example when a click had to be repeated. Zephyr then shows `SUCCESS (with 1 warning(s), check for flakiness)`. They are worth a look: they usually point to a slow page or a test that could be more precise.
-
-## Configuration
-
-All the settings of `.env` (see `.env.example`):
-
-| Setting | Default | Meaning |
-|---|---|---|
-| `BROWSER_CHANNEL` | `msedge` | Browser used. |
-| `HEADLESS` | `false` | Hide the browser. |
-| `VIEWPORT_WIDTH` / `VIEWPORT_HEIGHT` | `1920` / `1080` | Size of the browser window. |
-| `DEFAULT_TIMEOUT_MS` | `15000` | Default time an action waits for an element. |
-| `NAVIGATION_TIMEOUT_MS` | `30000` | Time allowed to load a page. |
-| `SLOW_MO_MS` | `0` | Slows every action down, to watch a test run. |
-| `UI_READY_TIMEOUT_MS` | `8000` | Max time spent waiting for the page to finish loading before an action. Only a warning if exceeded. |
-| `UI_SETTLE_MS` | `300` | An element found visible must still be visible after this delay. |
-| `UI_CLICK_RETRY_AFTER_MS` | `3000` | When a click has no effect after this delay, it is repeated once. |
-| `UI_STRICT_VISIBILITY` | `true` | Set to `false` to fall back to the plain Playwright definition of "visible". |
-| `FAIL_STEP_ON_HTTP_5XX` | `true` | A step fails if the server answered with a 5xx error, even if the page looks fine. |
-| `FAIL_STEP_ON_JS_ERRORS` | `false` | A step fails on JavaScript exceptions (often noisy in Jira). |
-| `IGNORED_HTTP_ERROR_PATTERN` | empty | Regex of URLs whose errors are tolerated. |
-| `IGNORED_JS_ERROR_PATTERN` | empty | Regex of JavaScript errors that are tolerated. |
-| `SSO_CONTINUE_SELECTOR` | empty | Button to click on the SSO page, if the default one is not found. |
-| `SSO_PAGE_URL_PATTERN` | empty | Regex of the SSO page URL, if it is on the same site as Jira/Confluence. |
-| `ARTIFACTS_DIR` | `artifacts` | Where screenshots, reports and traces are saved. |
-| `TRACE_MODE` | `retain-on-failure` | `on`, `off` or `retain-on-failure`. |
-| `ATTACH_TRACE_ON_FAILURE` | `true` | Attach the trace to the failed Zephyr step. |
-| `ZEPHYR_COMMENT_LIMIT` | `4000` | Max length of a Zephyr step comment. |
-| `REQUEST_TIMEOUT_SECONDS` | `30` | Timeout of Zephyr API calls. |
-| `STEP_RESULTS_TIMEOUT_SECONDS` | `10` | Time allowed for Zephyr to create the step results. |
-| `CYCLE_ID_FILE` | `cycle_id.txt` | Where the current cycle ID is saved. |
-
-## Self-test
-
-`selftest_actions.py` starts a small local web server with pages built to trap a test: a button that is transparent or hidden under an overlay, content inside a 0px-high iframe, an error that shows up after a spinner, an HTTP 500 behind a page that looks fine, an HTML error page downloaded as `.pdf`, an SSO page with a "Suivant" button, and so on. For each case it checks that the actions pass or fail as they should.
-
-Run it after changing `actions.py`, after upgrading Playwright or Edge, or on a new machine:
-
-```powershell
-python selftest_actions.py
-python selftest_actions.py --headed    # to watch it
-```
-
-## Troubleshooting
-
-### No tests are found
-
-Run `python master.py --list`, then check `TEST_DIRECTORIES` and `TEST_FILE_PATTERN`. Several Windows folders must be separated with `;`.
-
-### A Python step number does not exist in Zephyr
-
-Python step `n` is reported to Zephyr step `n`. Add the missing step in Zephyr or fix the number in Python. A mismatch makes the test fail, so that a step is never reported as passed by mistake.
-
-### Zephyr returns no step results
-
-First check that the Zephyr test has steps. If the Zephyr version rejects `expand=checksteps`, enable the UI fallback in `.env` and set `ZEPHYR_TEST_SUMMARY_URL`.
-
-### Microsoft Edge does not start
-
-Check that Edge is installed normally and that `BROWSER_CHANNEL=msedge`. The Playwright Python package must be installed, but Playwright's own Chromium is not needed.
-
-### API calls fail with certificate errors
-
-Check that `pip_system_certs` is installed and that the intranet certificate authority is in the Windows trust store. `VERIFY_TLS=false` is available for local troubleshooting only.
-
-### Common messages
-
-| Message | What to do |
-|---|---|
-| `matches several visible elements` | The target is ambiguous. Add `within=`, `has_text=` or `nth=`. |
-| `... in an iframe: use frame=...` | The element is in an iframe. Add the suggested `frame=`. |
-| `is covered by div.aui-blanket` (or another element) | Something is on top of the element: an open dialog, a popup, a banner. Close it, or use `dismiss_if_present` / `auto_dismiss` if it is not part of the test. |
-| `is transparent` / `is not painted at its position` / `is outside the visible area` | The element exists but a user cannot see it. Usually a real bug, or a section that must be expanded first. |
-| `the browser is on a login page` | The session is not logged in. Check the SSO step. |
-| `... is not a Jira/Confluence page. If it is the SSO page, set SSO_CONTINUE_SELECTOR` | The SSO button was not recognised. Set `SSO_CONTINUE_SELECTOR` in `.env`. |
-| `Page still busy after ... ms` (warning) | A spinner or a request never finished. If it is a normal background request, add it to `DEFAULT_IGNORED_PENDING_URLS` in `actions.py`. |
-| `Server error response(s) received` | The server answered with a 5xx error during the step. If it is unrelated to the plugin, add the URL to `IGNORED_HTTP_ERROR_PATTERN`. |
-| `Typed ... but it contains ...` | The field did not keep the value. If the application reformats it on purpose, use `fill(..., expected_value=...)`. |
-
-## Why pytest is not included
-
-Pytest is an excellent test runner, especially for fixtures, parameterized tests and CI pipelines. This project already has a runner (`master.py`) and needs a one-to-one mapping between business steps and Zephyr step results. Adding pytest would bring a second way of running and reporting tests without making the current workflow simpler. It can be added later if the test suite needs it.
-
-## Maintenance guidelines
-
-- Keep shared browser, Zephyr, retry and artifact behavior in `master.py`.
-- Keep generic UI actions in `actions.py`, and run `selftest_actions.py` after every change to it.
-- Keep plugin-specific selectors and checks in the test files, declared at the top.
-- Prefer stable ids, classes and attributes; use roles and texts when nothing else is stable.
-- Use `test.ui` checks instead of fixed `time.sleep` delays.
-- Never hide a failure on purpose unless the behavior is really optional and documented.
-- Never put tokens, passwords or production data in source files.
+def by_xpath(xpath: str, **options: Any) -> Target:
+    return Target(selector="xpath={}".format(xpath), **options)
+
+
+def by_text(text: TextMatch, exact: bool = False, **options: Any) -> Target:
+    """Smallest element whose text contains (or equals, if exact) ``text``."""
+
+    return Target(text=text, exact=exact, **options)
+
+
+def by_role(
+    role: str, name: Optional[TextMatch] = None, exact: bool = False, **options: Any
+) -> Target:
+    """Button, link, tab, checkbox... found by its accessible name."""
+
+    return Target(role=role, name=name, exact=exact, **options)
+
+
+def by_label(label: TextMatch, exact: bool = False, **options: Any) -> Target:
+    """Form field by its <label> text or aria-label."""
+
+    return Target(label=label, exact=exact, **options)
+
+
+def by_placeholder(placeholder: TextMatch, exact: bool = False, **options: Any) -> Target:
+    return Target(placeholder=placeholder, exact=exact, **options)
+
+
+def by_test_id(test_id: str, **options: Any) -> Target:
+    """Element by data-testid."""
+
+    return Target(test_id=test_id, **options)
+
+
+def by_title(title: TextMatch, exact: bool = False, **options: Any) -> Target:
+    return Target(title=title, exact=exact, **options)
+
+
+# Button of the SSO page that leads to Jira/Confluence ("Suivant", "Next"...).
+DEFAULT_SSO_CONTINUE = Target(
+    alternatives=tuple(
+        Target(role=role, name=re.compile(r"^\s*({})\s*$".format(words), re.IGNORECASE))
+        for words in (
+            r"suivant|next",
+            r"continuer|continue",
+            r"valider|ok|submit",
+            r"se connecter|connexion|sign in|log ?in",
+        )
+        for role in ("button", "link")
+    ),
+    description="SSO continue button",
+)
+
+
+# ==============================================================================
+# Browser signals
+# ==============================================================================
+
+
+class PageMonitor:
+    """Records browser errors and the XHR/fetch calls in progress."""
+
+    def __init__(self) -> None:
+        self.console_errors: List[str] = []
+        self.page_errors: List[str] = []
+        self.failed_requests: List[str] = []
+        self.http_errors: List[str] = []
+        self.http_error_statuses: List[int] = []
+        self._inflight: Dict[Any, Tuple[Any, float]] = {}
+        self._pages: List[Page] = []
+
+    def attach(self, page: Page) -> None:
+        """Start listening to a page (once per page)."""
+
+        if any(known is page for known in self._pages):
+            return
+        self._pages.append(page)
+        page.on("console", self._on_console)
+        page.on("pageerror", lambda error: self.page_errors.append(str(error)))
+        page.on("request", lambda request: self._on_request(page, request))
+        page.on("requestfinished", self._on_request_done)
+        page.on("requestfailed", self._on_request_failed)
+        page.on("response", self._on_response)
+
+    def _on_console(self, message: Any) -> None:
+        if message.type == "error":
+            self.console_errors.append(message.text)
+
+    def _on_request(self, page: Page, request: Any) -> None:
+        if request.resource_type in ("xhr", "fetch"):
+            self._inflight[request] = (page, time.monotonic())
+
+    def _on_request_done(self, request: Any) -> None:
+        self._inflight.pop(request, None)
+
+    def _on_request_failed(self, request: Any) -> None:
+        self._inflight.pop(request, None)
+        if "ERR_ABORTED" in str(request.failure or ""):
+            return  # cancelled by a navigation, not a failure
+        self.failed_requests.append(
+            "{} {}: {}".format(
+                request.method, request.url, request.failure or "Unknown network failure"
+            )
+        )
+
+    def _on_response(self, response: Any) -> None:
+        status = response.status
+        resource_type = response.request.resource_type
+        if status >= 500 or (status >= 400 and resource_type in ("xhr", "fetch")):
+            self.http_errors.append(
+                "HTTP {} {} {} ({})".format(
+                    status, response.request.method, response.url, resource_type
+                )
+            )
+            self.http_error_statuses.append(status)
+
+    def pending_requests(
+        self, page: Optional[Page] = None, max_age_seconds: float = LONG_POLL_SECONDS
+    ) -> List[str]:
+        """URLs of XHR/fetch requests still running and younger than max_age."""
+
+        now = time.monotonic()
+        return [
+            request.url
+            for request, (owner, created) in list(self._inflight.items())
+            if now - created < max_age_seconds and (page is None or owner is page)
+        ]
+
+    def offsets(self) -> Tuple[int, int, int, int]:
+        return (
+            len(self.console_errors),
+            len(self.page_errors),
+            len(self.failed_requests),
+            len(self.http_errors),
+        )
+
+    def format_since(self, offsets: Sequence[int]) -> str:
+        offsets = tuple(offsets) + (0,) * (4 - len(offsets))
+        sections = []
+        for title, items, offset in (
+            ("Browser console errors", self.console_errors, offsets[0]),
+            ("Unhandled page errors", self.page_errors, offsets[1]),
+            ("Failed network requests", self.failed_requests, offsets[2]),
+            ("HTTP errors", self.http_errors, offsets[3]),
+        ):
+            new_items = items[offset:]
+            if new_items:
+                shown = new_items[:30]
+                more = len(new_items) - len(shown)
+                text = "{}:\n- {}".format(title, "\n- ".join(shown))
+                if more:
+                    text += "\n- ... and {} more".format(more)
+                sections.append(text)
+        return "\n\n".join(sections)
+
+
+# ==============================================================================
+# JavaScript snippets
+# ==============================================================================
+
+_DESCRIBE_JS = r"""
+const describe = (e) => {
+  if (!e || !e.tagName) return String(e);
+  let s = e.tagName.toLowerCase();
+  if (e.id) s += '#' + e.id;
+  const c = e.getAttribute && e.getAttribute('class');
+  if (c && c.trim()) s += '.' + c.trim().split(/\s+/).slice(0, 3).join('.');
+  return s;
+};
+"""
+
+# Returns null when the element is really visible, otherwise the reason.
+_VISIBILITY_JS = (
+    r"""(el, opts) => {"""
+    + _DESCRIBE_JS
+    + r"""
+  if (!el.isConnected) return 'is detached from the document';
+  const style = getComputedStyle(el);
+  if (style.visibility !== 'visible') return 'has visibility:' + style.visibility;
+  const rects = Array.from(el.getClientRects()).filter(r => r.width >= 1 && r.height >= 1);
+  if (!rects.length) {
+    const b = el.getBoundingClientRect();
+    return 'has no rendered size (' + Math.round(b.width) + 'x' + Math.round(b.height) + ' px)';
+  }
+  const parentOf = (e) => {
+    if (e.parentElement) return e.parentElement;
+    const root = e.getRootNode && e.getRootNode();
+    return root && root.host ? root.host : null;
+  };
+  for (let e = el; e; e = parentOf(e)) {
+    const s = getComputedStyle(e);
+    if (s.display === 'none') return 'is inside a hidden element (' + describe(e) + ' has display:none)';
+    if (parseFloat(s.opacity) < 0.05) return 'is transparent (opacity ' + s.opacity + ' on ' + describe(e) + ')';
+  }
+  const vw = window.innerWidth || document.documentElement.clientWidth;
+  const vh = window.innerHeight || document.documentElement.clientHeight;
+  const points = [];
+  for (const r of rects.slice(0, 20)) {
+    const l = Math.max(r.left, 0), t = Math.max(r.top, 0);
+    const rr = Math.min(r.right, vw), b = Math.min(r.bottom, vh);
+    if (rr - l < 1 || b - t < 1) continue;
+    for (const [fx, fy] of [[0.5, 0.5], [0.2, 0.2], [0.8, 0.2], [0.2, 0.8], [0.8, 0.8]]) {
+      points.push([l + (rr - l) * fx, t + (b - t) * fy]);
+    }
+  }
+  if (!points.length) return 'is outside the visible area of the page';
+  if (!opts.checkCovered) return null;
+  const root = el.getRootNode();
+  const hitter = root && root.elementFromPoint ? root : document;
+  const passThrough = style.pointerEvents === 'none';
+  let blocker = null;
+  for (const [x, y] of points) {
+    const hit = hitter.elementFromPoint(x, y);
+    if (!hit) continue;
+    if (hit === el || el.contains(hit)) return null;
+    if (passThrough && hit.contains(el)) return null;
+    if (!blocker) blocker = hit;
+  }
+  if (!blocker) return 'could not be hit-tested at its position';
+  if (blocker.contains(el)) return 'is not painted at its position (clipped by an overflow container, or behind ' + describe(blocker) + ')';
+  return 'is covered by ' + describe(blocker);
+}"""
+)
+
+# Returns the list of reasons why the document (or element) is still busy.
+_BUSY_JS = r"""(el, selectors) => {
+  const root = el && el.nodeType === 1 ? el : document;
+  const reasons = [];
+  if (!el) {
+    if (document.readyState === 'loading') reasons.push('document is still loading');
+    const jq = window.jQuery;
+    if (jq && typeof jq.active === 'number' && jq.active > 0) reasons.push(jq.active + ' jQuery AJAX call(s) running');
+  }
+  const shown = (n) => {
+    const r = n.getBoundingClientRect();
+    if (r.width < 1 || r.height < 1) return false;
+    const s = getComputedStyle(n);
+    return s.visibility === 'visible' && parseFloat(s.opacity) > 0.05;
+  };
+  for (const sel of selectors) {
+    let nodes = [];
+    try { nodes = Array.from(root.querySelectorAll(sel)); } catch (e) { continue; }
+    if (el && el.matches) { try { if (el.matches(sel)) nodes.push(el); } catch (e) {} }
+    for (const n of nodes) { if (shown(n)) { reasons.push('loading indicator visible (' + sel + ')'); break; } }
+  }
+  return reasons;
+}"""
+
+# Resolves true once the subtree had no DOM change for quietMs.
+_DOM_QUIET_JS = r"""(el, args) => new Promise((resolve) => {
+  const target = el && el.nodeType === 1 ? el : document;
+  const start = performance.now();
+  let last = start;
+  const observer = new MutationObserver(() => { last = performance.now(); });
+  observer.observe(target, {subtree: true, childList: true, characterData: true});
+  const tick = () => {
+    const now = performance.now();
+    if (now - last >= args.quietMs) { observer.disconnect(); resolve(true); }
+    else if (now - start >= args.timeoutMs) { observer.disconnect(); resolve(false); }
+    else setTimeout(tick, 50);
+  };
+  setTimeout(tick, 50);
+})"""
+
+# Rendered text + visible error elements of an element or of the document.
+_SCAN_JS = r"""(el, selectors) => {
+  const root = el && el.nodeType === 1 ? el : document.body;
+  if (!root) return {text: '', hits: []};
+  const shown = (n) => {
+    const r = n.getBoundingClientRect();
+    return r.width >= 1 && r.height >= 1 && getComputedStyle(n).visibility === 'visible';
+  };
+  const hits = [];
+  for (const sel of selectors) {
+    let nodes = [];
+    try { nodes = root.querySelectorAll(sel); } catch (e) { continue; }
+    for (const n of nodes) {
+      if (shown(n)) hits.push(sel + ': ' + ((n.innerText || '').trim().replace(/\s+/g, ' ').slice(0, 300) || '(no text)'));
+    }
+  }
+  return {text: root.innerText || '', hits: hits};
+}"""
+
+_CONTENT_JS = r"""(el) => ({
+  text: (el.innerText || '').trim().length,
+  media: el.querySelectorAll('img,svg,canvas,video,iframe,object,embed').length
+         + (el.matches('img,svg,canvas,video,iframe,object,embed') ? 1 : 0)
+})"""
+
+# Returns null when the image / canvas / svg is really drawn, otherwise the reason.
+_GRAPHIC_JS = r"""(el) => {
+  const tag = el.tagName.toLowerCase();
+  const checkImg = (img) => {
+    if (!img.complete) return 'image still loading: ' + (img.currentSrc || img.src);
+    if (!img.naturalWidth) return 'broken image (failed to load): ' + (img.currentSrc || img.src);
+    return null;
+  };
+  if (tag === 'img') return checkImg(el);
+  if (tag === 'canvas') {
+    if (!el.width || !el.height) return 'canvas has no size';
+    let ctx = null;
+    try { ctx = el.getContext('2d'); } catch (e) { return null; }
+    if (!ctx) return null;
+    try {
+      const data = ctx.getImageData(0, 0, el.width, el.height).data;
+      const step = Math.max(4, Math.floor(data.length / 4 / 200000) * 4);
+      for (let i = 3; i < data.length; i += step) if (data[i] !== 0) return null;
+      return 'canvas is blank (nothing drawn)';
+    } catch (e) { return null; }
+  }
+  if (tag === 'svg') {
+    const shapes = el.querySelectorAll('path,rect,circle,ellipse,line,polyline,polygon,text,image,use');
+    return shapes.length ? null : 'svg contains no drawn shape';
+  }
+  const imgs = Array.from(el.querySelectorAll('img'));
+  const others = el.querySelectorAll('canvas,svg').length;
+  if (!imgs.length && !others) return 'contains no image, canvas or svg';
+  for (const img of imgs) { const r = checkImg(img); if (r) return r; }
+  return null;
+}"""
+
+_EDITABLE_KIND_JS = r"""(el) => {
+  if (el.isContentEditable) return 'editable';
+  const tag = el.tagName.toLowerCase();
+  if (tag === 'input' || tag === 'textarea' || tag === 'select') return tag;
+  return 'other:' + tag;
+}"""
+
+_TABLE_JS = r"""(el) => {
+  const table = el.tagName.toLowerCase() === 'table' ? el : el.querySelector('table');
+  if (!table) return null;
+  const clean = (t) => (t || '').replace(/\s+/g, ' ').trim();
+  return Array.from(table.rows).map(row => Array.from(row.cells).map(cell => clean(cell.innerText)));
+}"""
+
+_FRAME_HINT_JS = r"""(el) => {
+  const tag = el.tagName.toLowerCase();
+  const esc = (v) => v.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  if (el.id && /^[A-Za-z_][A-Za-z0-9_-]*$/.test(el.id)) return '#' + el.id;
+  if (el.id) return tag + '[id="' + esc(el.id) + '"]';
+  for (const attr of ['name', 'title', 'data-macro-name']) {
+    const v = el.getAttribute(attr);
+    if (v) return tag + '[' + attr + '="' + esc(v) + '"]';
+  }
+  const src = (el.getAttribute('src') || '').split('?')[0].split('#')[0];
+  const part = src.split('/').filter(Boolean).slice(-2).join('/');
+  if (part) return tag + '[src*="' + esc(part) + '"]';
+  const cls = (el.getAttribute('class') || '').trim().split(/\s+/).filter(Boolean)[0];
+  return cls ? tag + '.' + cls : tag;
+}"""
+
+_TRIGGER_TEXT_JS = r"""(el) => {
+  const value = typeof el.value === 'string' ? el.value : '';
+  const own = el.innerText || '';
+  const parent = el.parentElement ? (el.parentElement.innerText || '') : '';
+  return [value, own, parent].join('\n');
+}"""
+
+# File signatures, to spot an HTML error page saved as .pdf, .xlsx...
+_MAGIC_BYTES: Dict[str, Tuple[bytes, ...]] = {
+    ".pdf": (b"%PDF",),
+    ".zip": (b"PK",),
+    ".docx": (b"PK",),
+    ".xlsx": (b"PK",),
+    ".pptx": (b"PK",),
+    ".odt": (b"PK",),
+    ".ods": (b"PK",),
+    ".png": (b"\x89PNG",),
+    ".jpg": (b"\xff\xd8",),
+    ".jpeg": (b"\xff\xd8",),
+    ".gif": (b"GIF8",),
+}
+_TEXTUAL_EXTENSIONS = {".html", ".htm", ".txt", ".csv", ".xml", ".json", ".doc", ".md", ".svg"}
+
+
+# ==============================================================================
+# Internals
+# ==============================================================================
+
+
+@dataclass
+class _Resolved:
+    locator: Locator
+    description: str
+    leaf: Optional[Target] = None
+
+
+def _as_target(target: Any, frame: Any = None) -> Union[Target, Locator]:
+    if isinstance(target, Locator):
+        if frame is not None:
+            raise ValueError("frame= cannot be combined with a Playwright Locator.")
+        return target
+    if isinstance(target, Target):
+        result = target
+    elif isinstance(target, str):
+        if not target.strip():
+            raise ValueError("Empty selector.")
+        result = Target(selector=target)
+    elif isinstance(target, (list, tuple)):
+        if not target:
+            raise ValueError("Empty list of alternatives.")
+        result = Target(alternatives=tuple(target))
+    else:
+        raise TypeError("Unsupported target type: {!r}".format(type(target)))
+    if frame is not None:
+        if result.frame is not None and result.frame != frame:
+            raise ValueError("The frame is given twice (in the Target and in frame=).")
+        result = replace(result, frame=frame)
+    return result
+
+
+def _leaves(target: Target, frame: Any = None, within: Any = None) -> List[Any]:
+    """Flatten a Target and its alternatives into simple Targets (or Locators)."""
+
+    own_frame = target.frame if target.frame is not None else frame
+    own_within = target.within if target.within is not None else within
+    leaves: List[Any] = []
+    if target.has_own_strategy:
+        leaves.append(replace(target, frame=own_frame, within=own_within, alternatives=()))
+    for alternative in target.alternatives:
+        normalized = _as_target(alternative)
+        if isinstance(normalized, Locator):
+            leaves.append(normalized)
+        else:
+            leaves.extend(_leaves(normalized, own_frame, own_within))
+    return leaves
+
+
+def _visible_filter(locator: Locator) -> Locator:
+    try:
+        return locator.filter(visible=True)
+    except TypeError:  # Playwright < 1.51
+        return locator.locator("visible=true")
+
+
+def _first_line(error: BaseException, limit: int = 12) -> str:
+    lines = [line for line in str(error).splitlines() if line.strip()]
+    return "\n".join(lines[:limit])
+
+
+def _is_strict_violation(error: BaseException) -> bool:
+    return "strict mode violation" in str(error)
+
+
+def _normalize_space(text: str) -> str:
+    return re.sub(r"\s+", " ", text.replace(" ", " ")).strip()
+
+
+def _matches(text: str, expected: TextMatch, ignore_case: bool = False) -> bool:
+    if isinstance(expected, re.Pattern):
+        return expected.search(text) is not None
+    haystack, needle = _normalize_space(text), _normalize_space(expected)
+    if ignore_case:
+        haystack, needle = haystack.lower(), needle.lower()
+    return needle in haystack
+
+
+def _safe_file_name(value: str) -> str:
+    sanitized = re.sub(r"[^A-Za-z0-9_.-]+", "_", value.strip())
+    return sanitized.strip("._") or "download"
+
+
+# ==============================================================================
+# Actions
+# ==============================================================================
+
+
+class Actions:
+    """Actions and checks on one page. Timeouts are in milliseconds.
+
+    ready_timeout_ms: max wait for the page to be idle before an action (warning only).
+    settle_ms: an element found visible must still be visible after this delay.
+    click_retry_after_ms: delay before a click without effect is repeated.
+    strict_visibility: False falls back to the plain Playwright visibility.
+    ignored_pending_urls: regex of background requests to ignore.
+    sso_continue: button clicked on the SSO page.
+    sso_page_pattern: regex of the SSO page URL (default: any site other than
+    the one requested).
+    """
+
+    def __init__(
+        self,
+        page: Page,
+        *,
+        monitor: Optional[PageMonitor] = None,
+        timeout_ms: int = 15_000,
+        ready_timeout_ms: int = 8_000,
+        settle_ms: int = 300,
+        click_retry_after_ms: int = 3_000,
+        strict_visibility: bool = True,
+        wait_ready_before_actions: bool = True,
+        busy_selectors: Sequence[str] = DEFAULT_BUSY_SELECTORS,
+        error_selectors: Sequence[str] = DEFAULT_ERROR_SELECTORS,
+        error_patterns: Sequence[str] = DEFAULT_ERROR_PATTERNS,
+        login_url_patterns: Sequence[str] = DEFAULT_LOGIN_URL_PATTERNS,
+        login_selectors: Sequence[str] = DEFAULT_LOGIN_SELECTORS,
+        ignored_pending_urls: Optional[str] = DEFAULT_IGNORED_PENDING_URLS,
+        sso_continue: Any = None,
+        sso_page_pattern: Optional[str] = None,
+        navigation_timeout_ms: int = 30_000,
+        artifacts_dir: Optional[Path] = None,
+        logger: Optional[logging.Logger] = None,
+    ) -> None:
+        self.page = page
+        self.monitor = monitor or PageMonitor()
+        self.monitor.attach(page)
+        self.timeout_ms = timeout_ms
+        self.navigation_timeout_ms = navigation_timeout_ms
+        self.ready_timeout_ms = ready_timeout_ms
+        self.settle_ms = settle_ms
+        self.click_retry_after_ms = click_retry_after_ms
+        self.strict_visibility = strict_visibility
+        self.wait_ready_before_actions = wait_ready_before_actions
+        self.busy_selectors = list(busy_selectors)
+        self.error_selectors = list(error_selectors)
+        self.error_patterns = list(error_patterns)
+        self.login_url_patterns = list(login_url_patterns)
+        self.login_selectors = list(login_selectors)
+        self.ignored_pending_urls = re.compile(ignored_pending_urls) if ignored_pending_urls else None
+        self.sso_continue = DEFAULT_SSO_CONTINUE if sso_continue is None else sso_continue
+        self.sso_page_pattern = re.compile(sso_page_pattern) if sso_page_pattern else None
+        self.artifacts_dir = Path(artifacts_dir) if artifacts_dir else Path("artifacts")
+        self.log = logger or LOGGER
+        self.warnings: List[str] = []
+        self._step_offsets = self.monitor.offsets()
+
+    # ------------------------------------------------------------------ setup
+
+    def use_page(self, page: Page) -> Page:
+        """Switch to another page, a new tab for instance."""
+
+        self.page = page
+        self.monitor.attach(page)
+        return page
+
+    def begin_step(self) -> None:
+        """Called by the runner at the start of each step."""
+
+        self._step_offsets = self.monitor.offsets()
+        self.warnings = []
+
+    def take_warnings(self) -> List[str]:
+        warnings, self.warnings = self.warnings, []
+        return warnings
+
+    def _warn(self, message: str) -> None:
+        self.log.warning(message)
+        if message not in self.warnings:
+            self.warnings.append(message)
+
+    # ------------------------------------------------------------ time utils
+
+    def _timeout(self, timeout_ms: Optional[int]) -> int:
+        return self.timeout_ms if timeout_ms is None else max(int(timeout_ms), 1)
+
+    @staticmethod
+    def _deadline(timeout_ms: int) -> float:
+        return time.monotonic() + timeout_ms / 1000.0
+
+    @staticmethod
+    def _remaining(deadline: float, minimum: int = 1) -> int:
+        return max(int((deadline - time.monotonic()) * 1000), minimum)
+
+    @staticmethod
+    def _expired(deadline: float) -> bool:
+        return time.monotonic() >= deadline
+
+    def _sleep(self, milliseconds: int) -> None:
+        try:
+            self.page.wait_for_timeout(milliseconds)
+        except PlaywrightError:
+            time.sleep(milliseconds / 1000.0)
+
+    # ------------------------------------------------------- target resolving
+
+    def _roots(self, frame_spec: Any) -> List[Tuple[Any, str]]:
+        if frame_spec is None:
+            return [(self.page, "main page")]
+        if frame_spec == ANY_FRAME:
+            return [(frame, self._frame_label(frame)) for frame in self.page.frames]
+        chain = [frame_spec] if isinstance(frame_spec, str) else list(frame_spec)
+        root: Any = self.page
+        for selector in chain:
+            root = root.frame_locator(selector)
+        return [(root, _describe_frame_spec(frame_spec))]
+
+    def _frame_label(self, frame: Frame) -> str:
+        if frame.parent_frame is None:
+            return "main page"
+        try:
+            hint = " > ".join(self._frame_chain_hint(frame))
+        except PlaywrightError:
+            hint = frame.name or frame.url
+        return "iframe {}".format(hint)
+
+    def _frame_chain_hint(self, frame: Frame) -> List[str]:
+        chain = []
+        current: Optional[Frame] = frame
+        while current is not None and current.parent_frame is not None:
+            element = current.frame_element()
+            try:
+                chain.append(element.evaluate(_FRAME_HINT_JS))
+            finally:
+                element.dispose()
+            current = current.parent_frame
+        return list(reversed(chain))
+
+    def _build(self, root: Any, leaf: Target) -> Locator:
+        if leaf.within is not None:
+            container = _as_target(leaf.within)
+            if isinstance(container, Locator):
+                root = container
+            else:
+                container_leaves = [item for item in _leaves(container) if isinstance(item, Target)]
+                if not container_leaves:
+                    raise ValueError("Invalid within= container.")
+                root = self._build(root, replace(container_leaves[0], frame=None))
+        if leaf.role is not None:
+            if leaf.name is not None:
+                locator = root.get_by_role(leaf.role, name=leaf.name, exact=leaf.exact)
+            else:
+                locator = root.get_by_role(leaf.role)
+        elif leaf.test_id is not None:
+            locator = root.get_by_test_id(leaf.test_id)
+        elif leaf.label is not None:
+            locator = root.get_by_label(leaf.label, exact=leaf.exact)
+        elif leaf.placeholder is not None:
+            locator = root.get_by_placeholder(leaf.placeholder, exact=leaf.exact)
+        elif leaf.title is not None:
+            locator = root.get_by_title(leaf.title, exact=leaf.exact)
+        elif leaf.text is not None:
+            locator = root.get_by_text(leaf.text, exact=leaf.exact)
+        else:
+            locator = root.locator(leaf.selector)
+        if leaf.has_text is not None:
+            locator = locator.filter(has_text=leaf.has_text)
+        if leaf.has_not_text is not None:
+            locator = locator.filter(has_not_text=leaf.has_not_text)
+        return locator
+
+    @staticmethod
+    def _finish(locator: Locator, leaf: Optional[Target], visible_only: bool) -> Locator:
+        if visible_only:
+            locator = _visible_filter(locator)
+        if leaf is not None and leaf.nth is not None:
+            locator = locator.nth(leaf.nth)
+        return locator
+
+    def _leaf_locators(self, leaf: Any, visible_only: bool) -> List[Tuple[Locator, str]]:
+        if isinstance(leaf, Locator):
+            return [(self._finish(leaf, None, visible_only), "given locator")]
+        return [
+            (self._finish(self._build(root, leaf), leaf, visible_only), where)
+            for root, where in self._roots(leaf.frame)
+        ]
+
+    @staticmethod
+    def _count(locator: Locator) -> Optional[int]:
+        try:
+            return locator.count()
+        except PlaywrightError:
+            return None
+
+    def _locate(
+        self,
+        target: Any,
+        frame: Any = None,
+        *,
+        visible_only: bool,
+        timeout_ms: Optional[int] = None,
+    ) -> _Resolved:
+        """Locator for the target. Alternatives and ANY_FRAME are polled until one matches."""
+
+        normalized = _as_target(target, frame)
+        if isinstance(normalized, Locator):
+            return _Resolved(self._finish(normalized, None, visible_only), str(normalized))
+        description = normalized.describe()
+        leaves = _leaves(normalized)
+        if (
+            len(leaves) == 1
+            and (isinstance(leaves[0], Locator) or leaves[0].frame != ANY_FRAME)
+        ):
+            locator, _where = self._leaf_locators(leaves[0], visible_only)[0]
+            leaf = leaves[0] if isinstance(leaves[0], Target) else None
+            return _Resolved(locator, description, leaf)
+
+        timeout = self._timeout(timeout_ms)
+        deadline = self._deadline(timeout)
+        while True:
+            for leaf in leaves:
+                for locator, where in self._leaf_locators(leaf, visible_only):
+                    if (self._count(locator) or 0) > 0:
+                        matched = describe_target(leaf)
+                        if len(leaves) > 1 or where != "main page":
+                            self.log.debug("%s resolved as %s in %s", description, matched, where)
+                        return _Resolved(
+                            locator,
+                            "{} (matched {} in {})".format(description, matched, where),
+                            leaf if isinstance(leaf, Target) else None,
+                        )
+            if self._expired(deadline):
+                raise UiCheckError(
+                    "No {}element matches {} after {} ms.\n{}".format(
+                        "visible " if visible_only else "",
+                        description,
+                        timeout,
+                        self.diagnose(target, frame),
+                    )
+                )
+            self._sleep(100)
+
+    def _all_locators(self, target: Any, frame: Any, visible_only: bool) -> List[Tuple[Locator, str]]:
+        result = []
+        for group in self._locator_groups(target, frame, visible_only):
+            result.extend(group)
+        return result
+
+    def _locator_groups(
+        self, target: Any, frame: Any, visible_only: bool
+    ) -> List[List[Tuple[Locator, str]]]:
+        """One group per alternative; one locator per frame inside a group."""
+
+        normalized = _as_target(target, frame)
+        if isinstance(normalized, Locator):
+            return [[(self._finish(normalized, None, visible_only), "given locator")]]
+        return [self._leaf_locators(leaf, visible_only) for leaf in _leaves(normalized)]
+
+    def _total(self, target: Any, frame: Any, visible_only: bool) -> Optional[int]:
+        """Match count of the first alternative that matches (None on error)."""
+
+        error = False
+        for group in self._locator_groups(target, frame, visible_only):
+            counts = [self._count(locator) for locator, _where in group]
+            if None in counts:
+                error = True
+                continue
+            total = sum(counts)
+            if total:
+                return total
+        return None if error else 0
+
+    # -------------------------------------------------------------- diagnosis
+
+    def diagnose(self, target: Any, frame: Any = None) -> str:
+        """Where the target matches. Added to the failure messages."""
+
+        lines = []
+        try:
+            lines.append("URL: {}".format(self.page.url))
+            try:
+                lines.append("Page title: {}".format(self.page.title()))
+            except PlaywrightError:
+                pass
+            login = self._login_problem()
+            if login:
+                lines.append("WARNING: {}".format(login))
+            normalized = _as_target(target, frame)
+            leaves = [normalized] if isinstance(normalized, Locator) else _leaves(normalized)
+            for leaf in leaves:
+                lines.append("Candidate {}:".format(describe_target(leaf)))
+                found_somewhere = False
+                for raw, where in self._leaf_locators(leaf, visible_only=False):
+                    total = self._safe_count_text(raw)
+                    visible = self._safe_count_text(_visible_filter(raw))
+                    lines.append("  - {}: {} match(es), {} rendered".format(where, total, visible))
+                    found_somewhere = found_somewhere or (total.isdigit() and total != "0")
+                if isinstance(leaf, Target) and not found_somewhere and leaf.frame != ANY_FRAME:
+                    lines.extend(self._search_other_frames(leaf))
+        except Exception as error:  # never hide the original failure
+            lines.append("(diagnosis incomplete: {})".format(_first_line(error, 2)))
+        return "\n".join(lines)
+
+    def _safe_count_text(self, locator: Locator) -> str:
+        try:
+            return str(locator.count())
+        except PlaywrightError as error:
+            if _is_strict_violation(error):
+                return "error (the iframe selector matches several iframes)"
+            return "error"
+
+    def _search_other_frames(self, leaf: Target) -> List[str]:
+        lines = []
+        for frame in self.page.frames:
+            if leaf.frame is None and frame.parent_frame is None:
+                continue
+            try:
+                locator = self._build(frame, replace(leaf, frame=None))
+                total = locator.count()
+                if not total:
+                    continue
+                visible = _visible_filter(locator).count()
+            except PlaywrightError:
+                continue
+            if frame.parent_frame is None:
+                lines.append(
+                    "  -> found {} match(es) ({} visible) in the main page: remove frame=".format(
+                        total, visible
+                    )
+                )
+                continue
+            try:
+                chain = self._frame_chain_hint(frame)
+                hint = chain[0] if len(chain) == 1 else chain
+            except PlaywrightError:
+                hint = frame.url
+            lines.append(
+                "  -> found {} match(es) ({} visible) in an iframe: use frame={!r}".format(
+                    total, visible, hint
+                )
+            )
+        return lines
+
+    def _login_problem(self) -> Optional[str]:
+        url = self.page.url
+        for pattern in self.login_url_patterns:
+            if re.search(pattern, url, re.IGNORECASE):
+                return "the browser is on a login page ({}), the session is not authenticated.".format(url)
+        for selector in self.login_selectors:
+            try:
+                if self.page.locator(selector).first.is_visible():
+                    return "a login form is displayed ({}), the session is not authenticated.".format(
+                        selector
+                    )
+            except PlaywrightError:
+                continue
+        return None
+
+    def _fail(self, message: str, target: Any = None, frame: Any = None) -> UiCheckError:
+        details = self.diagnose(target, frame) if target is not None else "URL: {}".format(self.page.url)
+        return UiCheckError("{}\n{}".format(message, details))
+
+    # -------------------------------------------------------- page readiness
+
+    def _busy_reasons(self) -> List[str]:
+        reasons = []
+        pending = [
+            url
+            for url in self.monitor.pending_requests(self.page)
+            if not (self.ignored_pending_urls and self.ignored_pending_urls.search(url))
+        ]
+        if pending:
+            reasons.append(
+                "{} XHR/fetch request(s) running (e.g. {})".format(len(pending), pending[0][:150])
+            )
+        for frame in list(self.page.frames):
+            try:
+                frame_reasons = frame.evaluate(
+                    "selectors => ({})(null, selectors)".format(_BUSY_JS), self.busy_selectors
+                )
+            except PlaywrightError:
+                if frame.parent_frame is None:
+                    reasons.append("main page is navigating")
+                continue
+            if frame.parent_frame is not None:
+                frame_reasons = ["iframe: " + reason for reason in frame_reasons]
+            reasons.extend(frame_reasons)
+        return reasons
+
+    def wait_for_ready(
+        self, timeout_ms: Optional[int] = None, raise_on_timeout: bool = False
+    ) -> bool:
+        """Wait until there is no AJAX call and no spinner left on the page.
+
+        Returns False and logs a warning on timeout, it never fails.
+        """
+
+        timeout = self.ready_timeout_ms if timeout_ms is None else max(int(timeout_ms), 1)
+        deadline = self._deadline(timeout)
+        try:
+            self.page.wait_for_load_state("domcontentloaded", timeout=timeout)
+        except PlaywrightError:
+            pass
+        consecutive_idle = 0
+        reasons: List[str] = []
+        while True:
+            reasons = self._busy_reasons()
+            if reasons:
+                consecutive_idle = 0
+            else:
+                consecutive_idle += 1
+                if consecutive_idle >= 2:
+                    return True
+            if self._expired(deadline):
+                break
+            self._sleep(100)
+        message = "Page still busy after {} ms: {}".format(timeout, "; ".join(reasons))
+        if raise_on_timeout:
+            raise UiCheckError(message)
+        self._warn(message)
+        return False
+
+    def wait_for_dom_stable(
+        self,
+        target: Any = None,
+        *,
+        frame: Any = None,
+        quiet_ms: int = 500,
+        timeout_ms: Optional[int] = None,
+        raise_on_timeout: bool = False,
+    ) -> bool:
+        """Wait until the page (or the target) has not changed for quiet_ms."""
+
+        timeout = self.ready_timeout_ms if timeout_ms is None else max(int(timeout_ms), 1)
+        arguments = {"quietMs": quiet_ms, "timeoutMs": timeout}
+        try:
+            if target is None:
+                stable = self.page.evaluate(
+                    "args => ({})(null, args)".format(_DOM_QUIET_JS), arguments
+                )
+            else:
+                resolved = self._locate(target, frame, visible_only=False, timeout_ms=timeout)
+                stable = resolved.locator.evaluate(
+                    _DOM_QUIET_JS, arguments, timeout=timeout
+                )
+        except PlaywrightError as error:
+            stable = False
+            message = "DOM stability check interrupted (navigation?): {}".format(_first_line(error, 1))
+        else:
+            message = "The DOM kept changing for {} ms ({}).".format(
+                timeout, describe_target(target) if target is not None else "page"
+            )
+        if stable:
+            return True
+        if raise_on_timeout:
+            raise UiCheckError(message)
+        self._warn(message)
+        return False
+
+    def _settle(self) -> None:
+        """Negative checks would pass if run too early, so wait for the page first."""
+
+        self.wait_for_ready()
+        self.wait_for_dom_stable(quiet_ms=400)
+
+    def _prepare_action(self) -> None:
+        if self.wait_ready_before_actions:
+            self.wait_for_ready()
+
+    def wait_until(
+        self,
+        predicate: Callable[[], Any],
+        *,
+        timeout_ms: Optional[int] = None,
+        interval_ms: int = 200,
+        message: str = "condition",
+    ) -> Any:
+        """Call predicate until it returns something truthy (exceptions count as False)."""
+
+        timeout = self._timeout(timeout_ms)
+        deadline = self._deadline(timeout)
+        last_error: Optional[BaseException] = None
+        while True:
+            try:
+                value = predicate()
+                if value:
+                    return value
+            except Exception as error:
+                last_error = error
+            if self._expired(deadline):
+                detail = " Last error: {}".format(_first_line(last_error, 3)) if last_error else ""
+                raise self._fail("Timed out after {} ms waiting for {}.{}".format(timeout, message, detail))
+            self._sleep(interval_ms)
+
+    # ------------------------------------------------------------ navigation
+
+    def goto(
+        self,
+        url: str,
+        *,
+        expect: Any = None,
+        timeout_ms: Optional[int] = None,
+        retries: int = 2,
+        allow_login_page: bool = False,
+        handle_sso: bool = True,
+    ) -> None:
+        """Open a URL and check that it really loaded.
+
+        The SSO page shown before Jira/Confluence is passed automatically.
+        Fails on HTTP errors and on login pages, retries network glitches and
+        502/503/504. expect: an element proving that it is the right page.
+        """
+
+        timeout = self.navigation_timeout_ms if timeout_ms is None else self._timeout(timeout_ms)
+        transient = re.compile(
+            r"ERR_(CONNECTION_(RESET|CLOSED|REFUSED|ABORTED|TIMED_OUT)|NETWORK_CHANGED|"
+            r"EMPTY_RESPONSE|TIMED_OUT|NAME_NOT_RESOLVED|INTERNET_DISCONNECTED)|Timeout",
+        )
+        response = None
+        for attempt in range(retries + 1):
+            try:
+                self.log.info("goto %s", url)
+                response = self.page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+            except PlaywrightError as error:
+                if attempt < retries and transient.search(str(error)):
+                    self._warn("Navigation to {} failed ({}), retrying.".format(url, _first_line(error, 1)))
+                    self._sleep(1_000 * (attempt + 1))
+                    continue
+                raise self._fail("Could not open {}: {}".format(url, _first_line(error)))
+            if response is not None and response.status in (502, 503, 504) and attempt < retries:
+                self._warn("Navigation to {} returned HTTP {}, retrying.".format(url, response.status))
+                self._sleep(2_000 * (attempt + 1))
+                continue
+            break
+        if response is not None and response.status >= 400:
+            raise self._fail("Opening {} returned HTTP {} {}.".format(url, response.status, response.status_text))
+        if response is not None:
+            try:
+                user = response.header_value("x-ausername")
+            except PlaywrightError:
+                user = None
+            if user == "anonymous" and not allow_login_page:
+                self._warn("Jira/Confluence served {} to an anonymous user (not logged in).".format(url))
+        self.wait_for_ready()
+        if handle_sso:
+            self._pass_sso_page(url, timeout)
+        if not allow_login_page:
+            problem = self._login_problem()
+            if problem:
+                raise self._fail("Opening {} failed: {}".format(url, problem))
+        if expect is not None:
+            self.expect_visible(expect, timeout_ms=timeout)
+
+    def reload(self, *, expect: Any = None, timeout_ms: Optional[int] = None) -> None:
+        """Reload the page and verify it like goto()."""
+
+        self.goto(self.page.url, expect=expect, timeout_ms=timeout_ms)
+
+    def expect_url(self, expected: TextMatch, *, timeout_ms: Optional[int] = None) -> None:
+        """URL contains ``expected`` (string) or matches it (compiled regex)."""
+
+        pattern = expected if isinstance(expected, re.Pattern) else re.compile(re.escape(expected))
+        try:
+            expect(self.page).to_have_url(pattern, timeout=self._timeout(timeout_ms))
+        except AssertionError as error:
+            raise self._fail("URL does not match {}: {}".format(_fmt(expected), _first_line(error, 3)))
+
+    def expect_title(self, expected: TextMatch, *, timeout_ms: Optional[int] = None) -> None:
+        """Page title contains ``expected`` (string) or matches it (regex)."""
+
+        pattern = expected if isinstance(expected, re.Pattern) else re.compile(re.escape(expected))
+        try:
+            expect(self.page).to_have_title(pattern, timeout=self._timeout(timeout_ms))
+        except AssertionError as error:
+            raise self._fail("Title does not match {}: {}".format(_fmt(expected), _first_line(error, 3)))
+
+    # ------------------------------------------------------- authentication
+
+    def current_user(self) -> Optional[str]:
+        """Jira/Confluence user of the page, "" when anonymous, None when unknown."""
+
+        try:
+            return self.page.evaluate(
+                "() => { const meta = document.querySelector('meta[name=\"ajs-remote-user\"]');"
+                " return meta ? (meta.getAttribute('content') || '') : null; }"
+            )
+        except PlaywrightError:
+            return None
+
+    def expect_logged_in(self, user: Optional[str] = None, *, timeout_ms: Optional[int] = None) -> str:
+        """The current Jira/Confluence page belongs to an authenticated session.
+
+        Relies on the ajs-remote-user meta tag present in Jira and Confluence
+        Data Center pages. Returns the user name.
+        """
+
+        state: Dict[str, Any] = {"user": None}
+
+        def logged_in() -> bool:
+            if self._login_problem():
+                return False
+            state["user"] = self.current_user()
+            if not state["user"]:
+                return False
+            return user is None or state["user"].lower() == user.lower()
+
+        try:
+            self.wait_until(logged_in, timeout_ms=timeout_ms, message="an authenticated session")
+        except UiCheckError:
+            login = self._login_problem()
+            if login:
+                detail = login
+            elif state["user"] is None:
+                detail = (
+                    "{} is not a Jira/Confluence page. If it is the SSO page, set "
+                    "SSO_CONTINUE_SELECTOR in .env".format(self.page.url)
+                )
+            elif state["user"] == "":
+                detail = "the session is anonymous"
+            else:
+                detail = "logged in as {!r}".format(state["user"])
+            raise self._fail(
+                "Not logged in{}: {}.".format(" as {!r}".format(user) if user else "", detail)
+            )
+        self.log.info("logged in as %s", state["user"])
+        return state["user"]
+
+    def login_sso(
+        self,
+        url: str,
+        *,
+        user: Optional[str] = None,
+        expect: Any = None,
+        timeout_ms: Optional[int] = None,
+    ) -> str:
+        """Open a Jira/Confluence URL, go through the SSO page and check that the
+        session is authenticated. Returns the user name."""
+
+        if timeout_ms is None:
+            timeout = max(self.navigation_timeout_ms, 60_000)
+        else:
+            timeout = self._timeout(timeout_ms)
+        deadline = self._deadline(timeout)
+        self.goto(url, timeout_ms=timeout)
+        name = self.expect_logged_in(user, timeout_ms=self._remaining(deadline, 2_000))
+        if expect is not None:
+            self.expect_visible(expect, timeout_ms=self._remaining(deadline, 2_000))
+        return name
+
+    def _on_sso_page(self, requested_url: str) -> bool:
+        current = self.page.url
+        if self.sso_page_pattern is not None:
+            return bool(self.sso_page_pattern.search(current))
+        requested_host = urlparse(requested_url).netloc
+        current_host = urlparse(current).netloc
+        return bool(requested_host and current_host) and current_host != requested_host
+
+    def _pass_sso_page(self, url: str, timeout_ms: int) -> None:
+        """Click through the SSO page when opening url ended on another site."""
+
+        deadline = self._deadline(timeout_ms)
+        give_up = self._deadline(min(timeout_ms, 10_000))
+        clicks = 0
+        seen_button = False
+        while self._on_sso_page(url):
+            if self._total(self.sso_continue, None, True):
+                seen_button = True
+                if clicks == 3:
+                    raise self._fail(
+                        "The SSO page is still displayed after 3 clicks on {}.".format(
+                            describe_target(self.sso_continue)
+                        )
+                    )
+                before = self.page.url
+                self.log.info("SSO page %s: clicking %s", before, describe_target(self.sso_continue))
+                try:
+                    # short timeout: the button was just seen, the loop checks again if it fails
+                    self.click(self.sso_continue, retries=0, timeout_ms=min(self._remaining(deadline), 3_000))
+                except UiCheckError as error:
+                    # The SSO page can move on by itself (redirect, script) or re-render while
+                    # loading, between the moment the button is seen and the click.
+                    if self._expired(deadline):
+                        raise self._fail(
+                            "Could not get through the SSO page {}: {}".format(before, _first_line(error, 1))
+                        )
+                    self.log.info(
+                        "SSO button not clickable on %s (%s). Now on %s, checking again.",
+                        before, _first_line(error, 1), self.page.url,
+                    )
+                    continue
+                clicks += 1
+                try:
+                    self.wait_until(
+                        lambda: self.page.url != before,
+                        timeout_ms=min(self._remaining(deadline), 15_000),
+                        message="the SSO page to go away",
+                    )
+                except UiCheckError:
+                    pass
+                continue
+            # once the SSO page has shown its button, wait for the whole flow to finish
+            if self._expired(deadline if (clicks or seen_button) else give_up):
+                if clicks or seen_button:
+                    raise self._fail("Still on {} after going through the SSO page.".format(self.page.url))
+                self.log.info("Redirected to %s, no SSO button found.", self.page.url)
+                return
+            self._sleep(200)
+        if clicks:
+            self.wait_for_ready()
+
+    # ------------------------------------------------------------ visibility
+
+    def _visibility_problem(
+        self, resolved: _Resolved, check_covered: bool, scroll: bool, deadline: float
+    ) -> Optional[str]:
+        locator = resolved.locator
+        if scroll:
+            try:
+                locator.scroll_into_view_if_needed(timeout=min(self._remaining(deadline), 3_000))
+            except PlaywrightError as error:
+                if _is_strict_violation(error):
+                    raise
+                return "could not be scrolled into view ({})".format(_first_line(error, 1))
+        reason = locator.evaluate(
+            _VISIBILITY_JS,
+            {"checkCovered": check_covered},
+            timeout=min(self._remaining(deadline), 3_000),
+        )
+        if reason:
+            return reason
+        # the iframes around the element must be visible too
+        handle = locator.element_handle(timeout=min(self._remaining(deadline), 3_000))
+        try:
+            frame = handle.owner_frame()
+        finally:
+            handle.dispose()
+        while frame is not None and frame.parent_frame is not None:
+            frame_element = frame.frame_element()
+            try:
+                if scroll:
+                    try:
+                        frame_element.scroll_into_view_if_needed(timeout=2_000)
+                    except PlaywrightError:
+                        pass
+                frame_reason = frame_element.evaluate(_VISIBILITY_JS, {"checkCovered": check_covered})
+                if frame_reason:
+                    hint = frame_element.evaluate(_FRAME_HINT_JS)
+                    return "is inside iframe {} which {}".format(hint, frame_reason)
+            finally:
+                frame_element.dispose()
+            frame = frame.parent_frame
+        return None
+
+    def expect_visible(
+        self,
+        target: Any,
+        *,
+        frame: Any = None,
+        timeout_ms: Optional[int] = None,
+        check_covered: bool = True,
+        settle_ms: Optional[int] = None,
+    ) -> Locator:
+        """Exactly one matching element is visible, and stays visible.
+
+        Visible means not hidden, not transparent, not covered, not clipped, and in
+        visible iframes. Returns the locator.
+        """
+
+        timeout = self._timeout(timeout_ms)
+        deadline = self._deadline(timeout)
+        settle = self.settle_ms if settle_ms is None else settle_ms
+        resolved = self._locate(target, frame, visible_only=True, timeout_ms=timeout)
+        last_reason = "never became visible (no visible element matched)"
+        first_attempt = True
+        while True:
+            # a last attempt with almost no time left would hide the real reason
+            if not first_attempt and self._remaining(deadline, 0) < 300:
+                break
+            first_attempt = False
+            try:
+                expect(resolved.locator).to_be_visible(timeout=self._remaining(deadline))
+                if not self.strict_visibility:
+                    return resolved.locator
+                reason = self._visibility_problem(resolved, check_covered, True, deadline)
+                if reason is None and settle:
+                    self._sleep(settle)
+                    reason = self._visibility_problem(resolved, check_covered, False, deadline)
+                    if reason is not None:
+                        reason = "was visible, then " + reason
+                if reason is None:
+                    self.log.info("visible: %s", resolved.description)
+                    return resolved.locator
+                last_reason = reason
+            except (AssertionError, PlaywrightError) as error:
+                if _is_strict_violation(error):
+                    raise self._fail(
+                        "{} matches several visible elements; make it more precise "
+                        "(nth=, within=, has_text=...).".format(resolved.description),
+                        target,
+                        frame,
+                    )
+                message = str(error)
+                if "Timeout" not in message and "expected to be visible" not in message:
+                    last_reason = _first_line(error, 3)
+            if self._expired(deadline):
+                break
+            self._sleep(150)
+        raise self._fail(
+            "{} is not visible after {} ms: it {}".format(resolved.description, timeout, last_reason),
+            target,
+            frame,
+        )
+
+    def expect_all_visible(
+        self, targets: Sequence[Any], *, frame: Any = None, timeout_ms: Optional[int] = None
+    ) -> None:
+        """Every target is visible. All failures are reported together."""
+
+        timeout = self._timeout(timeout_ms)
+        deadline = self._deadline(timeout)
+        failures = []
+        for target in targets:
+            try:
+                self.expect_visible(target, frame=frame, timeout_ms=self._remaining(deadline, 1_000))
+            except UiCheckError as error:
+                failures.append(str(error))
+        if failures:
+            raise UiCheckError(
+                "{} of {} element(s) are not visible:\n\n{}".format(
+                    len(failures), len(targets), "\n\n".join(failures)
+                )
+            )
+
+    def _wait_counts(
+        self,
+        target: Any,
+        frame: Any,
+        visible_only: bool,
+        accept: Callable[[int], bool],
+        timeout_ms: Optional[int],
+        hold_ms: int,
+    ) -> Tuple[bool, int]:
+        timeout = self._timeout(timeout_ms)
+        deadline = self._deadline(timeout)
+        total: Optional[int] = 0
+        while True:
+            total = self._total(target, frame, visible_only)
+            if total is not None and accept(total):
+                if not hold_ms:
+                    return True, total
+                # a list still loading must not pass
+                self._sleep(hold_ms)
+                total = self._total(target, frame, visible_only)
+                if total is not None and accept(total):
+                    return True, total
+            if self._expired(deadline):
+                return False, -1 if total is None else total
+            self._sleep(150)
+
+    def expect_hidden(self, target: Any, *, frame: Any = None, timeout_ms: Optional[int] = None) -> None:
+        """No visible element matches (it may still be in the DOM)."""
+
+        self._settle()
+        ok, count = self._wait_counts(
+            target, frame, True, lambda total: total == 0, timeout_ms, max(self.settle_ms, 300)
+        )
+        if not ok:
+            raise self._fail(
+                "{} is still visible ({} visible match(es)).".format(describe_target(target), count),
+                target,
+                frame,
+            )
+        self.log.info("hidden: %s", describe_target(target))
+
+    def expect_absent(self, target: Any, *, frame: Any = None, timeout_ms: Optional[int] = None) -> None:
+        """No element matches, visible or not."""
+
+        self._settle()
+        ok, count = self._wait_counts(
+            target, frame, False, lambda total: total == 0, timeout_ms, max(self.settle_ms, 300)
+        )
+        if not ok:
+            raise self._fail(
+                "{} is still present in the page ({} match(es)).".format(describe_target(target), count),
+                target,
+                frame,
+            )
+        self.log.info("absent: %s", describe_target(target))
+
+    def expect_count(
+        self,
+        target: Any,
+        exactly: Optional[int] = None,
+        *,
+        minimum: Optional[int] = None,
+        maximum: Optional[int] = None,
+        frame: Any = None,
+        visible_only: bool = True,
+        timeout_ms: Optional[int] = None,
+    ) -> int:
+        """Number of visible matches. The count has to be stable to pass. Returns it."""
+
+        if exactly is None and minimum is None and maximum is None:
+            raise ValueError("Give exactly=, minimum= or maximum=.")
+
+        def accept(total: int) -> bool:
+            if exactly is not None and total != exactly:
+                return False
+            if minimum is not None and total < minimum:
+                return False
+            return maximum is None or total <= maximum
+
+        self._settle()
+        ok, total = self._wait_counts(
+            target, frame, visible_only, accept, timeout_ms, max(self.settle_ms, 300)
+        )
+        if not ok:
+            wanted = "exactly {}".format(exactly) if exactly is not None else "between {} and {}".format(
+                minimum if minimum is not None else 0, maximum if maximum is not None else "inf"
+            )
+            raise self._fail(
+                "{} has {} {}match(es), expected {}.".format(
+                    describe_target(target), total, "visible " if visible_only else "", wanted
+                ),
+                target,
+                frame,
+            )
+        self.log.info("count %s = %d", describe_target(target), total)
+        return total
+
+    def is_visible(self, target: Any, *, frame: Any = None, timeout_ms: int = 0) -> bool:
+        """True or False without failing, for optional things such as popups."""
+
+        deadline = self._deadline(max(timeout_ms, 1))
+        while True:
+            if self._total(target, frame, True):
+                return True
+            if self._expired(deadline):
+                return False
+            self._sleep(100)
+
+    # ------------------------------------------------------------- contents
+
+    def expect_text(
+        self,
+        target: Any,
+        expected: TextMatch,
+        *,
+        frame: Any = None,
+        exact: bool = False,
+        ignore_case: bool = False,
+        timeout_ms: Optional[int] = None,
+    ) -> str:
+        """The text contains expected (or equals it with exact=True).
+
+        expected can be a compiled regex. Spaces are normalized. Returns the text.
+        """
+
+        timeout = self._timeout(timeout_ms)
+        deadline = self._deadline(timeout)
+        resolved = self._locate(target, frame, visible_only=True, timeout_ms=timeout)
+        assertion = expect(resolved.locator)
+        try:
+            if exact:
+                assertion.to_have_text(
+                    expected, ignore_case=ignore_case, use_inner_text=True, timeout=self._remaining(deadline)
+                )
+            else:
+                assertion.to_contain_text(
+                    expected, ignore_case=ignore_case, use_inner_text=True, timeout=self._remaining(deadline)
+                )
+        except AssertionError as error:
+            if _is_strict_violation(error):
+                raise self._fail(
+                    "{} matches several visible elements.".format(resolved.description), target, frame
+                )
+            actual = self._safe_inner_text(resolved.locator)
+            raise self._fail(
+                "{} does not {} {}. Actual text: {!r}".format(
+                    resolved.description, "equal" if exact else "contain", _fmt(expected), actual[:500]
+                ),
+                target,
+                frame,
+            )
+        self.expect_visible(resolved.locator, timeout_ms=self._remaining(deadline, 2_000))
+        actual = self._safe_inner_text(resolved.locator)
+        self.log.info("text ok: %s contains %s", resolved.description, _fmt(expected))
+        return actual
+
+    def expect_no_text(
+        self,
+        text: TextMatch,
+        *,
+        within: Any = None,
+        frame: Any = None,
+        include_frames: bool = True,
+    ) -> None:
+        """text is not displayed in within, or anywhere in the page and its iframes."""
+
+        self._settle()
+        pattern = text.pattern if isinstance(text, re.Pattern) else re.escape(_normalize_space(text))
+        found = self._scan_for(
+            [pattern], within, frame, include_frames, selectors=[], ignore_patterns=()
+        )
+        if found:
+            raise self._fail("Unexpected text {} is displayed:\n- {}".format(_fmt(text), "\n- ".join(found)))
+
+    def expect_value(
+        self, target: Any, expected: TextMatch, *, frame: Any = None, timeout_ms: Optional[int] = None
+    ) -> None:
+        """Input/textarea/select value equals ``expected`` (or matches a regex)."""
+
+        resolved = self._locate(target, frame, visible_only=True, timeout_ms=timeout_ms)
+        try:
+            expect(resolved.locator).to_have_value(expected, timeout=self._timeout(timeout_ms))
+        except AssertionError as error:
+            raise self._fail(
+                "{} does not have value {}: {}".format(resolved.description, _fmt(expected), _first_line(error, 4)),
+                target,
+                frame,
+            )
+
+    def expect_attribute(
+        self,
+        target: Any,
+        name: str,
+        value: Optional[TextMatch] = None,
+        *,
+        frame: Any = None,
+        visible_only: bool = True,
+        timeout_ms: Optional[int] = None,
+    ) -> None:
+        """Attribute ``name`` exists (value None) or equals / matches ``value``."""
+
+        resolved = self._locate(target, frame, visible_only=visible_only, timeout_ms=timeout_ms)
+        expected = re.compile(r"[\s\S]*") if value is None else value
+        try:
+            expect(resolved.locator).to_have_attribute(name, expected, timeout=self._timeout(timeout_ms))
+        except AssertionError as error:
+            raise self._fail(
+                "{} attribute {!r} check failed ({}): {}".format(
+                    resolved.description, name, "present" if value is None else _fmt(value), _first_line(error, 4)
+                ),
+                target,
+                frame,
+            )
+
+    def expect_class(
+        self, target: Any, class_name: str, *, frame: Any = None, timeout_ms: Optional[int] = None
+    ) -> None:
+        """The element has the CSS class ``class_name`` (among others)."""
+
+        resolved = self._locate(target, frame, visible_only=True, timeout_ms=timeout_ms)
+        pattern = re.compile(r"(^|\s){}(\s|$)".format(re.escape(class_name)))
+        try:
+            expect(resolved.locator).to_have_class(pattern, timeout=self._timeout(timeout_ms))
+        except AssertionError as error:
+            raise self._fail(
+                "{} does not have class {!r}: {}".format(resolved.description, class_name, _first_line(error, 4)),
+                target,
+                frame,
+            )
+
+    def _expect_state(self, target: Any, frame: Any, timeout_ms: Optional[int], state: str) -> None:
+        resolved = self._locate(target, frame, visible_only=True, timeout_ms=timeout_ms)
+        assertion = expect(resolved.locator)
+        checks = {
+            "enabled": lambda t: assertion.to_be_enabled(timeout=t),
+            "disabled": lambda t: assertion.to_be_disabled(timeout=t),
+            "checked": lambda t: assertion.to_be_checked(timeout=t),
+            "unchecked": lambda t: assertion.not_to_be_checked(timeout=t),
+            "editable": lambda t: assertion.to_be_editable(timeout=t),
+        }
+        try:
+            checks[state](self._timeout(timeout_ms))
+        except AssertionError as error:
+            raise self._fail(
+                "{} is not {}: {}".format(resolved.description, state, _first_line(error, 4)), target, frame
+            )
+
+    def expect_enabled(self, target: Any, *, frame: Any = None, timeout_ms: Optional[int] = None) -> None:
+        self._expect_state(target, frame, timeout_ms, "enabled")
+
+    def expect_disabled(self, target: Any, *, frame: Any = None, timeout_ms: Optional[int] = None) -> None:
+        self._expect_state(target, frame, timeout_ms, "disabled")
+
+    def expect_checked(
+        self, target: Any, checked: bool = True, *, frame: Any = None, timeout_ms: Optional[int] = None
+    ) -> None:
+        self._expect_state(target, frame, timeout_ms, "checked" if checked else "unchecked")
+
+    def expect_editable(self, target: Any, *, frame: Any = None, timeout_ms: Optional[int] = None) -> None:
+        self._expect_state(target, frame, timeout_ms, "editable")
+
+    def expect_rendered(
+        self,
+        target: Any,
+        *,
+        frame: Any = None,
+        min_text_length: int = 1,
+        accept_media: bool = True,
+        extra_error_patterns: Sequence[str] = (),
+        timeout_ms: Optional[int] = None,
+    ) -> Locator:
+        """The macro is visible, finished loading, has content and shows no error.
+
+        Content means at least min_text_length characters, or an image, svg,
+        canvas or iframe when accept_media is True.
+        """
+
+        timeout = self._timeout(timeout_ms)
+        deadline = self._deadline(timeout)
+        locator = self.expect_visible(target, frame=frame, timeout_ms=timeout)
+        description = describe_target(target)
+
+        def loaded() -> bool:
+            busy = locator.evaluate(_BUSY_JS, self.busy_selectors, timeout=2_000)
+            if busy:
+                return False
+            content = locator.evaluate(_CONTENT_JS, timeout=2_000)
+            return content["text"] >= min_text_length or (accept_media and content["media"] > 0)
+
+        try:
+            self.wait_until(
+                loaded,
+                timeout_ms=self._remaining(deadline, 1_000),
+                message="{} to finish loading and show content".format(description),
+            )
+        except UiCheckError:
+            content = self._safe_evaluate(locator, _CONTENT_JS) or {}
+            raise self._fail(
+                "{} is visible but never finished rendering (still loading, or empty: "
+                "{} text character(s), {} media element(s)).".format(
+                    description, content.get("text", "?"), content.get("media", "?")
+                ),
+                target,
+                frame,
+            )
+        self.wait_for_dom_stable(locator, quiet_ms=300, timeout_ms=self._remaining(deadline, 1_000))
+        self.expect_no_errors(locator, extra_patterns=extra_error_patterns, include_frames=False, settle=False)
+        self.expect_visible(locator, timeout_ms=self._remaining(deadline, 2_000))
+        self.log.info("rendered: %s", description)
+        return locator
+
+    def expect_image_loaded(
+        self, target: Any, *, frame: Any = None, timeout_ms: Optional[int] = None
+    ) -> None:
+        """The image is loaded, the canvas is not blank or the svg draws something."""
+
+        timeout = self._timeout(timeout_ms)
+        deadline = self._deadline(timeout)
+        locator = self.expect_visible(target, frame=frame, timeout_ms=timeout)
+        last = {"reason": "unknown"}
+
+        def drawn() -> bool:
+            reason = locator.evaluate(_GRAPHIC_JS, timeout=2_000)
+            last["reason"] = reason
+            return reason is None
+
+        try:
+            self.wait_until(drawn, timeout_ms=self._remaining(deadline, 1_000), message="graphic rendering")
+        except UiCheckError:
+            raise self._fail(
+                "{} is not correctly drawn: {}".format(describe_target(target), last["reason"]), target, frame
+            )
+
+    def read_table(self, target: Any, *, frame: Any = None, timeout_ms: Optional[int] = None) -> List[List[str]]:
+        """Cell texts of the table, or of the first table inside the target."""
+
+        locator = self.expect_visible(target, frame=frame, timeout_ms=timeout_ms)
+        rows = locator.evaluate(_TABLE_JS, timeout=self._timeout(timeout_ms))
+        if rows is None:
+            raise self._fail("{} is not and does not contain a <table>.".format(describe_target(target)), target, frame)
+        return rows
+
+    def expect_table(
+        self,
+        target: Any,
+        *,
+        frame: Any = None,
+        headers: Sequence[str] = (),
+        min_rows: Optional[int] = None,
+        contains_rows: Sequence[Sequence[str]] = (),
+        timeout_ms: Optional[int] = None,
+    ) -> List[List[str]]:
+        """Check a table.
+
+        headers: texts expected in the first row.
+        min_rows: minimum number of rows after the first one.
+        contains_rows: each item is a list of texts found, in order, in one row.
+        """
+
+        timeout = self._timeout(timeout_ms)
+        deadline = self._deadline(timeout)
+        self._settle()
+        state: Dict[str, Any] = {"rows": [], "problem": "table not read"}
+
+        def satisfied() -> bool:
+            try:
+                rows = self.read_table(target, frame=frame, timeout_ms=self._remaining(deadline, 1_000))
+            except UiCheckError as error:
+                state["problem"] = _first_line(error, 6)
+                return False
+            state["rows"] = rows
+            first = [_normalize_space(cell).lower() for cell in (rows[0] if rows else [])]
+            missing = [h for h in headers if not any(_normalize_space(h).lower() in cell for cell in first)]
+            if missing:
+                state["problem"] = "missing header(s) {}".format(missing)
+                return False
+            if min_rows is not None and len(rows) - 1 < min_rows:
+                state["problem"] = "{} data row(s), expected at least {}".format(len(rows) - 1, min_rows)
+                return False
+            for expected_row in contains_rows:
+                if not any(self._row_matches(row, expected_row) for row in rows):
+                    state["problem"] = "no row matches {}".format(list(expected_row))
+                    return False
+            return True
+
+        try:
+            self.wait_until(satisfied, timeout_ms=timeout, message="table content")
+        except UiCheckError:
+            preview = "\n".join(" | ".join(row) for row in state["rows"][:15])
+            raise self._fail(
+                "Table {} check failed: {}.\nFirst rows:\n{}".format(
+                    describe_target(target), state["problem"], preview
+                ),
+                target,
+                frame,
+            )
+        return state["rows"]
+
+    @staticmethod
+    def _row_matches(row: Sequence[str], expected: Sequence[str]) -> bool:
+        position = 0
+        for wanted in expected:
+            wanted_normalized = _normalize_space(wanted).lower()
+            while position < len(row) and wanted_normalized not in _normalize_space(row[position]).lower():
+                position += 1
+            if position >= len(row):
+                return False
+            position += 1
+        return True
+
+    # ------------------------------------------------------- error detection
+
+    def _scan_for(
+        self,
+        patterns: Sequence[str],
+        within: Any,
+        frame: Any,
+        include_frames: bool,
+        selectors: Sequence[str],
+        ignore_patterns: Sequence[str],
+    ) -> List[str]:
+        scopes: List[Tuple[str, Callable[[], Any]]] = []
+        if within is not None:
+            resolved = self._locate(within, frame, visible_only=True)
+            scopes.append((resolved.description, lambda: resolved.locator.evaluate(_SCAN_JS, list(selectors))))
+        else:
+            frames = self.page.frames if include_frames else [self.page.main_frame]
+            for current in frames:
+                label = self._frame_label(current)
+                scopes.append(
+                    (
+                        label,
+                        lambda current=current: current.evaluate(
+                            "selectors => ({})(null, selectors)".format(_SCAN_JS), list(selectors)
+                        ),
+                    )
+                )
+        compiled = [re.compile(pattern, re.IGNORECASE) for pattern in patterns]
+        ignored = [re.compile(pattern, re.IGNORECASE) for pattern in ignore_patterns]
+        found = []
+        for label, scan in scopes:
+            try:
+                result = scan()
+            except PlaywrightError:
+                continue
+            text = _normalize_space(result.get("text", ""))
+            candidates = list(result.get("hits", []))
+            for pattern in compiled:
+                for match in pattern.finditer(text):
+                    start, end = max(match.start() - 80, 0), min(match.end() + 80, len(text))
+                    candidates.append("...{}...".format(text[start:end]))
+                    break
+            for candidate in candidates:
+                if any(rule.search(candidate) for rule in ignored):
+                    continue
+                entry = "[{}] {}".format(label, candidate)
+                if entry not in found:
+                    found.append(entry)
+        return found
+
+    def expect_no_errors(
+        self,
+        within: Any = None,
+        *,
+        frame: Any = None,
+        include_frames: bool = True,
+        extra_patterns: Sequence[str] = (),
+        ignore_patterns: Sequence[str] = (),
+        use_default_patterns: bool = True,
+        settle: bool = True,
+    ) -> None:
+        """No error message is displayed, in within or in the page and its iframes.
+
+        Looks for AUI error messages and DEFAULT_ERROR_PATTERNS. ignore_patterns
+        are regexes of messages to tolerate.
+        """
+
+        if settle:
+            self._settle()
+        patterns = (list(self.error_patterns) if use_default_patterns else []) + list(extra_patterns)
+        selectors = self.error_selectors if use_default_patterns else []
+        found = self._scan_for(patterns, within, frame, include_frames, selectors, ignore_patterns)
+        if found:
+            raise self._fail(
+                "Error message(s) displayed{}:\n- {}".format(
+                    " in {}".format(describe_target(within)) if within is not None else "",
+                    "\n- ".join(found[:20]),
+                )
+            )
+        self.log.info("no error displayed%s", " in {}".format(describe_target(within)) if within is not None else "")
+
+    def expect_no_server_errors(
+        self,
+        *,
+        url_pattern: Optional[str] = None,
+        ignore_pattern: Optional[str] = None,
+        min_status: int = 500,
+        whole_test: bool = False,
+    ) -> None:
+        """No HTTP error >= min_status since the start of the step.
+
+        url_pattern limits the check to some URLs, ignore_pattern skips others.
+        """
+
+        self.wait_for_ready()
+        start = 0 if whole_test else self._step_offsets[3]
+        errors = []
+        for entry, status in zip(self.monitor.http_errors[start:], self.monitor.http_error_statuses[start:]):
+            if status < min_status:
+                continue
+            if url_pattern and not re.search(url_pattern, entry):
+                continue
+            if ignore_pattern and re.search(ignore_pattern, entry):
+                continue
+            errors.append(entry)
+        if errors:
+            raise self._fail("Server error response(s) received:\n- {}".format("\n- ".join(errors[:20])))
+
+    def expect_no_js_errors(self, *, ignore_pattern: Optional[str] = None, whole_test: bool = False) -> None:
+        """No uncaught JavaScript exception since the start of the step."""
+
+        start = 0 if whole_test else self._step_offsets[1]
+        errors = [
+            error
+            for error in self.monitor.page_errors[start:]
+            if not (ignore_pattern and re.search(ignore_pattern, error))
+        ]
+        if errors:
+            raise self._fail("Uncaught JavaScript error(s):\n- {}".format("\n- ".join(errors[:20])))
+
+    # ---------------------------------------------------------------- click
+
+    def _click_once(
+        self,
+        locator: Locator,
+        timeout: int,
+        *,
+        double: bool,
+        force: bool,
+        button: str,
+        modifiers: Optional[Sequence[str]],
+        position: Optional[Dict[str, float]],
+    ) -> None:
+        options: Dict[str, Any] = {"timeout": timeout, "force": force, "button": button}
+        if modifiers:
+            options["modifiers"] = list(modifiers)
+        if position:
+            options["position"] = position
+        if double:
+            locator.dblclick(**options)
+        else:
+            locator.click(**options)
+
+    def _postcondition_met(
+        self,
+        expect_target: Any,
+        expect_hidden: Any,
+        expect_url: Optional[TextMatch],
+        until: Optional[Callable[[], Any]],
+    ) -> bool:
+        if expect_target is not None and not self._total(expect_target, None, True):
+            return False
+        if expect_hidden is not None and self._total(expect_hidden, None, True) != 0:
+            return False
+        if expect_url is not None and not _matches(self.page.url, expect_url):
+            return False
+        if until is not None:
+            try:
+                if not until():
+                    return False
+            except Exception:
+                return False
+        return True
+
+    def click(
+        self,
+        target: Any,
+        *,
+        frame: Any = None,
+        expect: Any = None,
+        expect_hidden: Any = None,
+        expect_url: Optional[TextMatch] = None,
+        until: Optional[Callable[[], Any]] = None,
+        retries: int = 1,
+        double: bool = False,
+        force: bool = False,
+        button: str = "left",
+        modifiers: Optional[Sequence[str]] = None,
+        position: Optional[Dict[str, float]] = None,
+        timeout_ms: Optional[int] = None,
+    ) -> None:
+        """Click the visible element matching target.
+
+        expect, expect_hidden, expect_url and until describe the expected result.
+        With one of them, a click without effect is repeated once and a warning is
+        recorded. Use retries=0 for buttons that must never be clicked twice.
+        """
+
+        timeout = self._timeout(timeout_ms)
+        deadline = self._deadline(timeout)
+        resolved = self._locate(target, frame, visible_only=True, timeout_ms=timeout)
+        self._prepare_action()
+        if force:
+            self._warn("click(force=True) on {}: actionability checks bypassed.".format(resolved.description))
+        self.log.info("click %s", resolved.description)
+        click_options = dict(double=double, force=force, button=button, modifiers=modifiers, position=position)
+        try:
+            self._click_once(resolved.locator, self._remaining(deadline), **click_options)
+        except PlaywrightError as error:
+            if _is_strict_violation(error):
+                raise self._fail(
+                    "Cannot click {}: it matches several visible elements; make it more precise "
+                    "(nth=, within=, has_text=...).".format(resolved.description),
+                    target,
+                    frame,
+                )
+            raise self._fail(
+                "Could not click {}:\n{}".format(resolved.description, _first_line(error, 15)), target, frame
+            )
+
+        has_postcondition = any(item is not None for item in (expect, expect_hidden, expect_url, until))
+        if not has_postcondition:
+            return
+        attempts_left = max(retries, 0)
+        while True:
+            window_end = (
+                min(deadline, time.monotonic() + self.click_retry_after_ms / 1000.0) if attempts_left else deadline
+            )
+            while not self._postcondition_met(expect, expect_hidden, expect_url, until):
+                if time.monotonic() >= window_end:
+                    break
+                self._sleep(100)
+            else:
+                break
+            if self._expired(deadline) or not attempts_left:
+                raise self._fail(
+                    "Clicked {} but the expected result did not happen within {} ms ({}).".format(
+                        resolved.description,
+                        timeout,
+                        self._describe_postconditions(expect, expect_hidden, expect_url, until),
+                    ),
+                    expect if expect is not None else target,
+                    None if expect is not None else frame,
+                )
+            attempts_left -= 1
+            if self._still_clickable(resolved.locator):
+                self._warn(
+                    "Click on {} had no visible effect after {} ms; clicking again.".format(
+                        resolved.description, self.click_retry_after_ms
+                    )
+                )
+                try:
+                    self._click_once(
+                        resolved.locator, min(self._remaining(deadline), 5_000), **click_options
+                    )
+                except PlaywrightError as error:
+                    self.log.debug("Retry click failed: %s", _first_line(error, 2))
+        # final check with the strict visibility rules
+        if expect is not None:
+            self.expect_visible(expect, timeout_ms=self._remaining(deadline, 2_000))
+        if expect_hidden is not None:
+            self.expect_hidden(expect_hidden, timeout_ms=self._remaining(deadline, 2_000))
+
+    @staticmethod
+    def _describe_postconditions(expect_target: Any, expect_hidden: Any, expect_url: Any, until: Any) -> str:
+        parts = []
+        if expect_target is not None:
+            parts.append("expected visible: {}".format(describe_target(expect_target)))
+        if expect_hidden is not None:
+            parts.append("expected hidden: {}".format(describe_target(expect_hidden)))
+        if expect_url is not None:
+            parts.append("expected URL: {}".format(_fmt(expect_url)))
+        if until is not None:
+            parts.append("custom condition")
+        return "; ".join(parts)
+
+    def _still_clickable(self, locator: Locator) -> bool:
+        try:
+            return locator.count() == 1 and locator.is_visible() and locator.is_enabled(timeout=500)
+        except PlaywrightError:
+            return False
+
+    def click_new_tab(self, target: Any, *, frame: Any = None, timeout_ms: Optional[int] = None) -> Page:
+        """Click something that opens a new tab and return the new page."""
+
+        timeout = self._timeout(timeout_ms)
+        with self.page.context.expect_page(timeout=timeout) as page_info:
+            self.click(target, frame=frame, retries=0, timeout_ms=timeout)
+        new_page = page_info.value
+        try:
+            new_page.wait_for_load_state("domcontentloaded", timeout=timeout)
+        except PlaywrightError as error:
+            raise self._fail("The new tab did not load: {}".format(_first_line(error, 3)))
+        self.monitor.attach(new_page)
+        self.log.info("new tab opened: %s", new_page.url)
+        return new_page
+
+    def click_and_download(
+        self,
+        target: Any,
+        *,
+        frame: Any = None,
+        save_dir: Optional[Union[str, Path]] = None,
+        file_name: Optional[str] = None,
+        expected_extension: Optional[str] = None,
+        min_bytes: int = 1,
+        timeout_ms: Optional[int] = None,
+    ) -> Path:
+        """Click, wait for the download and check the file. Returns its path.
+
+        The size, the extension and the file signature are checked, so an HTML
+        error page saved as .pdf fails.
+        """
+
+        timeout = self._timeout(timeout_ms) if timeout_ms is not None else max(self.timeout_ms, 60_000)
+        with self.page.expect_download(timeout=timeout) as download_info:
+            self.click(target, frame=frame, retries=0, timeout_ms=timeout)
+        download = download_info.value
+        failure = download.failure()
+        if failure:
+            raise self._fail("Download from {} failed: {}".format(describe_target(target), failure))
+        directory = Path(save_dir) if save_dir else self.artifacts_dir / "downloads"
+        directory.mkdir(parents=True, exist_ok=True)
+        name = _safe_file_name(file_name or download.suggested_filename)
+        path = directory / name
+        download.save_as(str(path))
+        size = path.stat().st_size
+        extension = Path(download.suggested_filename).suffix.lower()
+        if size < min_bytes:
+            raise self._fail("Downloaded file {} is too small ({} bytes, expected >= {}).".format(name, size, min_bytes))
+        if expected_extension:
+            wanted = expected_extension.lower()
+            wanted = wanted if wanted.startswith(".") else "." + wanted
+            if extension != wanted:
+                raise self._fail(
+                    "Downloaded file {!r} has extension {!r}, expected {!r}.".format(
+                        download.suggested_filename, extension, wanted
+                    )
+                )
+        with path.open("rb") as handle:
+            head = handle.read(512)
+        signatures = _MAGIC_BYTES.get(extension)
+        if signatures and not any(head.startswith(signature) for signature in signatures):
+            looks_html = b"<html" in head.lower() or b"<!doctype" in head.lower()
+            raise self._fail(
+                "Downloaded file {!r} is not a valid {} file{} (starts with {!r}).".format(
+                    name, extension, " (it is an HTML page, probably an error page)" if looks_html else "", head[:40]
+                )
+            )
+        if not signatures and extension not in _TEXTUAL_EXTENSIONS:
+            lowered = head.lstrip().lower()
+            if lowered.startswith(b"<!doctype html") or lowered.startswith(b"<html"):
+                raise self._fail("Downloaded file {!r} is an HTML page (probably an error page).".format(name))
+        self.log.info("downloaded %s (%d bytes)", path, size)
+        return path
+
+    def click_and_handle_dialog(
+        self,
+        target: Any,
+        *,
+        frame: Any = None,
+        accept: bool = True,
+        prompt_text: Optional[str] = None,
+        expected_message: Optional[TextMatch] = None,
+        timeout_ms: Optional[int] = None,
+    ) -> str:
+        """Click something that opens a native alert, confirm or prompt, and answer it.
+
+        Without this, Playwright answers "Cancel" silently. Returns the message.
+        """
+
+        timeout = self._timeout(timeout_ms)
+        seen: Dict[str, str] = {}
+
+        def handler(dialog: Any) -> None:
+            if seen:
+                return
+            seen["message"] = dialog.message
+            seen["type"] = dialog.type
+            try:
+                if accept:
+                    if prompt_text is not None:
+                        dialog.accept(prompt_text)
+                    else:
+                        dialog.accept()
+                else:
+                    dialog.dismiss()
+            except PlaywrightError:
+                pass
+
+        self.page.on("dialog", handler)
+        try:
+            self.click(target, frame=frame, retries=0, timeout_ms=timeout)
+            self.wait_until(lambda: bool(seen), timeout_ms=timeout, message="a native dialog to open")
+        finally:
+            self.page.remove_listener("dialog", handler)
+        message = seen["message"]
+        if expected_message is not None and not _matches(message, expected_message):
+            raise self._fail(
+                "The {} dialog says {!r}, expected {}.".format(seen["type"], message, _fmt(expected_message))
+            )
+        self.log.info("%s dialog %s: %s", seen["type"], "accepted" if accept else "dismissed", message)
+        return message
+
+    # ----------------------------------------------------------------- text
+
+    def _editable_target(self, resolved: _Resolved, timeout: int) -> Tuple[Locator, str]:
+        locator = resolved.locator
+        kind = locator.evaluate(_EDITABLE_KIND_JS, timeout=timeout)
+        if not kind.startswith("other"):
+            return locator, kind
+        inner = _visible_filter(
+            locator.locator("input:not([type=hidden]), textarea, [contenteditable=''], [contenteditable='true']")
+        )
+        count = inner.count()
+        if count == 1:
+            return inner, inner.evaluate(_EDITABLE_KIND_JS, timeout=timeout)
+        raise self._fail(
+            "{} is a <{}> that cannot receive text and contains {} visible editable field(s). "
+            "Target the <input>, <textarea> or contenteditable element itself.".format(
+                resolved.description, kind.split(":", 1)[1], count
+            )
+        )
+
+    @staticmethod
+    def _read_content(locator: Locator, kind: str) -> str:
+        if kind in ("input", "textarea", "select"):
+            return locator.input_value(timeout=2_000)
+        return locator.inner_text(timeout=2_000)
+
+    def _content_ok(self, locator: Locator, kind: str, expected: str) -> Tuple[bool, str]:
+        try:
+            actual = self._read_content(locator, kind)
+        except PlaywrightError as error:
+            return False, "<unreadable: {}>".format(_first_line(error, 1))
+        if kind in ("input", "textarea"):
+            return actual == expected, actual
+        return _normalize_space(expected) in _normalize_space(actual), actual
+
+    def _wait_content(self, locator: Locator, kind: str, expected: str, timeout_ms: int) -> Tuple[bool, str]:
+        deadline = self._deadline(timeout_ms)
+        while True:
+            ok, actual = self._content_ok(locator, kind, expected)
+            if ok or self._expired(deadline):
+                return ok, actual
+            self._sleep(100)
+
+    def _press_combo(self, locator: Locator, combo: str) -> None:
+        try:
+            locator.press(combo.replace("Mod", "ControlOrMeta"))
+        except PlaywrightError:  # ControlOrMeta needs Playwright 1.45
+            modifier = "Meta" if sys.platform == "darwin" else "Control"
+            locator.press(combo.replace("Mod", modifier))
+
+    def fill(
+        self,
+        target: Any,
+        text: str,
+        *,
+        frame: Any = None,
+        clear: bool = True,
+        verify: bool = True,
+        expected_value: Optional[str] = None,
+        press_enter: bool = False,
+        sensitive: bool = False,
+        timeout_ms: Optional[int] = None,
+    ) -> None:
+        """Type text into an input, a textarea or an editable area, and read it back.
+
+        If the value is not kept, it is typed again key by key. Use expected_value
+        when the application reformats it, clear=False to append, sensitive=True
+        to hide it in the logs.
+        """
+
+        timeout = self._timeout(timeout_ms)
+        deadline = self._deadline(timeout)
+        shown = "***" if sensitive else repr(text)
+        resolved = self._locate(target, frame, visible_only=True, timeout_ms=timeout)
+        self._prepare_action()
+        try:
+            expect(resolved.locator).to_be_visible(timeout=self._remaining(deadline))
+            locator, kind = self._editable_target(resolved, self._remaining(deadline))
+            if kind == "select":
+                raise self._fail("{} is a <select>: use select_option().".format(resolved.description))
+            expect(locator).to_be_editable(timeout=self._remaining(deadline))
+        except UiCheckError:
+            raise
+        except AssertionError as error:
+            raise self._fail(
+                "{} is not editable: {}".format(resolved.description, _first_line(error, 4)), target, frame
+            )
+        except PlaywrightError as error:
+            if _is_strict_violation(error):
+                raise self._fail(
+                    "{} matches several visible elements.".format(resolved.description), target, frame
+                )
+            raise self._fail("Cannot type into {}: {}".format(resolved.description, _first_line(error, 6)), target, frame)
+
+        self.log.info("fill %s with %s", resolved.description, shown)
+        if clear:
+            expected = text if expected_value is None else expected_value
+            locator.fill(text, timeout=self._remaining(deadline))
+        else:
+            previous = self._read_content(locator, kind)
+            expected = (previous + text) if expected_value is None else expected_value
+            locator.focus(timeout=self._remaining(deadline))
+            self._press_combo(locator, "Mod+End" if kind == "editable" else "End")
+            locator.press_sequentially(text, delay=20, timeout=self._remaining(deadline))
+
+        if verify:
+            ok, actual = self._wait_content(locator, kind, expected, min(self._remaining(deadline), 1_500))
+            if not ok and clear:
+                self._warn(
+                    "fill(): {} did not keep the value set at once; retyping it key by key.".format(
+                        resolved.description
+                    )
+                )
+                if kind == "editable":
+                    locator.click(timeout=self._remaining(deadline))
+                    self._press_combo(locator, "Mod+A")
+                    locator.press("Backspace")
+                else:
+                    locator.fill("", timeout=self._remaining(deadline))
+                locator.press_sequentially(text, delay=30, timeout=self._remaining(deadline))
+                ok, actual = self._wait_content(locator, kind, expected, min(self._remaining(deadline), 3_000))
+            if not ok:
+                raise self._fail(
+                    "Typed {} into {} but it contains {}. Use expected_value= if the application "
+                    "legitimately reformats it.".format(
+                        shown, resolved.description, "***" if sensitive else repr(actual[:300])
+                    )
+                )
+        if press_enter:
+            locator.press("Enter")
+
+    def type_text(
+        self,
+        target: Any,
+        text: str,
+        *,
+        frame: Any = None,
+        delay_ms: int = 40,
+        clear: bool = False,
+        at_end: bool = True,
+        press_enter: bool = False,
+        verify: bool = False,
+        timeout_ms: Optional[int] = None,
+    ) -> None:
+        """Type key by key, for autocompletes and editor shortcuts such as "{chart".
+
+        The result is not checked by default since these widgets change the text.
+        """
+
+        timeout = self._timeout(timeout_ms)
+        deadline = self._deadline(timeout)
+        resolved = self._locate(target, frame, visible_only=True, timeout_ms=timeout)
+        self._prepare_action()
+        locator, kind = self._editable_target(resolved, self._remaining(deadline))
+        self.log.info("type %r into %s", text, resolved.description)
+        locator.focus(timeout=self._remaining(deadline))
+        if clear:
+            if kind == "editable":
+                self._press_combo(locator, "Mod+A")
+                locator.press("Backspace")
+            else:
+                locator.fill("", timeout=self._remaining(deadline))
+        elif at_end:
+            self._press_combo(locator, "Mod+End" if kind == "editable" else "End")
+        locator.press_sequentially(text, delay=delay_ms, timeout=self._remaining(deadline))
+        if verify:
+            ok, actual = self._wait_content(locator, kind, text, min(self._remaining(deadline), 2_000))
+            if not ok:
+                raise self._fail(
+                    "Typed {!r} into {} but it contains {!r}.".format(text, resolved.description, actual[:300])
+                )
+        if press_enter:
+            locator.press("Enter")
+
+    def press(self, key: str, target: Any = None, *, frame: Any = None, timeout_ms: Optional[int] = None) -> None:
+        """Press a key ("Enter", "Escape", "Control+S"...) on target or on the focused element."""
+
+        if target is None:
+            self.log.info("press %s", key)
+            self.page.keyboard.press(key)
+            return
+        resolved = self._locate(target, frame, visible_only=True, timeout_ms=timeout_ms)
+        self.log.info("press %s on %s", key, resolved.description)
+        resolved.locator.press(key, timeout=self._timeout(timeout_ms))
+
+    # ------------------------------------------------------------- choosing
+
+    def select_option(
+        self,
+        target: Any,
+        *,
+        value: Optional[str] = None,
+        label: Optional[str] = None,
+        index: Optional[int] = None,
+        frame: Any = None,
+        timeout_ms: Optional[int] = None,
+    ) -> None:
+        """Choose an option of a native <select>."""
+
+        if [value, label, index].count(None) != 2:
+            raise ValueError("Give exactly one of value=, label=, index=.")
+        timeout = self._timeout(timeout_ms)
+        resolved = self._locate(target, frame, visible_only=True, timeout_ms=timeout)
+        self._prepare_action()
+        self.log.info("select %s in %s", value or label or index, resolved.description)
+        try:
+            if value is not None:
+                resolved.locator.select_option(value=value, timeout=timeout)
+            elif label is not None:
+                resolved.locator.select_option(label=label, timeout=timeout)
+            else:
+                resolved.locator.select_option(index=index, timeout=timeout)
+        except PlaywrightError as error:
+            raise self._fail("Cannot select in {}: {}".format(resolved.description, _first_line(error, 6)), target, frame)
+        selected = resolved.locator.evaluate(
+            "el => Array.from(el.selectedOptions).map(o => [o.value, o.label.trim(), o.index])"
+        )
+        ok = any(
+            (value is not None and item[0] == value)
+            or (label is not None and item[1] == label.strip())
+            or (index is not None and item[2] == index)
+            for item in selected
+        )
+        if not ok:
+            raise self._fail("{} did not keep the selection; selected: {}".format(resolved.description, selected))
+
+    def choose_option(
+        self,
+        trigger: Any,
+        option: Any,
+        *,
+        frame: Any = None,
+        search: Optional[str] = None,
+        option_frame: Any = None,
+        verify: Any = True,
+        timeout_ms: Optional[int] = None,
+    ) -> None:
+        """Pick an option in a custom dropdown or an autocomplete (AUI, Select2...).
+
+        option is a text or a target. search is typed once the list is open.
+        verify=True checks that the trigger then shows the option, verify=<target>
+        checks that target instead, verify=False skips the check.
+        """
+
+        timeout = self._timeout(timeout_ms)
+        deadline = self._deadline(timeout)
+        list_frame = frame if option_frame is None else option_frame
+        if isinstance(option, str):
+            option_text = option
+            anchored = re.compile(r"^\s*{}\s*$".format(re.escape(option)))
+            candidates: List[Any] = [
+                Target(role="option", name=option, exact=True),
+                Target(role="menuitem", name=option, exact=True),
+                Target(role="menuitemradio", name=option, exact=True),
+                Target(role="menuitemcheckbox", name=option, exact=True),
+                Target(role="treeitem", name=option, exact=True),
+                Target(selector="li", has_text=anchored),
+                Target(text=option, exact=True),
+                Target(role="option", name=option),
+                Target(selector="li", has_text=option),
+            ]
+            option_target = Target(
+                alternatives=tuple(candidates), frame=list_frame, description="option {!r}".format(option)
+            )
+        else:
+            option_target = option
+            option_text = None
+            normalized = _as_target(option)
+            if isinstance(normalized, Target) and normalized.frame is None and list_frame is not None:
+                option_target = replace(normalized, frame=list_frame)
+
+        if search is None:
+            self.click(trigger, frame=frame, expect=option_target, timeout_ms=self._remaining(deadline))
+        else:
+            self.click(trigger, frame=frame, timeout_ms=self._remaining(deadline))
+            self.log.info("type %r in the focused search field", search)
+            self.page.keyboard.type(search, delay=40)
+        self.click(option_target, retries=0, timeout_ms=self._remaining(deadline))
+
+        if verify is False or (verify is True and option_text is None):
+            return
+        if verify is True:
+            trigger_locator = self._locate(trigger, frame, visible_only=False).locator
+
+            def shows_choice() -> bool:
+                return _matches(trigger_locator.evaluate(_TRIGGER_TEXT_JS, timeout=2_000), option_text, True)
+
+            try:
+                self.wait_until(shows_choice, timeout_ms=self._remaining(deadline, 2_000), message="selection")
+            except UiCheckError:
+                raise self._fail(
+                    "Option {!r} was clicked but {} does not show it. Pass verify=<target that "
+                    "displays the choice> or verify=False.".format(option_text, describe_target(trigger)),
+                    trigger,
+                    frame,
+                )
+        elif option_text is None:
+            self.expect_visible(verify, timeout_ms=self._remaining(deadline, 2_000))
+        else:
+            self.expect_text(verify, option_text, timeout_ms=self._remaining(deadline, 2_000))
+
+    def check(self, target: Any, *, frame: Any = None, timeout_ms: Optional[int] = None) -> None:
+        """Tick a checkbox, radio or switch."""
+
+        self._set_checked(target, True, frame, timeout_ms)
+
+    def uncheck(self, target: Any, *, frame: Any = None, timeout_ms: Optional[int] = None) -> None:
+        """Untick a checkbox or switch."""
+
+        self._set_checked(target, False, frame, timeout_ms)
+
+    def _set_checked(self, target: Any, checked: bool, frame: Any, timeout_ms: Optional[int]) -> None:
+        timeout = self._timeout(timeout_ms)
+        resolved = self._locate(target, frame, visible_only=True, timeout_ms=timeout)
+        self._prepare_action()
+        self.log.info("%s %s", "check" if checked else "uncheck", resolved.description)
+        try:
+            resolved.locator.set_checked(checked, timeout=timeout)
+        except PlaywrightError as error:
+            raise self._fail(
+                "Cannot {} {}: {}".format("check" if checked else "uncheck", resolved.description, _first_line(error, 8)),
+                target,
+                frame,
+            )
+        self.expect_checked(resolved.locator, checked, timeout_ms=timeout)
+
+    # ------------------------------------------------------- other gestures
+
+    def hover(
+        self, target: Any, *, frame: Any = None, expect: Any = None, timeout_ms: Optional[int] = None
+    ) -> None:
+        """Hover an element. With expect, check that the tooltip or menu shows up."""
+
+        timeout = self._timeout(timeout_ms)
+        deadline = self._deadline(timeout)
+        resolved = self._locate(target, frame, visible_only=True, timeout_ms=timeout)
+        self._prepare_action()
+        self.log.info("hover %s", resolved.description)
+        resolved.locator.hover(timeout=self._remaining(deadline))
+        if expect is None:
+            return
+        if not self.is_visible(expect, timeout_ms=min(self.click_retry_after_ms, self._remaining(deadline))):
+            self._warn("Hover on {} had no effect; moving away and hovering again.".format(resolved.description))
+            self.page.mouse.move(0, 0)
+            resolved.locator.hover(timeout=self._remaining(deadline))
+        self.expect_visible(expect, timeout_ms=self._remaining(deadline, 2_000))
+
+    def drag_and_drop(
+        self,
+        source: Any,
+        destination: Any,
+        *,
+        frame: Any = None,
+        expect: Any = None,
+        until: Optional[Callable[[], Any]] = None,
+        timeout_ms: Optional[int] = None,
+    ) -> None:
+        """Drag source onto destination.
+
+        If expect / until is not met, the drag is done again with step-by-step mouse
+        moves (jQuery UI sortable needs them).
+        """
+
+        timeout = self._timeout(timeout_ms)
+        deadline = self._deadline(timeout)
+        src = self._locate(source, frame, visible_only=True, timeout_ms=timeout)
+        dst = self._locate(destination, frame, visible_only=True, timeout_ms=timeout)
+        self._prepare_action()
+        self.log.info("drag %s to %s", src.description, dst.description)
+        src.locator.drag_to(dst.locator, timeout=self._remaining(deadline))
+        if expect is None and until is None:
+            return
+        if self._wait_postcondition(expect, until, min(self.click_retry_after_ms, self._remaining(deadline))):
+            return
+        self._warn("drag_to() had no effect; retrying with manual mouse moves.")
+        src.locator.scroll_into_view_if_needed(timeout=self._remaining(deadline))
+        start = src.locator.bounding_box()
+        end = dst.locator.bounding_box()
+        if not start or not end:
+            raise self._fail("Cannot compute drag coordinates.", source, frame)
+        start_x, start_y = start["x"] + start["width"] / 2, start["y"] + start["height"] / 2
+        end_x, end_y = end["x"] + end["width"] / 2, end["y"] + end["height"] / 2
+        mouse = self.page.mouse
+        mouse.move(start_x, start_y)
+        mouse.down()
+        mouse.move(start_x + 5, start_y + 5, steps=5)
+        mouse.move(end_x, end_y, steps=20)
+        self._sleep(150)
+        mouse.up()
+        if not self._wait_postcondition(expect, until, self._remaining(deadline)):
+            raise self._fail(
+                "Dragged {} to {} but the expected result did not happen.".format(src.description, dst.description),
+                expect if expect is not None else source,
+            )
+        if expect is not None:
+            self.expect_visible(expect, timeout_ms=self._remaining(deadline, 2_000))
+
+    def _wait_postcondition(self, expect_target: Any, until: Optional[Callable[[], Any]], timeout_ms: int) -> bool:
+        deadline = self._deadline(timeout_ms)
+        while True:
+            if self._postcondition_met(expect_target, None, None, until):
+                return True
+            if self._expired(deadline):
+                return False
+            self._sleep(100)
+
+    def upload_file(
+        self,
+        target: Any,
+        files: Union[str, Path, Sequence[Union[str, Path]]],
+        *,
+        frame: Any = None,
+        timeout_ms: Optional[int] = None,
+    ) -> None:
+        """Upload files through an <input type=file> (even hidden) or a button."""
+
+        paths = [Path(files)] if isinstance(files, (str, Path)) else [Path(item) for item in files]
+        missing = [str(path) for path in paths if not path.is_file()]
+        if missing:
+            raise UiCheckError("File(s) to upload not found: {}".format(", ".join(missing)))
+        timeout = self._timeout(timeout_ms)
+        resolved = self._locate(target, frame, visible_only=False, timeout_ms=timeout)
+        self._prepare_action()
+        names = [str(path) for path in paths]
+        self.log.info("upload %s via %s", ", ".join(path.name for path in paths), resolved.description)
+        try:
+            is_file_input = resolved.locator.evaluate(
+                "el => el.tagName.toLowerCase() === 'input' && el.type === 'file'", timeout=timeout
+            )
+        except PlaywrightError as error:
+            raise self._fail("Cannot find {}: {}".format(resolved.description, _first_line(error, 4)), target, frame)
+        if is_file_input:
+            resolved.locator.set_input_files(names, timeout=timeout)
+            count = resolved.locator.evaluate("el => el.files ? el.files.length : 0")
+            if count != len(paths):
+                raise self._fail("{} holds {} file(s) instead of {}.".format(resolved.description, count, len(paths)))
+            return
+        with self.page.expect_file_chooser(timeout=timeout) as chooser_info:
+            self.click(target, frame=frame, retries=0, timeout_ms=timeout)
+        chooser_info.value.set_files(names, timeout=timeout)
+
+    def scroll_to(self, target: Any, *, frame: Any = None, timeout_ms: Optional[int] = None) -> None:
+        """Scroll until the element is in view."""
+
+        resolved = self._locate(target, frame, visible_only=False, timeout_ms=timeout_ms)
+        resolved.locator.scroll_into_view_if_needed(timeout=self._timeout(timeout_ms))
+
+    # -------------------------------------------------------------- reading
+
+    def _safe_inner_text(self, locator: Locator) -> str:
+        try:
+            return locator.inner_text(timeout=500)
+        except PlaywrightError:
+            return "<unavailable>"
+
+    @staticmethod
+    def _safe_evaluate(locator: Locator, script: str) -> Any:
+        try:
+            return locator.evaluate(script, timeout=2_000)
+        except PlaywrightError:
+            return None
+
+    def get_text(self, target: Any, *, frame: Any = None, timeout_ms: Optional[int] = None) -> str:
+        """Displayed text of the visible element."""
+
+        locator = self.expect_visible(target, frame=frame, timeout_ms=timeout_ms)
+        return _normalize_space(locator.inner_text(timeout=self._timeout(timeout_ms)))
+
+    def get_value(self, target: Any, *, frame: Any = None, timeout_ms: Optional[int] = None) -> str:
+        """Current value of an input / textarea / select."""
+
+        resolved = self._locate(target, frame, visible_only=True, timeout_ms=timeout_ms)
+        return resolved.locator.input_value(timeout=self._timeout(timeout_ms))
+
+    def get_attribute(
+        self, target: Any, name: str, *, frame: Any = None, visible_only: bool = True, timeout_ms: Optional[int] = None
+    ) -> Optional[str]:
+        resolved = self._locate(target, frame, visible_only=visible_only, timeout_ms=timeout_ms)
+        return resolved.locator.get_attribute(name, timeout=self._timeout(timeout_ms))
+
+    def count(self, target: Any, *, frame: Any = None, visible_only: bool = True, settle: bool = True) -> int:
+        """Number of visible matches once the page is idle (no check)."""
+
+        if settle:
+            self._settle()
+        return self._total(target, frame, visible_only) or 0
+
+    # ---------------------------------------------------------------- popups
+
+    def dismiss_if_present(
+        self,
+        popup: Any,
+        *,
+        close: Any = None,
+        frame: Any = None,
+        timeout_ms: int = 1_500,
+    ) -> bool:
+        """Close an optional popup if it shows up. Returns True if it was closed."""
+
+        if not self.is_visible(popup, frame=frame, timeout_ms=timeout_ms):
+            return False
+        self.log.info("closing optional popup %s", describe_target(popup))
+        if close is None:
+            self.page.keyboard.press("Escape")
+        else:
+            self.click(close, frame=frame, retries=0)
+        self.expect_hidden(popup, frame=frame)
+        return True
+
+    def auto_dismiss(self, popup: Any, *, close: Any = None, frame: Any = None, times: Optional[int] = None) -> None:
+        """Close a popup automatically whenever it shows up and blocks an action.
+
+        Only for popups that are not part of the plugin under test.
+        """
+
+        if not hasattr(self.page, "add_locator_handler"):
+            raise RuntimeError("auto_dismiss() needs Playwright >= 1.42.")
+        popup_locator = self._locate(popup, frame, visible_only=False).locator
+        close_locator = self._locate(close, frame, visible_only=True).locator if close is not None else None
+        description = describe_target(popup)
+
+        def handler(*_args: Any) -> None:
+            self._warn("Popup {} appeared and was closed automatically.".format(description))
+            if close_locator is not None:
+                close_locator.click()
+            else:
+                self.page.keyboard.press("Escape")
+
+        options: Dict[str, Any] = {}
+        if times is not None:
+            options["times"] = times
+        self.page.add_locator_handler(popup_locator, handler, **options)
+
+    # -------------------------------------------------------------- evidence
+
+    def screenshot(self, name: str, target: Any = None, *, frame: Any = None) -> Path:
+        """Save a screenshot of the page or of an element, return its path."""
+
+        directory = self.artifacts_dir / "screenshots"
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / "{}_{}.png".format(_safe_file_name(name), time.strftime("%H-%M-%S"))
+        if target is None:
+            self.page.screenshot(path=str(path), full_page=True)
+        else:
+            self.expect_visible(target, frame=frame).screenshot(path=str(path))
+        return path
+
+
+__all__ = [
+    "ANY_FRAME",
+    "CONFLUENCE_EDITOR_FRAME",
+    "DEFAULT_BUSY_SELECTORS",
+    "DEFAULT_ERROR_PATTERNS",
+    "DEFAULT_ERROR_SELECTORS",
+    "DEFAULT_IGNORED_PENDING_URLS",
+    "DEFAULT_SSO_CONTINUE",
+    "Actions",
+    "PageMonitor",
+    "Target",
+    "UiCheckError",
+    "by_attr",
+    "by_class",
+    "by_id",
+    "by_label",
+    "by_placeholder",
+    "by_role",
+    "by_test_id",
+    "by_text",
+    "by_title",
+    "by_xpath",
+    "css",
+    "describe_target",
+]
